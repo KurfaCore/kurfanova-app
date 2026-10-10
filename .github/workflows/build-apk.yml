@@ -1,0 +1,63 @@
+name: Build Kurfanova Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'android/**'
+      - '.github/workflows/build-apk.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.6'
+
+      - name: Build Debug APK with Gradle
+        env:
+          ANDROID_HOME: /usr/local/lib/android/sdk
+        run: |
+          cd android
+          gradle assembleDebug --stacktrace
+
+      - name: Prepare APK Output
+        run: |
+          mkdir -p dist
+          cp android/app/build/outputs/apk/debug/app-debug.apk dist/Kurfanova-Muzik.apk
+          ls -lh dist/Kurfanova-Muzik.apk
+
+      - name: Upload APK as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kurfanova-Muzik-APK
+          path: dist/Kurfanova-Muzik.apk
+
+      - name: Publish GitHub Release with APK
+        uses: softprops/action-gh-release@v2
+        if: github.ref == 'refs/heads/main'
+        with:
+          tag_name: v1.0.0-apk
+          name: "Kurfanova Müzik Android APK v1.0.0"
+          body: |
+            Kurfanova Müzik Canlı Senkronize Android APK Kurulum Paketi.
+            Bu APK bir kez kurulduktan sonra sitede yapılan tüm güncellemeler otomatik olarak uygulamaya yansır.
+          files: dist/Kurfanova-Muzik.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

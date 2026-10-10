@@ -1,0 +1,12 @@
+<resources>
+    <style name="Theme.KurfaMuzik" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="android:statusBarColor">#07090e</item>
+        <item name="android:navigationBarColor">#07090e</item>
+        <item name="android:windowBackground">#07090e</item>
+    </style>
+
+    <style name="Theme.KurfaMuzik.Fullscreen" parent="Theme.KurfaMuzik">
+        <item name="android:windowFullscreen">false</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+</resources>
