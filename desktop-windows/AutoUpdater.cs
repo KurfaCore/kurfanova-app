@@ -29,7 +29,16 @@ public sealed class AutoUpdater : IDisposable
     public string? ReleaseNotes { get; private set; }
     public bool HasStagedUpdate => !string.IsNullOrWhiteSpace(StagedExePath) && File.Exists(StagedExePath);
 
+    public sealed record UpdateProgressInfo(
+        string Phase,
+        Version Version,
+        string? Notes,
+        long BytesDownloaded,
+        long TotalBytes,
+        int Percent);
+
     public event Action<Version, string?>? UpdateReady;
+    public event Action<UpdateProgressInfo>? UpdateProgressChanged;
 
     public AutoUpdater() : this(new AppPaths(AppPaths.ResolveActiveInstallDir()))
     {
@@ -69,6 +78,7 @@ public sealed class AutoUpdater : IDisposable
             return;
         }
 
+        bool downloadStarted = false;
         try
         {
             CleanupOldTempFiles();
@@ -77,10 +87,13 @@ public sealed class AutoUpdater : IDisposable
                 existingVer is not null && existingPath is not null &&
                 existingVer > _currentVersion)
             {
+                long stagedLen = 0;
+                try { stagedLen = new FileInfo(existingPath).Length; } catch { }
                 StagedVersion = existingVer;
                 StagedExePath = existingPath;
                 _stagedSha256 = existingSha;
                 ReleaseNotes = existingNotes;
+                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", existingVer, existingNotes, stagedLen, stagedLen, 100));
                 UpdateReady?.Invoke(existingVer, existingNotes);
                 return;
             }
@@ -164,14 +177,23 @@ public sealed class AutoUpdater : IDisposable
 
             if (File.Exists(targetExePath) && VerifyFileIntegrity(targetExePath, expectedSize, expectedSha256))
             {
+                long existingFileLen = 0;
+                try { existingFileLen = new FileInfo(targetExePath).Length; } catch { }
                 SaveStagedMeta(remoteVersion.ToString(), targetExePath, expectedSha256, notes);
                 StagedVersion = remoteVersion;
                 StagedExePath = targetExePath;
                 _stagedSha256 = expectedSha256;
                 ReleaseNotes = notes;
+                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", remoteVersion, notes, existingFileLen, existingFileLen, 100));
                 UpdateReady?.Invoke(remoteVersion, notes);
                 return;
             }
+
+            downloadStarted = true;
+            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("downloading", remoteVersion, notes, 0, expectedSize, 0));
+
+            long downloadedBytes = 0;
+            long totalBytes = expectedSize;
 
             using (var dlCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
@@ -180,18 +202,46 @@ public sealed class AutoUpdater : IDisposable
                     downloadUrl,
                     HttpCompletionOption.ResponseHeadersRead,
                     dlCts.Token).ConfigureAwait(false);
-                if (!response.IsSuccessStatusCode) return;
+                if (!response.IsSuccessStatusCode)
+                {
+                    UpdateProgressChanged?.Invoke(new UpdateProgressInfo("hide", remoteVersion, null, 0, 0, 0));
+                    return;
+                }
+
+                if (response.Content.Headers.ContentLength is long cl && cl > 0)
+                {
+                    totalBytes = cl;
+                }
 
                 await using Stream netStream = await response.Content.ReadAsStreamAsync(dlCts.Token).ConfigureAwait(false);
                 await using (var fs = new FileStream(partPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true))
                 {
-                    await netStream.CopyToAsync(fs, dlCts.Token).ConfigureAwait(false);
+                    byte[] buffer = new byte[81920];
+                    long lastEmitMs = Environment.TickCount64;
+                    int read;
+                    while ((read = await netStream.ReadAsync(buffer.AsMemory(0, buffer.Length), dlCts.Token).ConfigureAwait(false)) > 0)
+                    {
+                        await fs.WriteAsync(buffer.AsMemory(0, read), dlCts.Token).ConfigureAwait(false);
+                        downloadedBytes += read;
+
+                        long nowMs = Environment.TickCount64;
+                        if (nowMs - lastEmitMs >= 110)
+                        {
+                            lastEmitMs = nowMs;
+                            int pct = totalBytes > 0 ? Math.Clamp((int)((downloadedBytes * 100L) / totalBytes), 0, 99) : 0;
+                            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("downloading", remoteVersion, notes, downloadedBytes, totalBytes, pct));
+                        }
+                    }
                 }
             }
+
+            long finalSize = totalBytes > 0 ? totalBytes : downloadedBytes;
+            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("verifying", remoteVersion, notes, downloadedBytes, finalSize, 100));
 
             if (!VerifyFileIntegrity(partPath, expectedSize, expectedSha256))
             {
                 TryDeleteFile(partPath);
+                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("hide", remoteVersion, null, 0, 0, 0));
                 return;
             }
 
@@ -203,10 +253,15 @@ public sealed class AutoUpdater : IDisposable
             StagedExePath = targetExePath;
             _stagedSha256 = expectedSha256;
             ReleaseNotes = notes;
+            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", remoteVersion, notes, finalSize, finalSize, 100));
             UpdateReady?.Invoke(remoteVersion, notes);
         }
         catch
         {
+            if (downloadStarted)
+            {
+                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("hide", _currentVersion, null, 0, 0, 0));
+            }
             // Never interrupt playback or startup if offline/unreachable
         }
         finally

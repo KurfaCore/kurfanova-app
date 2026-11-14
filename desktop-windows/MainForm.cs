@@ -75,6 +75,8 @@ public sealed class MainForm : Form
     private NotifyIcon? _trayIcon;
     private bool _restartForUpdate;
     private int _updatePromptShown;
+    private volatile bool _webContentLoaded;
+    private AutoUpdater.UpdateProgressInfo? _latestUpdateProgress;
 
     public MainForm() : this(null, null)
     {
@@ -150,17 +152,23 @@ public sealed class MainForm : Form
             core.WebMessageReceived += OnWebMessageReceived;
             core.NewWindowRequested += OnNewWindowRequested;
             core.NavigationStarting += OnNavigationStarting;
+            core.NavigationCompleted += (_, _) =>
+            {
+                _webContentLoaded = true;
+                ReplayLatestUpdateProgress();
+            };
 
             await core.AddScriptToExecuteOnDocumentCreatedAsync(BuildBridgeInjectionScript());
 
             core.Navigate(TargetUrl);
 
+            _updater.UpdateProgressChanged += OnUpdateProgressChanged;
             _updater.UpdateReady += OnUpdateReady;
             _ = Task.Run(async () =>
             {
                 try
                 {
-                    await Task.Delay(12000, _shutdownCts.Token).ConfigureAwait(false);
+                    await Task.Delay(4500, _shutdownCts.Token).ConfigureAwait(false);
                     await _updater.CheckAndStageAsync(_shutdownCts.Token, force: false).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) { }
@@ -286,6 +294,332 @@ public sealed class MainForm : Form
                     window.chrome.webview.postMessage(JSON.stringify(event.data));
                   }
                 });
+
+                // 3. Windows Desktop EXE Exclusive Update Overlay (never loaded on normal web)
+                const ensureUpdaterStyles = () => {
+                  if (document.getElementById('kurfa-win-upd-style')) return;
+                  const s = document.createElement('style');
+                  s.id = 'kurfa-win-upd-style';
+                  s.textContent = `
+                    @keyframes kurfaUpdSlideIn {
+                      0% { opacity: 0; transform: translateY(18px) scale(0.96); }
+                      100% { opacity: 1; transform: translateY(0) scale(1); }
+                    }
+                    @keyframes kurfaUpdSlideOut {
+                      0% { opacity: 1; transform: translateY(0) scale(1); }
+                      100% { opacity: 0; transform: translateY(14px) scale(0.96); }
+                    }
+                    @keyframes kurfaUpdSpin {
+                      to { transform: rotate(360deg); }
+                    }
+                    @keyframes kurfaUpdSheen {
+                      0% { transform: translateX(-100%); }
+                      100% { transform: translateX(220%); }
+                    }
+                    @keyframes kurfaUpdCheckDraw {
+                      0% { stroke-dashoffset: 28; opacity: 0; }
+                      100% { stroke-dashoffset: 0; opacity: 1; }
+                    }
+                    @keyframes kurfaUpdPulse {
+                      0%, 100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.36); }
+                      50% { box-shadow: 0 0 0 8px rgba(16, 185, 129, 0); }
+                    }
+                    #kurfa-win-updater-ui {
+                      position: fixed;
+                      bottom: 96px;
+                      right: 20px;
+                      width: min(388px, calc(100vw - 28px));
+                      z-index: 2147483000;
+                      pointer-events: auto;
+                      background: rgba(16, 18, 30, 0.88);
+                      backdrop-filter: blur(22px) saturate(180%);
+                      -webkit-backdrop-filter: blur(22px) saturate(180%);
+                      border: 1px solid rgba(255, 255, 255, 0.14);
+                      border-radius: 20px;
+                      padding: 14px 16px;
+                      box-shadow: 0 22px 54px rgba(0, 0, 0, 0.56), inset 0 1px 0 rgba(255, 255, 255, 0.16);
+                      color: #f8fafc;
+                      font-family: 'Manrope', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+                      animation: kurfaUpdSlideIn 380ms cubic-bezier(0.22, 1, 0.36, 1) both;
+                    }
+                    #kurfa-win-updater-ui.kurfa-upd-closing {
+                      animation: kurfaUpdSlideOut 220ms cubic-bezier(0.4, 0, 1, 1) forwards;
+                    }
+                    .kurfa-upd-row {
+                      display: flex;
+                      align-items: center;
+                      gap: 12px;
+                    }
+                    .kurfa-upd-icon {
+                      width: 38px;
+                      height: 38px;
+                      border-radius: 12px;
+                      flex-shrink: 0;
+                      display: flex;
+                      align-items: center;
+                      justify-content: center;
+                      background: rgba(255, 32, 86, 0.14);
+                      border: 1px solid rgba(255, 32, 86, 0.28);
+                      color: #ff4778;
+                    }
+                    .kurfa-upd-icon.is-ready {
+                      background: rgba(16, 185, 129, 0.14);
+                      border-color: rgba(16, 185, 129, 0.32);
+                      color: #34d399;
+                      animation: kurfaUpdPulse 2.2s ease-in-out infinite;
+                    }
+                    .kurfa-upd-spin {
+                      animation: kurfaUpdSpin 1.05s linear infinite;
+                      transform-origin: center;
+                    }
+                    .kurfa-upd-check {
+                      stroke-dasharray: 28;
+                      stroke-dashoffset: 0;
+                      animation: kurfaUpdCheckDraw 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+                    }
+                    .kurfa-upd-meta {
+                      flex: 1;
+                      min-width: 0;
+                    }
+                    .kurfa-upd-head {
+                      display: flex;
+                      align-items: center;
+                      gap: 7px;
+                    }
+                    .kurfa-upd-title {
+                      font-size: 13px;
+                      font-weight: 700;
+                      letter-spacing: -0.01em;
+                      color: #ffffff;
+                      white-space: nowrap;
+                      overflow: hidden;
+                      text-overflow: ellipsis;
+                    }
+                    .kurfa-upd-badge {
+                      font-size: 10px;
+                      font-weight: 700;
+                      padding: 2px 7px;
+                      border-radius: 99px;
+                      background: rgba(255, 32, 86, 0.18);
+                      border: 1px solid rgba(255, 32, 86, 0.32);
+                      color: #ff759b;
+                      flex-shrink: 0;
+                    }
+                    .kurfa-upd-sub {
+                      margin-top: 2px;
+                      font-size: 11.5px;
+                      color: rgba(226, 232, 240, 0.74);
+                      font-variant-numeric: tabular-nums;
+                      white-space: nowrap;
+                      overflow: hidden;
+                      text-overflow: ellipsis;
+                    }
+                    .kurfa-upd-close {
+                      width: 26px;
+                      height: 26px;
+                      border-radius: 99px;
+                      border: none;
+                      background: rgba(255, 255, 255, 0.06);
+                      color: rgba(226, 232, 240, 0.7);
+                      cursor: pointer;
+                      display: flex;
+                      align-items: center;
+                      justify-content: center;
+                      flex-shrink: 0;
+                      transition: background 150ms, color 150ms;
+                    }
+                    .kurfa-upd-close:hover {
+                      background: rgba(255, 255, 255, 0.14);
+                      color: #ffffff;
+                    }
+                    .kurfa-upd-track {
+                      margin-top: 11px;
+                      height: 4px;
+                      border-radius: 99px;
+                      background: rgba(255, 255, 255, 0.09);
+                      overflow: hidden;
+                      position: relative;
+                    }
+                    .kurfa-upd-fill {
+                      height: 100%;
+                      width: 0%;
+                      border-radius: 99px;
+                      background: linear-gradient(90deg, #ff2056, #ff6b98);
+                      transition: width 180ms ease-out;
+                      position: relative;
+                      overflow: hidden;
+                    }
+                    .kurfa-upd-fill::after {
+                      content: '';
+                      position: absolute;
+                      inset: 0;
+                      width: 45%;
+                      background: linear-gradient(90deg, transparent, rgba(255,255,255,0.45), transparent);
+                      animation: kurfaUpdSheen 1.4s ease-in-out infinite;
+                    }
+                    .kurfa-upd-actions {
+                      margin-top: 12px;
+                      display: flex;
+                      align-items: center;
+                      gap: 8px;
+                    }
+                    .kurfa-upd-btn-primary {
+                      flex: 1;
+                      border: none;
+                      border-radius: 12px;
+                      padding: 8px 12px;
+                      font-size: 12px;
+                      font-weight: 700;
+                      color: #ffffff;
+                      background: linear-gradient(135deg, #ff2056, #e11d48);
+                      box-shadow: 0 8px 20px rgba(255, 32, 86, 0.28);
+                      cursor: pointer;
+                      transition: transform 120ms, filter 150ms;
+                    }
+                    .kurfa-upd-btn-primary:hover { filter: brightness(1.08); }
+                    .kurfa-upd-btn-primary:active { transform: scale(0.98); }
+                    .kurfa-upd-btn-secondary {
+                      border: 1px solid rgba(255, 255, 255, 0.12);
+                      border-radius: 12px;
+                      padding: 8px 12px;
+                      font-size: 11.5px;
+                      font-weight: 600;
+                      color: rgba(226, 232, 240, 0.9);
+                      background: rgba(255, 255, 255, 0.06);
+                      cursor: pointer;
+                      transition: background 150ms;
+                    }
+                    .kurfa-upd-btn-secondary:hover { background: rgba(255, 255, 255, 0.12); }
+                  `;
+                  (document.head || document.documentElement).appendChild(s);
+                };
+
+                let __kurfaUpdDismissedForVersion = null;
+                const formatMb = (bytes) => (Math.max(0, Number(bytes) || 0) / (1024 * 1024)).toFixed(1);
+                const closeUpdaterCard = () => {
+                  const el = document.getElementById('kurfa-win-updater-ui');
+                  if (!el) return;
+                  el.classList.add('kurfa-upd-closing');
+                  setTimeout(() => { try { el.remove(); } catch(_) {} }, 220);
+                };
+
+                window.__kurfaDesktopUpdateUI = (info) => {
+                  try {
+                    if (!info || info.phase === 'hide') {
+                      closeUpdaterCard();
+                      return;
+                    }
+                    const phase = String(info.phase || 'downloading');
+                    const ver = String(info.version || '');
+                    if (__kurfaUpdDismissedForVersion && __kurfaUpdDismissedForVersion === ver + ':' + phase) {
+                      return;
+                    }
+                    if (!document.body) return;
+                    ensureUpdaterStyles();
+
+                    let card = document.getElementById('kurfa-win-updater-ui');
+                    if (!card) {
+                      card = document.createElement('div');
+                      card.id = 'kurfa-win-updater-ui';
+                      card.setAttribute('role', 'status');
+                      card.innerHTML = `
+                        <div class="kurfa-upd-row">
+                          <div class="kurfa-upd-icon" id="kurfa-upd-icon-box"></div>
+                          <div class="kurfa-upd-meta">
+                            <div class="kurfa-upd-head">
+                              <span class="kurfa-upd-title" id="kurfa-upd-title"></span>
+                              <span class="kurfa-upd-badge" id="kurfa-upd-ver"></span>
+                            </div>
+                            <div class="kurfa-upd-sub" id="kurfa-upd-sub"></div>
+                          </div>
+                          <button type="button" class="kurfa-upd-close" id="kurfa-upd-close-btn" title="Gizle">
+                            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6L6 18M6 6l12 12"/></svg>
+                          </button>
+                        </div>
+                        <div class="kurfa-upd-track" id="kurfa-upd-track"><div class="kurfa-upd-fill" id="kurfa-upd-fill"></div></div>
+                        <div class="kurfa-upd-actions" id="kurfa-upd-actions" style="display:none">
+                          <button type="button" class="kurfa-upd-btn-primary" id="kurfa-upd-apply-btn">Şimdi Güncelle &amp; Yeniden Başlat</button>
+                          <button type="button" class="kurfa-upd-btn-secondary" id="kurfa-upd-later-btn">Kapanışta Yükle</button>
+                        </div>
+                      `;
+                      document.body.appendChild(card);
+
+                      card.querySelector('#kurfa-upd-close-btn').addEventListener('click', () => {
+                        __kurfaUpdDismissedForVersion = ver + ':' + (card.dataset.phase || phase);
+                        closeUpdaterCard();
+                      });
+                      card.querySelector('#kurfa-upd-later-btn').addEventListener('click', () => {
+                        __kurfaUpdDismissedForVersion = ver + ':ready';
+                        closeUpdaterCard();
+                      });
+                      card.querySelector('#kurfa-upd-apply-btn').addEventListener('click', () => {
+                        const sub = card.querySelector('#kurfa-upd-sub');
+                        const applyBtn = card.querySelector('#kurfa-upd-apply-btn');
+                        if (applyBtn) {
+                          applyBtn.disabled = true;
+                          applyBtn.textContent = 'Uygulanıyor...';
+                        }
+                        if (sub) sub.textContent = 'Yeni sürüm kuruluyor, uygulama yeniden başlatılacak...';
+                        if (window.chrome && window.chrome.webview) {
+                          window.chrome.webview.postMessage(JSON.stringify({
+                            __kurfaExt: 'REQ',
+                            requestId: 'upd_' + Date.now(),
+                            action: 'APPLY_UPDATE'
+                          }));
+                        }
+                      });
+                    }
+
+                    card.classList.remove('kurfa-upd-closing');
+                    const prevPhase = card.dataset.phase;
+                    card.dataset.phase = phase;
+
+                    const iconBox = card.querySelector('#kurfa-upd-icon-box');
+                    const titleEl = card.querySelector('#kurfa-upd-title');
+                    const verEl = card.querySelector('#kurfa-upd-ver');
+                    const subEl = card.querySelector('#kurfa-upd-sub');
+                    const trackEl = card.querySelector('#kurfa-upd-track');
+                    const fillEl = card.querySelector('#kurfa-upd-fill');
+                    const actionsEl = card.querySelector('#kurfa-upd-actions');
+
+                    if (verEl) verEl.textContent = ver ? 'v' + ver : 'Yeni';
+
+                    if (phase === 'ready') {
+                      if (prevPhase !== 'ready') {
+                        iconBox.classList.add('is-ready');
+                        iconBox.innerHTML = '<svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path class="kurfa-upd-check" d="M5 13l4 4L19 7"/></svg>';
+                      }
+                      if (titleEl) titleEl.textContent = 'Yeni Sürüm Hazır';
+                      const noteTxt = String(info.notes || '').trim();
+                      if (subEl) subEl.textContent = noteTxt || 'Doğrulandı. Kapanışta veya şimdi kurabilirsiniz.';
+                      if (trackEl) trackEl.style.display = 'none';
+                      if (actionsEl) actionsEl.style.display = 'flex';
+                    } else {
+                      if (prevPhase !== 'downloading' && prevPhase !== 'verifying') {
+                        iconBox.classList.remove('is-ready');
+                        iconBox.innerHTML = '<svg class="kurfa-upd-spin" width="19" height="19" viewBox="0 0 24 24" fill="none"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-opacity="0.22" stroke-width="2.5"/><path d="M12 3a9 9 0 0 1 9 9" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"/></svg>';
+                      }
+                      if (trackEl) trackEl.style.display = 'block';
+                      if (actionsEl) actionsEl.style.display = 'none';
+                      const pct = Math.max(0, Math.min(100, Number(info.percent) || 0));
+                      if (fillEl) fillEl.style.width = pct + '%';
+
+                      if (phase === 'verifying') {
+                        if (titleEl) titleEl.textContent = 'Güncelleme Doğrulanıyor';
+                        if (subEl) subEl.textContent = 'SHA-256 güvenlik denetimi yapılıyor...';
+                      } else {
+                        if (titleEl) titleEl.textContent = 'Güncelleme İndiriliyor';
+                        const total = Number(info.totalBytes) || 0;
+                        const dl = Number(info.bytesDownloaded) || 0;
+                        if (subEl) {
+                          subEl.textContent = total > 0
+                            ? `${formatMb(dl)} / ${formatMb(total)} MB (%${pct})`
+                            : `Arka planda hazırlanıyor... %${pct}`;
+                        }
+                      }
+                    }
+                  } catch (_) {}
+                };
               } catch (_) {}
             })();
             """;
@@ -752,6 +1086,51 @@ public sealed class MainForm : Form
         }
     }
 
+    private void OnUpdateProgressChanged(AutoUpdater.UpdateProgressInfo info)
+    {
+        _latestUpdateProgress = info;
+        if (IsDisposed || !IsHandleCreated || !_webContentLoaded) return;
+
+        PushUpdateProgressToWebView(info);
+    }
+
+    private void ReplayLatestUpdateProgress()
+    {
+        AutoUpdater.UpdateProgressInfo? info = _latestUpdateProgress;
+        if (info is null || IsDisposed || !IsHandleCreated) return;
+
+        PushUpdateProgressToWebView(info);
+    }
+
+    private void PushUpdateProgressToWebView(AutoUpdater.UpdateProgressInfo info)
+    {
+        try
+        {
+            string payloadJson = JsonSerializer.Serialize(new
+            {
+                phase = info.Phase,
+                version = info.Version.ToString(),
+                notes = info.Notes ?? string.Empty,
+                bytesDownloaded = info.BytesDownloaded,
+                totalBytes = info.TotalBytes,
+                percent = info.Percent
+            });
+
+            BeginInvoke(() =>
+            {
+                if (!IsDisposed && _webView.CoreWebView2 is not null)
+                {
+                    _ = _webView.CoreWebView2.ExecuteScriptAsync(
+                        $"if (typeof window.__kurfaDesktopUpdateUI === 'function') {{ window.__kurfaDesktopUpdateUI({payloadJson}); }}");
+                }
+            });
+        }
+        catch
+        {
+            // Ignore shutdown races
+        }
+    }
+
     private void OnUpdateReady(Version version, string? notes)
     {
         if (IsDisposed || !IsHandleCreated) return;
@@ -763,11 +1142,19 @@ public sealed class MainForm : Form
             {
                 if (IsDisposed) return;
 
-                if (_webView.CoreWebView2 is not null)
+                if (_webContentLoaded && _webView.CoreWebView2 is not null)
                 {
                     string verJson = JsonSerializer.Serialize(version.ToString());
                     _ = _webView.CoreWebView2.ExecuteScriptAsync(
-                        $"if (typeof window.__kurfaOnNativeUpdateReady === 'function') {{ window.__kurfaOnNativeUpdateReady({{ version: {verJson}, platform: 'windows' }}); }}");
+                        $"if (typeof window.__kurfaOnNativeUpdateReady === 'function') {{ window.__kurfaOnNativeUpdateReady({{ version: {verJson}, platform: 'windows', uiHandled: true }}); }}");
+                    PushUpdateProgressToWebView(new AutoUpdater.UpdateProgressInfo(
+                        "ready",
+                        version,
+                        notes,
+                        0,
+                        0,
+                        100));
+                    return;
                 }
 
                 string noteLine = string.IsNullOrWhiteSpace(notes) ? string.Empty : $"\nYenilikler: {notes}\n";
