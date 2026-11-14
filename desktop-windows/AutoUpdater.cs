@@ -13,6 +13,7 @@ public sealed class AutoUpdater : IDisposable
 
     private static readonly HttpClient Http = CreateHttpClient();
 
+    private readonly AppPaths _paths;
     private readonly string _updatesDir;
     private readonly string _stagedMetaPath;
     private readonly Version _currentVersion;
@@ -25,15 +26,17 @@ public sealed class AutoUpdater : IDisposable
 
     public event Action<Version, string?>? UpdateReady;
 
-    public AutoUpdater()
+    public AutoUpdater() : this(new AppPaths(AppPaths.ResolveActiveInstallDir()))
     {
-        _updatesDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "KurfanovaMuzik",
-            "updates");
+    }
+
+    public AutoUpdater(AppPaths? paths)
+    {
+        _paths = paths ?? new AppPaths(AppPaths.ResolveActiveInstallDir());
+        _updatesDir = _paths.UpdatesDir;
         _stagedMetaPath = Path.Combine(_updatesDir, "staged-update.json");
         _currentVersion = NormalizeVersion(
-            Assembly.GetExecutingAssembly().GetName().Version ?? new Version(1, 0, 0, 0));
+            Assembly.GetExecutingAssembly().GetName().Version ?? new Version(1, 1, 0, 0));
     }
 
     public Version CurrentVersion => _currentVersion;
@@ -152,6 +155,7 @@ public sealed class AutoUpdater : IDisposable
 
             File.Move(partPath, targetExePath, overwrite: true);
             SaveStagedMeta(remoteVersion.ToString(), targetExePath, expectedSha256, notes);
+            LogUpdater($"Update staged: v{remoteVersion} at {targetExePath}");
 
             StagedVersion = remoteVersion;
             StagedExePath = targetExePath;
@@ -162,6 +166,17 @@ public sealed class AutoUpdater : IDisposable
         {
             // Never interrupt playback or startup if offline/unreachable
         }
+    }
+
+    private void LogUpdater(string message)
+    {
+        try
+        {
+            Directory.CreateDirectory(_paths.LogsDir);
+            string logFile = Path.Combine(_paths.LogsDir, "updater.log");
+            File.AppendAllText(logFile, $"[{DateTimeOffset.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}", Encoding.UTF8);
+        }
+        catch { }
     }
 
     public bool TryApplyPendingUpdate(bool relaunch)
@@ -180,11 +195,21 @@ public sealed class AutoUpdater : IDisposable
             string? currentExe = Environment.ProcessPath;
             if (!IsUpdatableProcessPath(currentExe))
             {
-                Interlocked.Exchange(ref _applyTriggered, 0);
-                return false;
+                if (IsUpdatableProcessPath(_paths.InstalledExePath))
+                {
+                    currentExe = _paths.InstalledExePath;
+                }
+                else
+                {
+                    Interlocked.Exchange(ref _applyTriggered, 0);
+                    return false;
+                }
             }
 
             Directory.CreateDirectory(_updatesDir);
+            Directory.CreateDirectory(_paths.LogsDir);
+            string logPath = Path.Combine(_paths.LogsDir, "updater.log");
+
             string scriptPath = Path.Combine(_updatesDir, "apply_update.ps1");
             string scriptBody = """
                 $ErrorActionPreference = 'SilentlyContinue'
@@ -192,6 +217,7 @@ public sealed class AutoUpdater : IDisposable
                 $cur = $env:KURFA_CUR
                 $newExe = $env:KURFA_NEW
                 $meta = $env:KURFA_META
+                $logFile = $env:KURFA_LOG
                 $relaunch = $env:KURFA_RELAUNCH -eq '1'
                 $bak = "$cur.bak"
 
@@ -223,6 +249,10 @@ public sealed class AutoUpdater : IDisposable
                 if ($swapped) {
                   Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
                   Remove-Item -LiteralPath $meta -Force -ErrorAction SilentlyContinue
+                  if ($logFile) {
+                    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
+                    Add-Content -LiteralPath $logFile -Value "[$ts] Update applied successfully to $cur" -ErrorAction SilentlyContinue
+                  }
                   if ($relaunch -and (Test-Path -LiteralPath $cur)) {
                     Start-Process -FilePath $cur
                   }
@@ -251,6 +281,7 @@ public sealed class AutoUpdater : IDisposable
                     $"$env:KURFA_CUR='{EscapePsSingleQuote(currentExe!)}';" +
                     $"$env:KURFA_NEW='{EscapePsSingleQuote(StagedExePath)}';" +
                     $"$env:KURFA_META='{EscapePsSingleQuote(_stagedMetaPath)}';" +
+                    $"$env:KURFA_LOG='{EscapePsSingleQuote(logPath)}';" +
                     $"$env:KURFA_RELAUNCH='{(relaunch ? "1" : "0")}';" +
                     $"& '{EscapePsSingleQuote(scriptPath)}'\"";
             }
@@ -260,6 +291,7 @@ public sealed class AutoUpdater : IDisposable
                 psi.Environment["KURFA_CUR"] = currentExe!;
                 psi.Environment["KURFA_NEW"] = StagedExePath;
                 psi.Environment["KURFA_META"] = _stagedMetaPath;
+                psi.Environment["KURFA_LOG"] = logPath;
                 psi.Environment["KURFA_RELAUNCH"] = relaunch ? "1" : "0";
             }
 

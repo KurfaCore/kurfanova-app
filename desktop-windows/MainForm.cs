@@ -61,16 +61,27 @@ public sealed class MainForm : Form
         "localhost"
     ];
 
+    private readonly AppPaths _paths;
+    private readonly DesktopAppConfig _config;
     private readonly NativeDesktopEngine _engine = new();
-    private readonly AutoUpdater _updater = new();
+    private readonly AutoUpdater _updater;
     private readonly WebView2 _webView = new();
     private readonly CancellationTokenSource _shutdownCts = new();
     private Icon? _embeddedIcon;
+    private NotifyIcon? _trayIcon;
     private bool _restartForUpdate;
     private int _updatePromptShown;
 
-    public MainForm()
+    public MainForm() : this(null, null)
     {
+    }
+
+    public MainForm(AppPaths? paths, DesktopAppConfig? config)
+    {
+        _paths = paths ?? new AppPaths(AppPaths.ResolveActiveInstallDir());
+        _config = config ?? AppPaths.LoadOrDefaultConfig(_paths, AppPaths.GetNormalizedCurrentVersion());
+        _updater = new AutoUpdater(_paths);
+
         Color darkBg = Color.FromArgb(11, 11, 20); // #0B0B14
 
         Text = "Kurfamüzik — Reklamsız Masaüstü";
@@ -113,14 +124,11 @@ public sealed class MainForm : Form
         try
         {
             _engine.Start();
+            InitializeTrayIcon();
 
-            string userDataFolder = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "KurfanovaMuzik",
-                "WebView2");
-            Directory.CreateDirectory(userDataFolder);
+            Directory.CreateDirectory(_paths.WebView2DataDir);
 
-            CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, userDataFolder);
+            CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, _paths.WebView2DataDir);
             await _webView.EnsureCoreWebView2Async(env);
 
             CoreWebView2 core = _webView.CoreWebView2;
@@ -187,7 +195,7 @@ public sealed class MainForm : Form
             (() => {
               try {
                 const host = String(window.location && window.location.hostname || '').toLowerCase();
-                if (host !== 'kurfanova.github.io' && host !== 'localhost') return;
+                if (host !== 'kurfanova.github.io' && host !== 'kurfanova.kurfa.workers.dev' && host !== 'localhost') return;
 
                 const activateBridge = () => {
                   try {
@@ -264,6 +272,9 @@ public sealed class MainForm : Form
         string? query = null;
         bool filterSingles = false;
         string? videoId = null;
+        bool? settingDesktopShortcut = null;
+        bool? settingStartMenuShortcut = null;
+        bool? settingRunOnStartup = null;
 
         try
         {
@@ -297,6 +308,43 @@ public sealed class MainForm : Form
                 if (payload.TryGetProperty("videoId", out JsonElement vEl) && vEl.ValueKind == JsonValueKind.String)
                 {
                     videoId = vEl.GetString();
+                }
+                if (payload.TryGetProperty("desktopShortcut", out JsonElement dsEl) &&
+                    (dsEl.ValueKind == JsonValueKind.True || dsEl.ValueKind == JsonValueKind.False))
+                {
+                    settingDesktopShortcut = dsEl.GetBoolean();
+                }
+                if (payload.TryGetProperty("startMenuShortcut", out JsonElement smEl) &&
+                    (smEl.ValueKind == JsonValueKind.True || smEl.ValueKind == JsonValueKind.False))
+                {
+                    settingStartMenuShortcut = smEl.GetBoolean();
+                }
+                if (payload.TryGetProperty("runOnStartup", out JsonElement rsEl) &&
+                    (rsEl.ValueKind == JsonValueKind.True || rsEl.ValueKind == JsonValueKind.False))
+                {
+                    settingRunOnStartup = rsEl.GetBoolean();
+                }
+                if (payload.TryGetProperty("key", out JsonElement keyEl) &&
+                    keyEl.ValueKind == JsonValueKind.String &&
+                    payload.TryGetProperty("value", out JsonElement valEl) &&
+                    (valEl.ValueKind == JsonValueKind.True || valEl.ValueKind == JsonValueKind.False))
+                {
+                    bool v = valEl.GetBoolean();
+                    switch (keyEl.GetString())
+                    {
+                        case "desktopShortcut":
+                        case "createDesktopShortcut":
+                            settingDesktopShortcut = v;
+                            break;
+                        case "startMenuShortcut":
+                        case "createStartMenuShortcut":
+                            settingStartMenuShortcut = v;
+                            break;
+                        case "runOnStartup":
+                        case "launchOnStartup":
+                            settingRunOnStartup = v;
+                            break;
+                    }
                 }
             }
         }
@@ -367,6 +415,61 @@ public sealed class MainForm : Form
                         }
                         break;
                     }
+
+                    case "GET_DESKTOP_SETTINGS":
+                        responseObj = new
+                        {
+                            success = true,
+                            version = _updater.CurrentVersion.ToString(3),
+                            installDir = _paths.InstallDir,
+                            desktopShortcut = _config.DesktopShortcut,
+                            startMenuShortcut = _config.StartMenuShortcut,
+                            runOnStartup = _config.RunOnStartup
+                        };
+                        break;
+
+                    case "SET_DESKTOP_SETTINGS":
+                        lock (_config)
+                        {
+                            if (settingDesktopShortcut.HasValue) _config.DesktopShortcut = settingDesktopShortcut.Value;
+                            if (settingStartMenuShortcut.HasValue) _config.StartMenuShortcut = settingStartMenuShortcut.Value;
+                            if (settingRunOnStartup.HasValue) _config.RunOnStartup = settingRunOnStartup.Value;
+
+                            AppPaths.SaveConfig(_paths, _config);
+                            InstallerService.ApplyShortcutsAndRegistry(_paths, _config, _updater.CurrentVersion);
+                        }
+                        responseObj = new
+                        {
+                            success = true,
+                            version = _updater.CurrentVersion.ToString(3),
+                            installDir = _paths.InstallDir,
+                            desktopShortcut = _config.DesktopShortcut,
+                            startMenuShortcut = _config.StartMenuShortcut,
+                            runOnStartup = _config.RunOnStartup
+                        };
+                        break;
+
+                    case "OPEN_INSTALL_FOLDER":
+                        try
+                        {
+                            Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_paths.InstallDir}\"") { UseShellExecute = true });
+                            responseObj = new { success = true };
+                        }
+                        catch (Exception ex)
+                        {
+                            responseObj = new { success = false, error = ex.Message };
+                        }
+                        break;
+
+                    case "CREATE_DESKTOP_SHORTCUT":
+                        lock (_config)
+                        {
+                            _config.DesktopShortcut = true;
+                            AppPaths.SaveConfig(_paths, _config);
+                            InstallerService.ApplyShortcutsAndRegistry(_paths, _config, _updater.CurrentVersion);
+                        }
+                        responseObj = new { success = true };
+                        break;
 
                     default:
                         responseObj = new { success = false, error = "Unsupported action" };
@@ -489,7 +592,8 @@ public sealed class MainForm : Form
         }
 
         bool isKurfanova = uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase) &&
-                           uri.Host.Equals("kurfanova.github.io", StringComparison.OrdinalIgnoreCase) &&
+                           (uri.Host.Equals("kurfanova.github.io", StringComparison.OrdinalIgnoreCase) ||
+                            uri.Host.Equals("kurfanova.kurfa.workers.dev", StringComparison.OrdinalIgnoreCase)) &&
                            uri.IsDefaultPort;
 
         bool isLocalhost = (uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase) ||
@@ -598,6 +702,133 @@ public sealed class MainForm : Form
         }
     }
 
+    private void InitializeTrayIcon()
+    {
+        try
+        {
+            _trayIcon = new NotifyIcon
+            {
+                Text = "Kurfamüzik",
+                Icon = _embeddedIcon ?? SystemIcons.Application,
+                Visible = true
+            };
+
+            var menu = new ContextMenuStrip();
+            menu.Renderer = new ToolStripProfessionalRenderer(new DarkColorTable());
+            menu.BackColor = Color.FromArgb(20, 22, 37);
+            menu.ForeColor = Color.White;
+
+            var itemShow = new ToolStripMenuItem("Kurfamüzik'i Göster", null, (_, _) => RestoreWindow());
+            itemShow.Font = new Font(Font, FontStyle.Bold);
+            itemShow.ForeColor = Color.White;
+
+            var itemShortcut = new ToolStripMenuItem("Masaüstü Kısayolu Oluştur / Yenile", null, (_, _) =>
+            {
+                lock (_config)
+                {
+                    _config.DesktopShortcut = true;
+                    AppPaths.SaveConfig(_paths, _config);
+                    InstallerService.ApplyShortcutsAndRegistry(_paths, _config, _updater.CurrentVersion);
+                }
+                _trayIcon.ShowBalloonTip(2000, "Kurfamüzik", "Masaüstü kısayolu oluşturuldu.", ToolTipIcon.Info);
+            })
+            {
+                ForeColor = Color.White
+            };
+
+            var itemOpenDir = new ToolStripMenuItem("Kurulum Klasörünü Aç", null, (_, _) =>
+            {
+                try
+                {
+                    Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_paths.InstallDir}\"") { UseShellExecute = true });
+                }
+                catch { }
+            })
+            {
+                ForeColor = Color.White
+            };
+
+            var itemCheckUpdate = new ToolStripMenuItem("Güncellemeleri Denetle", null, async (_, _) =>
+            {
+                _trayIcon.ShowBalloonTip(1500, "Kurfamüzik", "Güncellemeler denetleniyor...", ToolTipIcon.Info);
+                await _updater.CheckAndStageAsync(_shutdownCts.Token);
+                if (!_updater.HasStagedUpdate)
+                {
+                    _trayIcon.ShowBalloonTip(2000, "Kurfamüzik", "Uygulamanız güncel.", ToolTipIcon.Info);
+                }
+            })
+            {
+                ForeColor = Color.White
+            };
+
+            var itemSetup = new ToolStripMenuItem("Kurulum Sihirbazını Aç", null, (_, _) =>
+            {
+                LaunchSetup();
+            })
+            {
+                ForeColor = Color.White
+            };
+
+            var itemUninstall = new ToolStripMenuItem("Uygulamayı Kaldır...", null, (_, _) =>
+            {
+                BeginInvoke(() => InstallerService.RunUninstall(silent: false));
+            })
+            {
+                ForeColor = Color.White
+            };
+
+            var itemExit = new ToolStripMenuItem("Çıkış", null, (_, _) =>
+            {
+                Close();
+            })
+            {
+                ForeColor = Color.White
+            };
+
+            menu.Items.Add(itemShow);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(itemShortcut);
+            menu.Items.Add(itemOpenDir);
+            menu.Items.Add(itemCheckUpdate);
+            menu.Items.Add(itemSetup);
+            menu.Items.Add(itemUninstall);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(itemExit);
+
+            _trayIcon.ContextMenuStrip = menu;
+            _trayIcon.DoubleClick += (_, _) => RestoreWindow();
+        }
+        catch
+        {
+            // Ignore tray initialization errors
+        }
+    }
+
+    private void RestoreWindow()
+    {
+        Show();
+        if (WindowState == FormWindowState.Minimized)
+        {
+            WindowState = FormWindowState.Normal;
+        }
+        BringToFront();
+        Activate();
+    }
+
+    private void LaunchSetup()
+    {
+        try
+        {
+            ExistingInstallInfo existing = InstallerService.DetectExistingInstallation();
+            using var setup = new SetupForm(existing);
+            if (setup.ShowDialog(this) == DialogResult.OK)
+            {
+                Close();
+            }
+        }
+        catch { }
+    }
+
     private void OnFormClosed(object? sender, FormClosedEventArgs e)
     {
         try { _shutdownCts.Cancel(); } catch { /* ignore */ }
@@ -605,10 +836,32 @@ public sealed class MainForm : Form
         {
             _updater.TryApplyPendingUpdate(relaunch: _restartForUpdate);
         }
+        _trayIcon?.Dispose();
         _updater.Dispose();
         _engine.Dispose();
         _webView.Dispose();
         _embeddedIcon?.Dispose();
         _shutdownCts.Dispose();
+    }
+
+    private sealed class DarkColorTable : ProfessionalColorTable
+    {
+        private readonly Color _bg = Color.FromArgb(20, 22, 37);
+        private readonly Color _selected = Color.FromArgb(38, 42, 65);
+        private readonly Color _border = Color.FromArgb(48, 54, 80);
+
+        public override Color ToolStripDropDownBackground => _bg;
+        public override Color ImageMarginGradientBegin => _bg;
+        public override Color ImageMarginGradientMiddle => _bg;
+        public override Color ImageMarginGradientEnd => _bg;
+        public override Color MenuBorder => _border;
+        public override Color MenuItemBorder => _border;
+        public override Color MenuItemSelected => _selected;
+        public override Color MenuItemSelectedGradientBegin => _selected;
+        public override Color MenuItemSelectedGradientEnd => _selected;
+        public override Color MenuItemPressedGradientBegin => _selected;
+        public override Color MenuItemPressedGradientEnd => _selected;
+        public override Color SeparatorDark => _border;
+        public override Color SeparatorLight => _border;
     }
 }
