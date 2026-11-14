@@ -30,6 +30,8 @@ public sealed class MainForm : Form
         "*://*.youtube.com/ptracking*",
         "*://youtube.com/get_midroll_info*",
         "*://*.youtube.com/get_midroll_info*",
+        "*://youtube.com/api/stats/qoe*",
+        "*://*.youtube.com/api/stats/qoe*",
         "*://youtube-nocookie.com/pagead/*",
         "*://*.youtube-nocookie.com/pagead/*",
         "*://youtube-nocookie.com/api/stats/ads*",
@@ -37,7 +39,9 @@ public sealed class MainForm : Form
         "*://youtube-nocookie.com/ptracking*",
         "*://*.youtube-nocookie.com/ptracking*",
         "*://youtube-nocookie.com/get_midroll_info*",
-        "*://*.youtube-nocookie.com/get_midroll_info*"
+        "*://*.youtube-nocookie.com/get_midroll_info*",
+        "*://*.googlevideo.com/*oad=*",
+        "*://*.googlevideo.com/*adformat=*"
     ];
 
     private static readonly string[] AuthPopupHosts =
@@ -195,6 +199,71 @@ public sealed class MainForm : Form
             (() => {
               try {
                 const host = String(window.location && window.location.hostname || '').toLowerCase();
+
+                // 1. YouTube Embed Zero-Ad Shield (protects Video Klip Modu / any fallback embed inside WebView2)
+                if (host === 'www.youtube.com' || host === 'youtube.com' || host === 'www.youtube-nocookie.com' || host === 'youtube-nocookie.com') {
+                  const stripAds = (obj) => {
+                    if (!obj || typeof obj !== 'object') return obj;
+                    try {
+                      delete obj.adPlacements;
+                      delete obj.playerAds;
+                      delete obj.adSlots;
+                      delete obj.adBreakHeartbeatParams;
+                    } catch (_) {}
+                    return obj;
+                  };
+
+                  try {
+                    let cachedInitial = undefined;
+                    Object.defineProperty(window, 'ytInitialPlayerResponse', {
+                      configurable: true,
+                      enumerable: true,
+                      get() { return cachedInitial; },
+                      set(v) { cachedInitial = stripAds(v); }
+                    });
+                  } catch (_) {}
+
+                  try {
+                    const origFetch = window.fetch;
+                    if (typeof origFetch === 'function') {
+                      window.fetch = async function(...args) {
+                        const res = await origFetch.apply(this, args);
+                        try {
+                          const reqUrl = String((args[0] && args[0].url) || args[0] || '');
+                          if (reqUrl.includes('/youtubei/v1/player') || reqUrl.includes('/youtubei/v1/next')) {
+                            const txt = await res.clone().text();
+                            const data = stripAds(JSON.parse(txt));
+                            const hdrs = new Headers(res.headers);
+                            hdrs.delete('content-length');
+                            return new Response(JSON.stringify(data), { status: res.status, statusText: res.statusText, headers: hdrs });
+                          }
+                        } catch (_) {}
+                        return res;
+                      };
+                    }
+                  } catch (_) {}
+
+                  const guardAdDom = () => {
+                    try {
+                      const player = document.querySelector('.html5-video-player');
+                      if (player && player.classList.contains('ad-showing')) {
+                        const v = player.querySelector('video');
+                        if (v) {
+                          v.muted = true;
+                          if (Number.isFinite(v.duration) && v.duration > 0 && v.currentTime < v.duration - 0.15) {
+                            v.currentTime = v.duration;
+                          }
+                        }
+                        const skipBtn = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern');
+                        if (skipBtn) skipBtn.click();
+                      }
+                    } catch (_) {}
+                  };
+                  setInterval(guardAdDom, 150);
+                  return;
+                }
+
+                // 2. Kurfanova Host Native Desktop Bridge
                 if (host !== 'kurfanova.github.io' && host !== 'kurfanova.kurfa.workers.dev' && host !== 'localhost') return;
 
                 const activateBridge = () => {
@@ -229,10 +298,30 @@ public sealed class MainForm : Form
         if (Uri.TryCreate(e.Request.Uri, UriKind.Absolute, out Uri? uri))
         {
             string host = uri.Host.ToLowerInvariant();
-            if (MatchesHostOrSubdomain(host, "kurfanova.github.io") ||
-                MatchesHostOrSubdomain(host, "googlevideo.com") ||
-                MatchesHostOrSubdomain(host, "accounts.google.com") ||
-                host == "127.0.0.1")
+            string pathAndQuery = uri.PathAndQuery;
+
+            if (MatchesHostOrSubdomain(host, "googlevideo.com"))
+            {
+                bool isAdVideo = pathAndQuery.Contains("oad=", StringComparison.OrdinalIgnoreCase) ||
+                                 pathAndQuery.Contains("adformat=", StringComparison.OrdinalIgnoreCase);
+                if (!isAdVideo)
+                {
+                    return;
+                }
+            }
+            else if (MatchesHostOrSubdomain(host, "youtube.com") || MatchesHostOrSubdomain(host, "youtube-nocookie.com"))
+            {
+                bool isNormalQoe = pathAndQuery.Contains("/api/stats/qoe", StringComparison.OrdinalIgnoreCase) &&
+                                   !pathAndQuery.Contains("ad", StringComparison.OrdinalIgnoreCase);
+                if (isNormalQoe)
+                {
+                    return;
+                }
+            }
+            else if (MatchesHostOrSubdomain(host, "kurfanova.github.io") ||
+                     MatchesHostOrSubdomain(host, "kurfanova.kurfa.workers.dev") ||
+                     MatchesHostOrSubdomain(host, "accounts.google.com") ||
+                     host == "127.0.0.1")
             {
                 return;
             }

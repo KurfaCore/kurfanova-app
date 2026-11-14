@@ -52,7 +52,7 @@ jobs:
             sha256 = $sha256
             size = $exe.Length
             url = "https://github.com/KurfaCore/kurfanova-app/releases/latest/download/Kurfanova-Muzik-Windows.exe"
-            notes = "Otomatik güncelleme ve performans iyileştirmeleri"
+            notes = "Kesintisiz %100 reklamsız ses motoru (Chunked Range Proxy) ve YouTube reklam kalkanı"
           } | ConvertTo-Json
           [System.IO.File]::WriteAllText("dist-win/win-update.json", $manifest, [System.Text.UTF8Encoding]::new($false))
           Write-Host "Built: $($exe.FullName) ($($exe.Length) bytes) sha256=$sha256"
