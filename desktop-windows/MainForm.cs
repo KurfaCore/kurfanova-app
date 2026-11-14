@@ -108,7 +108,23 @@ public sealed class MainForm : Form
         Controls.Add(_webView);
 
         Load += OnFormLoad;
+        Resize += (_, _) => UpdateWebViewMemoryMode();
+        VisibleChanged += (_, _) => UpdateWebViewMemoryMode();
         FormClosed += OnFormClosed;
+    }
+
+    private void UpdateWebViewMemoryMode()
+    {
+        try
+        {
+            CoreWebView2? core = _webView.CoreWebView2;
+            if (core is null) return;
+            bool isBackground = WindowState == FormWindowState.Minimized || !Visible;
+            core.MemoryUsageTargetLevel = isBackground
+                ? CoreWebView2MemoryUsageTargetLevel.Low
+                : CoreWebView2MemoryUsageTargetLevel.Normal;
+        }
+        catch { /* ignore if disposing */ }
     }
 
     private static Icon? LoadEmbeddedIcon()
@@ -134,7 +150,10 @@ public sealed class MainForm : Form
 
             Directory.CreateDirectory(_paths.WebView2DataDir);
 
-            CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, _paths.WebView2DataDir);
+            var envOptions = new CoreWebView2EnvironmentOptions(
+                "--autoplay-policy=no-user-gesture-required --disk-cache-size=33554432 --media-cache-size=33554432 --disable-features=CalculateNativeWinOcclusion --enable-features=msLowPowerMode,msLowPowerModeAudioOnly"
+            );
+            CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, _paths.WebView2DataDir, envOptions);
             await _webView.EnsureCoreWebView2Async(env);
 
             CoreWebView2 core = _webView.CoreWebView2;
@@ -253,6 +272,7 @@ public sealed class MainForm : Form
 
                   const guardAdDom = () => {
                     try {
+                      if (document.hidden) return;
                       const player = document.querySelector('.html5-video-player');
                       if (player && player.classList.contains('ad-showing')) {
                         const v = player.querySelector('video');
@@ -267,7 +287,7 @@ public sealed class MainForm : Form
                       }
                     } catch (_) {}
                   };
-                  setInterval(guardAdDom, 150);
+                  setInterval(guardAdDom, 750);
                   return;
                 }
 

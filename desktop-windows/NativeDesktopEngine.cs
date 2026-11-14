@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
@@ -76,6 +77,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
     );
 
     private readonly ConcurrentDictionary<string, ResolvedAudio> _streamCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Task<ResolvedAudio?>> _inflightResolutions = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _visitorSemaphore = new(1, 1);
     private readonly HttpClient _apiHttpClient;
     private readonly HttpClient _streamHttpClient;
@@ -571,12 +573,19 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 long writtenInChunk = 0;
                 await using (Stream upstreamStream = await chunkUpstream.Content.ReadAsStreamAsync(ct).ConfigureAwait(false))
                 {
-                    byte[] buffer = new byte[65536];
-                    int read;
-                    while ((read = await upstreamStream.ReadAsync(buffer, ct).ConfigureAwait(false)) > 0)
+                    byte[] buffer = ArrayPool<byte>.Shared.Rent(65536);
+                    try
                     {
-                        await context.Response.OutputStream.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                        writtenInChunk += read;
+                        int read;
+                        while ((read = await upstreamStream.ReadAsync(buffer.AsMemory(0, 65536), ct).ConfigureAwait(false)) > 0)
+                        {
+                            await context.Response.OutputStream.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                            writtenInChunk += read;
+                        }
+                    }
+                    finally
+                    {
+                        ArrayPool<byte>.Shared.Return(buffer);
                     }
                 }
                 await context.Response.OutputStream.FlushAsync(ct).ConfigureAwait(false);
@@ -666,6 +675,28 @@ public sealed partial class NativeDesktopEngine : IDisposable
             _streamCache.TryRemove(cleanId, out _);
         }
 
+        // Coalesce concurrent resolutions for the same videoId so parallel range probes don't hit YouTube multiple times
+        string inflightKey = $"{cleanId}:{(forceRefresh ? '1' : '0')}:{(preferAlternateClient ? '1' : '0')}";
+        Task<ResolvedAudio?> task = _inflightResolutions.GetOrAdd(
+            inflightKey,
+            _ => ResolveAudioStreamCoreAsync(cleanId, forceRefresh, preferAlternateClient, ct)
+        );
+        try
+        {
+            return await task.ConfigureAwait(false);
+        }
+        finally
+        {
+            _inflightResolutions.TryRemove(new KeyValuePair<string, Task<ResolvedAudio?>>(inflightKey, task));
+        }
+    }
+
+    private async Task<ResolvedAudio?> ResolveAudioStreamCoreAsync(
+        string cleanId,
+        bool forceRefresh,
+        bool preferAlternateClient,
+        CancellationToken ct)
+    {
         // Primary: VISIONOS with sw.js_data visitorData (no 1 MiB CDN cap, no PO Token needed)
         // Fallbacks: IOS -> ANDROID_VR
         ResolvedAudio? resolved = preferAlternateClient

@@ -16,6 +16,8 @@
     <Authors>KurfaCode</Authors>
     <Description>Kurfamüzik Resmi Windows Masaüstü Uygulaması</Description>
     <Copyright>Copyright © 2026 KurfaCore</Copyright>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
 
   <ItemGroup>
