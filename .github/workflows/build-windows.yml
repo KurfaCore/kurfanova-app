@@ -38,7 +38,7 @@ jobs:
             -p:FileVersion="$appVersion.0" `
             -p:PublishSingleFile=true `
             -p:IncludeNativeLibrariesForSelfExtract=true `
-            -p:EnableCompressionInSingleFile=true `
+            -p:EnableCompressionInSingleFile=false `
             -o dist-win
 
       - name: Verify Built Executable & Generate Update Manifest

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32;
 
@@ -22,7 +23,6 @@ public sealed class InstallOptions
     public bool StartMenuShortcut { get; set; } = true;
     public bool RunOnStartup { get; set; } = false;
     public bool CleanupOldCopies { get; set; } = true;
-    public bool DeleteSourceInstallerAfterExit { get; set; } = false;
 }
 
 public static class InstallerService
@@ -34,6 +34,61 @@ public static class InstallerService
     public const string AppDisplayName = "Kurfamüzik";
     public const string DesktopShortcutFileName = "Kurfamüzik.lnk";
 
+    private const int MOVEFILE_DELAY_UNTIL_REBOOT = 0x00000004;
+
+    private static readonly string[] KnownProcessNames =
+    [
+        "KurfanovaMuzik",
+        "Kurfanova-Muzik-Windows"
+    ];
+
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool MoveFileEx(string lpExistingFileName, string? lpNewFileName, int dwFlags);
+
+    [ComImport]
+    [Guid("00021401-0000-0000-C000-000000000046")]
+    private class ShellLink
+    {
+    }
+
+    [ComImport]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    [Guid("000214F9-0000-0000-C000-000000000046")]
+    private interface IShellLinkW
+    {
+        void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszFile, int cchMaxPath, IntPtr pfd, int fFlags);
+        void GetIDList(out IntPtr ppidl);
+        void SetIDList(IntPtr pidl);
+        void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszName, int cchMaxName);
+        void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string pszName);
+        void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszDir, int cchMaxPath);
+        void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string pszDir);
+        void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszArgs, int cchMaxPath);
+        void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string pszArgs);
+        void GetHotkey(out short pwHotkey);
+        void SetHotkey(short wHotkey);
+        void GetShowCmd(out int piShowCmd);
+        void SetShowCmd(int iShowCmd);
+        void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder pszIconPath, int cchIconPath, out int piIcon);
+        void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string pszIconPath, int iIcon);
+        void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string pszPathRel, int dwReserved);
+        void Resolve(IntPtr hwnd, int fFlags);
+        void SetPath([MarshalAs(UnmanagedType.LPWStr)] string pszFile);
+    }
+
+    [ComImport]
+    [InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    [Guid("0000010b-0000-0000-C000-000000000046")]
+    private interface IPersistFile
+    {
+        void GetClassID(out Guid pClassID);
+        [PreserveSig] int IsDirty();
+        void Load([In, MarshalAs(UnmanagedType.LPWStr)] string pszFileName, uint dwMode);
+        void Save([In, MarshalAs(UnmanagedType.LPWStr)] string pszFileName, [In, MarshalAs(UnmanagedType.Bool)] bool fRemember);
+        void SaveCompleted([In, MarshalAs(UnmanagedType.LPWStr)] string pszFileName);
+        void GetCurFile([MarshalAs(UnmanagedType.LPWStr)] out string ppszFileName);
+    }
+
     public static ExistingInstallInfo DetectExistingInstallation()
     {
         string? previousInstallDir = null;
@@ -41,7 +96,6 @@ public static class InstallerService
         string? existingVersion = null;
         var extraOldCopies = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
-        // 1. Check Brand Key in Registry
         try
         {
             using RegistryKey? brandKey = Registry.CurrentUser.OpenSubKey(RegistryBrandKey, writable: false);
@@ -56,7 +110,6 @@ public static class InstallerService
         }
         catch { }
 
-        // 2. Check Uninstall Key in Registry
         try
         {
             using RegistryKey? uninstKey = Registry.CurrentUser.OpenSubKey(UninstallRegKey, writable: false);
@@ -75,7 +128,6 @@ public static class InstallerService
         }
         catch { }
 
-        // 3. Check known directories: %LocalAppData%\KurfanovaMuzik and %LocalAppData%\Programs\KurfanovaMuzik
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         string defaultDir = Path.Combine(localAppData, "KurfanovaMuzik");
         string programsDir = Path.Combine(localAppData, "Programs", "KurfanovaMuzik");
@@ -128,7 +180,6 @@ public static class InstallerService
             catch { }
         }
 
-        // 4. Check Desktop for Kurfanova*.exe (excluding current process)
         try
         {
             string desktop = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
@@ -146,7 +197,6 @@ public static class InstallerService
         }
         catch { }
 
-        // If version not in registry, inspect file version info
         if (existingVersion is null && existingExePath is not null && File.Exists(existingExePath))
         {
             try
@@ -164,28 +214,7 @@ public static class InstallerService
             catch { }
         }
 
-        // Count running processes
-        int runningOtherProcesses = 0;
-        try
-        {
-            int myPid = Environment.ProcessId;
-            foreach (var p in Process.GetProcesses())
-            {
-                try
-                {
-                    if (p.Id != myPid &&
-                        (p.ProcessName.Contains("Kurfanova", StringComparison.OrdinalIgnoreCase) ||
-                         p.ProcessName.Contains("Kurfamuzik", StringComparison.OrdinalIgnoreCase) ||
-                         p.ProcessName.Contains("Kurfamüzik", StringComparison.OrdinalIgnoreCase)))
-                    {
-                        runningOtherProcesses++;
-                    }
-                }
-                catch { }
-                finally { p.Dispose(); }
-            }
-        }
-        catch { }
+        int runningOtherProcesses = CountOtherRunningInstances();
 
         bool found = !string.IsNullOrWhiteSpace(previousInstallDir) ||
                      !string.IsNullOrWhiteSpace(existingExePath) ||
@@ -200,86 +229,77 @@ public static class InstallerService
             runningOtherProcesses);
     }
 
+    private static int CountOtherRunningInstances()
+    {
+        int count = 0;
+        int myPid = Environment.ProcessId;
+        foreach (string procName in KnownProcessNames)
+        {
+            try
+            {
+                foreach (Process p in Process.GetProcessesByName(procName))
+                {
+                    try
+                    {
+                        if (p.Id != myPid) count++;
+                    }
+                    catch { }
+                    finally
+                    {
+                        p.Dispose();
+                    }
+                }
+            }
+            catch { }
+        }
+        return count;
+    }
+
     public static void StopOtherRunningInstances()
     {
         int myPid = Environment.ProcessId;
-        var toKill = new List<Process>();
-
-        try
+        foreach (string procName in KnownProcessNames)
         {
-            foreach (var p in Process.GetProcesses())
+            try
             {
-                try
+                foreach (Process p in Process.GetProcessesByName(procName))
                 {
-                    if (p.Id == myPid)
+                    try
                     {
-                        p.Dispose();
-                        continue;
-                    }
+                        if (p.Id == myPid) continue;
 
-                    bool match = false;
-                    if (p.ProcessName.Contains("KurfanovaMuzik", StringComparison.OrdinalIgnoreCase) ||
-                        p.ProcessName.Contains("Kurfanova-Muzik-Windows", StringComparison.OrdinalIgnoreCase) ||
-                        p.ProcessName.Contains("Kurfamüzik", StringComparison.OrdinalIgnoreCase) ||
-                        p.ProcessName.Contains("Kurfamuzik", StringComparison.OrdinalIgnoreCase))
-                    {
-                        match = true;
-                    }
-                    else
-                    {
                         try
                         {
-                            string? module = p.MainModule?.FileName;
-                            if (!string.IsNullOrWhiteSpace(module) &&
-                                (module.Contains("KurfanovaMuzik", StringComparison.OrdinalIgnoreCase) ||
-                                 module.Contains("Kurfanova-Muzik-Windows", StringComparison.OrdinalIgnoreCase)))
+                            if (p.CloseMainWindow())
                             {
-                                match = true;
+                                p.WaitForExit(1500);
                             }
                         }
                         catch { }
-                    }
 
-                    if (match)
-                    {
-                        toKill.Add(p);
+                        if (!p.HasExited)
+                        {
+                            p.Kill();
+                            p.WaitForExit(3000);
+                        }
                     }
-                    else
+                    catch { }
+                    finally
                     {
                         p.Dispose();
                     }
                 }
-                catch
-                {
-                    p.Dispose();
-                }
             }
-
-            foreach (var p in toKill)
-            {
-                try
-                {
-                    p.Kill();
-                    p.WaitForExit(5000);
-                }
-                catch { }
-                finally
-                {
-                    p.Dispose();
-                }
-            }
+            catch { }
         }
-        catch { }
     }
 
     public static void InstallOrUpgrade(InstallOptions opts, Action<string>? onProgress = null)
     {
-        // 1. Stop other running instances
-        onProgress?.Invoke("Çalışan diğer Kurfamüzik işlemleri durduruluyor...");
+        onProgress?.Invoke("Çalışan eski Kurfamüzik işlemleri kapatılıyor...");
         StopOtherRunningInstances();
 
-        // 2. Prepare target directories
-        onProgress?.Invoke("Kurulum klasörleri hazırlanıyor...");
+        onProgress?.Invoke("Sahiplenilen uygulama klasörü hazırlanıyor...");
         var targetPaths = new AppPaths(opts.TargetInstallDir);
         Directory.CreateDirectory(targetPaths.InstallDir);
         Directory.CreateDirectory(targetPaths.DataDir);
@@ -287,7 +307,6 @@ public static class InstallerService
         Directory.CreateDirectory(targetPaths.UpdatesDir);
         Directory.CreateDirectory(targetPaths.LogsDir);
 
-        // 3. Preserve & migrate user data from old flat paths if applicable
         string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         string legacyAppData = Path.Combine(localAppData, "KurfanovaMuzik");
 
@@ -321,8 +340,7 @@ public static class InstallerService
             catch { }
         }
 
-        // 4. Clean old binaries inside targetPaths.InstallDir
-        onProgress?.Invoke("Eski ikili dosyalar temizleniyor...");
+        onProgress?.Invoke("Eski ikili dosyalar ve kalıntılar temizleniyor...");
         try
         {
             string targetExeName = Path.GetFileName(targetPaths.InstalledExePath);
@@ -335,7 +353,6 @@ public static class InstallerService
                     continue;
                 }
 
-                // If already running from installed exe, avoid deleting self
                 if (name.Equals(targetExeName, StringComparison.OrdinalIgnoreCase) &&
                     string.Equals(Environment.ProcessPath, targetPaths.InstalledExePath, StringComparison.OrdinalIgnoreCase))
                 {
@@ -349,6 +366,7 @@ public static class InstallerService
                     try { File.Delete(file); } catch { }
                 }
                 else if (name.EndsWith(".bak", StringComparison.OrdinalIgnoreCase) ||
+                         name.EndsWith(".old", StringComparison.OrdinalIgnoreCase) ||
                          name.EndsWith(".part", StringComparison.OrdinalIgnoreCase) ||
                          name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase))
                 {
@@ -358,7 +376,6 @@ public static class InstallerService
         }
         catch { }
 
-        // Clean previous install location if different and cleanup requested
         if (opts.CleanupOldCopies &&
             !string.IsNullOrWhiteSpace(opts.PreviousInstallDir) &&
             !string.Equals(Path.GetFullPath(opts.PreviousInstallDir), Path.GetFullPath(targetPaths.InstallDir), StringComparison.OrdinalIgnoreCase) &&
@@ -379,7 +396,6 @@ public static class InstallerService
             catch { }
         }
 
-        // 5. Clean old Desktop copies and old shortcuts if requested
         if (opts.CleanupOldCopies)
         {
             try
@@ -406,13 +422,13 @@ public static class InstallerService
             catch { }
         }
 
-        // 6. Copy Environment.ProcessPath cleanly to targetPaths.InstalledExePath
-        onProgress?.Invoke("Kurfamüzik dosyaları kopyalanıyor...");
+        onProgress?.Invoke("Resmi uygulama paketi kurulum klasörüne yerleştiriliyor...");
         string? currentExe = Environment.ProcessPath;
         if (!string.IsNullOrWhiteSpace(currentExe) &&
             !string.Equals(Path.GetFullPath(currentExe), Path.GetFullPath(targetPaths.InstalledExePath), StringComparison.OrdinalIgnoreCase))
         {
             string tempNewExe = targetPaths.InstalledExePath + ".new";
+            string oldRenameExe = targetPaths.InstalledExePath + ".old";
             bool copied = false;
             Exception? lastEx = null;
 
@@ -421,14 +437,27 @@ public static class InstallerService
                 try
                 {
                     File.Copy(currentExe, tempNewExe, overwrite: true);
+                    if (File.Exists(targetPaths.InstalledExePath))
+                    {
+                        try
+                        {
+                            File.Delete(targetPaths.InstalledExePath);
+                        }
+                        catch
+                        {
+                            try { if (File.Exists(oldRenameExe)) File.Delete(oldRenameExe); } catch { }
+                            File.Move(targetPaths.InstalledExePath, oldRenameExe, overwrite: true);
+                        }
+                    }
                     File.Move(tempNewExe, targetPaths.InstalledExePath, overwrite: true);
+                    try { if (File.Exists(oldRenameExe)) File.Delete(oldRenameExe); } catch { }
                     copied = true;
                     break;
                 }
                 catch (Exception ex)
                 {
                     lastEx = ex;
-                    Thread.Sleep(400);
+                    Thread.Sleep(350);
                 }
             }
 
@@ -438,7 +467,6 @@ public static class InstallerService
             }
         }
 
-        // Extract embedded icon to targetPaths.IconPath
         try
         {
             using Stream? iconStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("KurfanovaMuzik.app.ico");
@@ -450,8 +478,7 @@ public static class InstallerService
         }
         catch { }
 
-        // 7. Create DesktopAppConfig and save config.json
-        onProgress?.Invoke("Yapılandırma ayarları kaydediliyor...");
+        onProgress?.Invoke("Yapılandırma ve kısayollar kaydediliyor...");
         var cfg = new DesktopAppConfig
         {
             InstallDir = targetPaths.InstallDir,
@@ -459,15 +486,13 @@ public static class InstallerService
             StartMenuShortcut = opts.StartMenuShortcut,
             RunOnStartup = opts.RunOnStartup,
             InstalledVersion = AppPaths.GetNormalizedCurrentVersion().ToString(3),
-            UpdatedAt = DateTimeOffset.UtcNow
+            UpdatedAt = DateTimeOffset.UtcNow,
+            LastUpdateCheckUtc = DateTimeOffset.UtcNow
         };
         AppPaths.SaveConfig(targetPaths, cfg);
 
-        // 8. Apply shortcuts and registry integration
-        onProgress?.Invoke("Kısayollar ve sistem kaydı oluşturuluyor...");
         ApplyShortcutsAndRegistry(targetPaths, cfg, AppPaths.GetNormalizedCurrentVersion());
 
-        // 9. Write install log line
         try
         {
             string logFile = Path.Combine(targetPaths.LogsDir, "app.log");
@@ -476,20 +501,58 @@ public static class InstallerService
         }
         catch { }
 
-        // 10. Launch installed EXE
         onProgress?.Invoke("Kurfamüzik başlatılıyor...");
         Process.Start(new ProcessStartInfo(targetPaths.InstalledExePath)
         {
             WorkingDirectory = targetPaths.InstallDir,
             UseShellExecute = true
         });
+    }
 
-        // 11. Schedule deletion of source installer if requested
-        if (opts.DeleteSourceInstallerAfterExit &&
-            !string.IsNullOrWhiteSpace(currentExe) &&
-            !string.Equals(Path.GetFullPath(currentExe), Path.GetFullPath(targetPaths.InstalledExePath), StringComparison.OrdinalIgnoreCase))
+    private static void CreateShortcutNative(
+        string shortcutPath,
+        string targetPath,
+        string workingDirectory,
+        string iconPath,
+        string description,
+        string? arguments = null)
+    {
+        object? linkObj = null;
+        try
         {
-            ScheduleDeleteSourceInstaller(currentExe);
+            string? parentDir = Path.GetDirectoryName(shortcutPath);
+            if (!string.IsNullOrWhiteSpace(parentDir))
+            {
+                Directory.CreateDirectory(parentDir);
+            }
+
+            linkObj = new ShellLink();
+            var link = (IShellLinkW)linkObj;
+            link.SetPath(targetPath);
+            link.SetWorkingDirectory(workingDirectory);
+            link.SetDescription(description);
+            if (!string.IsNullOrWhiteSpace(arguments))
+            {
+                link.SetArguments(arguments);
+            }
+            if (!string.IsNullOrWhiteSpace(iconPath) && File.Exists(iconPath))
+            {
+                link.SetIconLocation(iconPath, 0);
+            }
+
+            var persistFile = (IPersistFile)linkObj;
+            persistFile.Save(shortcutPath, true);
+        }
+        catch
+        {
+            // Ignore shortcut creation errors on restricted shell environments
+        }
+        finally
+        {
+            if (linkObj is not null && Marshal.IsComObject(linkObj))
+            {
+                try { Marshal.FinalReleaseComObject(linkObj); } catch { }
+            }
         }
     }
 
@@ -498,81 +561,78 @@ public static class InstallerService
         string desktopDir = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
         string desktopLnk = Path.Combine(desktopDir, DesktopShortcutFileName);
 
+        if (cfg.DesktopShortcut)
+        {
+            CreateShortcutNative(
+                desktopLnk,
+                paths.InstalledExePath,
+                paths.InstallDir,
+                paths.IconPath,
+                "Kurfamüzik — Reklamsız Masaüstü Uygulaması");
+        }
+        else
+        {
+            try
+            {
+                if (File.Exists(desktopLnk)) File.Delete(desktopLnk);
+            }
+            catch { }
+        }
+
         string startMenuDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Kurfamüzik");
         string startMenuMainLnk = Path.Combine(startMenuDir, "Kurfamüzik.lnk");
         string startMenuUninstallLnk = Path.Combine(startMenuDir, "Kurfamüzik Kaldır.lnk");
 
-        string psScript = $$"""
-            $ErrorActionPreference = 'SilentlyContinue'
-            $wsh = New-Object -ComObject WScript.Shell
+        if (cfg.StartMenuShortcut)
+        {
+            CreateShortcutNative(
+                startMenuMainLnk,
+                paths.InstalledExePath,
+                paths.InstallDir,
+                paths.IconPath,
+                "Kurfamüzik — Reklamsız Masaüstü Uygulaması");
 
-            # Desktop Shortcut
-            $desktopLnk = '{{EscapePsSingleQuote(desktopLnk)}}'
-            if ('{{(cfg.DesktopShortcut ? "1" : "0")}}' -eq '1') {
-                $sc = $wsh.CreateShortcut($desktopLnk)
-                $sc.TargetPath = '{{EscapePsSingleQuote(paths.InstalledExePath)}}'
-                $sc.WorkingDirectory = '{{EscapePsSingleQuote(paths.InstallDir)}}'
-                $sc.IconLocation = '{{EscapePsSingleQuote(paths.IconPath)}},0'
-                $sc.Description = 'Kurfamüzik Masaüstü Uygulaması'
-                $sc.Save()
-            } else {
-                if (Test-Path -LiteralPath $desktopLnk) {
-                    Remove-Item -LiteralPath $desktopLnk -Force -ErrorAction SilentlyContinue
-                }
+            CreateShortcutNative(
+                startMenuUninstallLnk,
+                paths.InstalledExePath,
+                paths.InstallDir,
+                paths.IconPath,
+                "Kurfamüzik Masaüstü Uygulamasını Kaldır",
+                "--uninstall");
+        }
+        else
+        {
+            try
+            {
+                if (Directory.Exists(startMenuDir)) Directory.Delete(startMenuDir, recursive: true);
             }
+            catch { }
+        }
 
-            # Start Menu Shortcuts
-            $startMenuDir = '{{EscapePsSingleQuote(startMenuDir)}}'
-            $startMenuMainLnk = '{{EscapePsSingleQuote(startMenuMainLnk)}}'
-            $startMenuUninstallLnk = '{{EscapePsSingleQuote(startMenuUninstallLnk)}}'
-            if ('{{(cfg.StartMenuShortcut ? "1" : "0")}}' -eq '1') {
-                if (-not (Test-Path -LiteralPath $startMenuDir)) {
-                    New-Item -ItemType Directory -LiteralPath $startMenuDir -Force | Out-Null
-                }
-                $scMain = $wsh.CreateShortcut($startMenuMainLnk)
-                $scMain.TargetPath = '{{EscapePsSingleQuote(paths.InstalledExePath)}}'
-                $scMain.WorkingDirectory = '{{EscapePsSingleQuote(paths.InstallDir)}}'
-                $scMain.IconLocation = '{{EscapePsSingleQuote(paths.IconPath)}},0'
-                $scMain.Description = 'Kurfamüzik Masaüstü Uygulaması'
-                $scMain.Save()
-
-                $scUninst = $wsh.CreateShortcut($startMenuUninstallLnk)
-                $scUninst.TargetPath = '{{EscapePsSingleQuote(paths.InstalledExePath)}}'
-                $scUninst.Arguments = '--uninstall'
-                $scUninst.WorkingDirectory = '{{EscapePsSingleQuote(paths.InstallDir)}}'
-                $scUninst.IconLocation = '{{EscapePsSingleQuote(paths.IconPath)}},0'
-                $scUninst.Description = 'Kurfamüzik Masaüstü Uygulamasını Kaldır'
-                $scUninst.Save()
-            } else {
-                if (Test-Path -LiteralPath $startMenuDir) {
-                    Remove-Item -LiteralPath $startMenuDir -Recurse -Force -ErrorAction SilentlyContinue
-                }
-            }
-
-            Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-            """;
-
-        ExecutePsScript(psScript);
-
-        // Registry: Run on Windows startup
+        // Only open HKCU\...\Run for writing if RunOnStartup is enabled OR a previous entry exists to clean up
         try
         {
-            using RegistryKey? runKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: true);
-            if (runKey is not null)
+            if (cfg.RunOnStartup)
             {
-                if (cfg.RunOnStartup)
+                using RegistryKey? runKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: true);
+                runKey?.SetValue(StartupRegValueName, $"\"{paths.InstalledExePath}\"");
+            }
+            else
+            {
+                bool hasExistingStartupVal = false;
+                using (RegistryKey? readRunKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: false))
                 {
-                    runKey.SetValue(StartupRegValueName, $"\"{paths.InstalledExePath}\"");
+                    hasExistingStartupVal = readRunKey?.GetValue(StartupRegValueName) is not null;
                 }
-                else
+                if (hasExistingStartupVal)
                 {
-                    runKey.DeleteValue(StartupRegValueName, throwOnMissingValue: false);
+                    using RegistryKey? writeRunKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: true);
+                    writeRunKey?.DeleteValue(StartupRegValueName, throwOnMissingValue: false);
                 }
             }
         }
         catch { }
 
-        // Registry: KurfaCore Brand Key
         try
         {
             using RegistryKey brandKey = Registry.CurrentUser.CreateSubKey(RegistryBrandKey, writable: true);
@@ -583,7 +643,6 @@ public static class InstallerService
         }
         catch { }
 
-        // Registry: Windows Installed Apps (Uninstall key)
         try
         {
             using RegistryKey uninstKey = Registry.CurrentUser.CreateSubKey(UninstallRegKey, writable: true);
@@ -686,7 +745,6 @@ public static class InstallerService
         string activeInstallDir = AppPaths.ResolveActiveInstallDir();
         var paths = new AppPaths(activeInstallDir);
 
-        // Remove shortcuts
         try
         {
             string desktopLnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), DesktopShortcutFileName);
@@ -701,11 +759,14 @@ public static class InstallerService
         }
         catch { }
 
-        // Remove registry values
         try
         {
-            using RegistryKey? runKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: true);
-            runKey?.DeleteValue(StartupRegValueName, throwOnMissingValue: false);
+            using RegistryKey? readRunKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: false);
+            if (readRunKey?.GetValue(StartupRegValueName) is not null)
+            {
+                using RegistryKey? writeRunKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: true);
+                writeRunKey?.DeleteValue(StartupRegValueName, throwOnMissingValue: false);
+            }
         }
         catch { }
 
@@ -721,59 +782,48 @@ public static class InstallerService
         }
         catch { }
 
-        // Schedule background cleanup via PowerShell after PID exits
         try
         {
-            string tempScript = Path.Combine(Path.GetTempPath(), $"kurfa_uninstall_{Guid.NewGuid():N}.ps1");
-            string scriptBody = """
-                $ErrorActionPreference = 'SilentlyContinue'
-                $targetPid = [int]$env:KURFA_UNINST_PID
-                $dir = $env:KURFA_UNINST_DIR
-                $purge = $env:KURFA_UNINST_PURGE -eq '1'
+            if (Directory.Exists(paths.InstallDir))
+            {
+                try { if (File.Exists(paths.IconPath)) File.Delete(paths.IconPath); } catch { }
+                try { if (File.Exists(paths.ConfigPath)) File.Delete(paths.ConfigPath); } catch { }
+                try { if (Directory.Exists(paths.UpdatesDir)) Directory.Delete(paths.UpdatesDir, recursive: true); } catch { }
+                try { if (Directory.Exists(paths.LogsDir)) Directory.Delete(paths.LogsDir, recursive: true); } catch { }
 
-                for ($i = 0; $i -lt 30; $i++) {
-                    $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
-                    if (-not $proc) { break }
-                    Start-Sleep -Milliseconds 500
+                if (purgeData && Directory.Exists(paths.DataDir))
+                {
+                    try { Directory.Delete(paths.DataDir, recursive: true); } catch { }
                 }
 
-                if (Test-Path -LiteralPath $dir) {
-                    Remove-Item -LiteralPath "$dir\KurfanovaMuzik.exe" -Force -ErrorAction SilentlyContinue
-                    Remove-Item -LiteralPath "$dir\Kurfanova-Muzik-Windows.exe" -Force -ErrorAction SilentlyContinue
-                    Remove-Item -LiteralPath "$dir\kurfanova.ico" -Force -ErrorAction SilentlyContinue
-                    Remove-Item -LiteralPath "$dir\config.json" -Force -ErrorAction SilentlyContinue
-                    Remove-Item -LiteralPath "$dir\Updates" -Recurse -Force -ErrorAction SilentlyContinue
-                    Remove-Item -LiteralPath "$dir\Logs" -Recurse -Force -ErrorAction SilentlyContinue
-
-                    if ($purge) {
-                        Remove-Item -LiteralPath "$dir\Data" -Recurse -Force -ErrorAction SilentlyContinue
-                        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
-                    } else {
-                        $items = Get-ChildItem -LiteralPath $dir -ErrorAction SilentlyContinue
-                        if (-not $items) {
-                            Remove-Item -LiteralPath $dir -Force -ErrorAction SilentlyContinue
+                if (File.Exists(paths.InstalledExePath))
+                {
+                    try
+                    {
+                        File.Delete(paths.InstalledExePath);
+                    }
+                    catch
+                    {
+                        // Running executable can be renamed into Temp and marked for OS cleanup without external scripts
+                        try
+                        {
+                            string tempOld = Path.Combine(Path.GetTempPath(), $"kurfa_uninst_{Guid.NewGuid():N}.old");
+                            File.Move(paths.InstalledExePath, tempOld, overwrite: true);
+                            MoveFileEx(tempOld, null, MOVEFILE_DELAY_UNTIL_REBOOT);
                         }
+                        catch { }
                     }
                 }
 
-                Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-                """;
-
-            File.WriteAllText(tempScript, scriptBody, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = "powershell.exe",
-                Arguments = $"-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{tempScript}\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            };
-            psi.Environment["KURFA_UNINST_PID"] = Environment.ProcessId.ToString();
-            psi.Environment["KURFA_UNINST_DIR"] = paths.InstallDir;
-            psi.Environment["KURFA_UNINST_PURGE"] = purgeData ? "1" : "0";
-
-            Process.Start(psi);
+                try
+                {
+                    if (Directory.GetFileSystemEntries(paths.InstallDir).Length == 0)
+                    {
+                        Directory.Delete(paths.InstallDir, recursive: false);
+                    }
+                }
+                catch { }
+            }
         }
         catch { }
 
@@ -787,80 +837,6 @@ public static class InstallerService
         }
 
         Environment.Exit(0);
-    }
-
-    private static void ScheduleDeleteSourceInstaller(string sourceExePath)
-    {
-        try
-        {
-            string scriptPath = Path.Combine(Path.GetTempPath(), $"kurfa_del_src_{Guid.NewGuid():N}.ps1");
-            string scriptBody = """
-                $ErrorActionPreference = 'SilentlyContinue'
-                $targetPid = [int]$env:KURFA_SRC_PID
-                $exe = $env:KURFA_SRC_EXE
-
-                for ($i = 0; $i -lt 30; $i++) {
-                    $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
-                    if (-not $proc) { break }
-                    Start-Sleep -Milliseconds 500
-                }
-
-                for ($attempt = 0; $attempt -lt 10; $attempt++) {
-                    try {
-                        if (Test-Path -LiteralPath $exe) {
-                            Remove-Item -LiteralPath $exe -Force -ErrorAction Stop
-                        }
-                        break
-                    } catch {
-                        Start-Sleep -Milliseconds 500
-                    }
-                }
-
-                Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-                """;
-
-            File.WriteAllText(scriptPath, scriptBody, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = "powershell.exe",
-                Arguments = $"-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{scriptPath}\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            };
-            psi.Environment["KURFA_SRC_PID"] = Environment.ProcessId.ToString();
-            psi.Environment["KURFA_SRC_EXE"] = sourceExePath;
-
-            Process.Start(psi);
-        }
-        catch { }
-    }
-
-    private static void ExecutePsScript(string scriptBody)
-    {
-        try
-        {
-            string tempScript = Path.Combine(Path.GetTempPath(), $"kurfa_ps_{Guid.NewGuid():N}.ps1");
-            File.WriteAllText(tempScript, scriptBody, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = "powershell.exe",
-                Arguments = $"-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{tempScript}\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WindowStyle = ProcessWindowStyle.Hidden
-            };
-
-            using Process? proc = Process.Start(psi);
-            proc?.WaitForExit(10000);
-            if (File.Exists(tempScript))
-            {
-                try { File.Delete(tempScript); } catch { }
-            }
-        }
-        catch { }
     }
 
     private static void CopyDirectory(string sourceDir, string destinationDir)
@@ -877,6 +853,4 @@ public static class InstallerService
             CopyDirectory(subDir, targetSubDir);
         }
     }
-
-    private static string EscapePsSingleQuote(string value) => value.Replace("'", "''");
 }

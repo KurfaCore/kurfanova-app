@@ -16,6 +16,7 @@ public sealed class DesktopAppConfig
     public bool RunOnStartup { get; set; } = false;
     public string InstalledVersion { get; set; } = "1.1.0";
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
+    public DateTimeOffset? LastUpdateCheckUtc { get; set; }
 }
 
 public sealed class AppPaths

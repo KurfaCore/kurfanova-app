@@ -156,8 +156,8 @@ public sealed class MainForm : Form
             {
                 try
                 {
-                    await Task.Delay(3500, _shutdownCts.Token).ConfigureAwait(false);
-                    await _updater.CheckAndStageAsync(_shutdownCts.Token).ConfigureAwait(false);
+                    await Task.Delay(12000, _shutdownCts.Token).ConfigureAwait(false);
+                    await _updater.CheckAndStageAsync(_shutdownCts.Token, force: false).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) { }
             });
@@ -366,7 +366,7 @@ public sealed class MainForm : Form
                         break;
 
                     case "CHECK_UPDATE":
-                        await _updater.CheckAndStageAsync(ct).ConfigureAwait(false);
+                        await _updater.CheckAndStageAsync(ct, force: true).ConfigureAwait(false);
                         responseObj = new
                         {
                             success = true,
@@ -751,7 +751,7 @@ public sealed class MainForm : Form
             var itemCheckUpdate = new ToolStripMenuItem("Güncellemeleri Denetle", null, async (_, _) =>
             {
                 _trayIcon.ShowBalloonTip(1500, "Kurfamüzik", "Güncellemeler denetleniyor...", ToolTipIcon.Info);
-                await _updater.CheckAndStageAsync(_shutdownCts.Token);
+                await _updater.CheckAndStageAsync(_shutdownCts.Token, force: true);
                 if (!_updater.HasStagedUpdate)
                 {
                     _trayIcon.ShowBalloonTip(2000, "Kurfamüzik", "Uygulamanız güncel.", ToolTipIcon.Info);

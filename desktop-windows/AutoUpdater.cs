@@ -11,12 +11,17 @@ public sealed class AutoUpdater : IDisposable
     private const string ManifestUrl =
         "https://github.com/KurfaCore/kurfanova-app/releases/latest/download/win-update.json";
 
+    private static readonly TimeSpan AutoCheckCooldown = TimeSpan.FromHours(4);
+    private static readonly TimeSpan ManualCheckCooldown = TimeSpan.FromSeconds(25);
     private static readonly HttpClient Http = CreateHttpClient();
 
     private readonly AppPaths _paths;
     private readonly string _updatesDir;
     private readonly string _stagedMetaPath;
     private readonly Version _currentVersion;
+    private readonly SemaphoreSlim _checkGate = new(1, 1);
+    private DateTimeOffset _lastInMemoryCheckAt = DateTimeOffset.MinValue;
+    private string? _stagedSha256;
     private int _applyTriggered;
 
     public string? StagedExePath { get; private set; }
@@ -53,33 +58,69 @@ public sealed class AutoUpdater : IDisposable
         {
             Timeout = TimeSpan.FromMinutes(3)
         };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("KurfanovaMuzik-Updater/1.1");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("KurfanovaMuzik-Updater/1.2");
         return client;
     }
 
-    public async Task CheckAndStageAsync(CancellationToken ct)
+    public async Task CheckAndStageAsync(CancellationToken ct, bool force = false)
     {
+        if (!await _checkGate.WaitAsync(0, ct).ConfigureAwait(false))
+        {
+            return;
+        }
+
         try
         {
             CleanupOldTempFiles();
 
-            // Check if a previously staged binary already exists and is still newer than us
-            if (TryLoadExistingStaged(out Version? existingVer, out string? existingPath, out string? existingNotes) &&
+            if (TryLoadExistingStaged(out Version? existingVer, out string? existingPath, out string? existingSha, out string? existingNotes) &&
                 existingVer is not null && existingPath is not null &&
                 existingVer > _currentVersion)
             {
                 StagedVersion = existingVer;
                 StagedExePath = existingPath;
+                _stagedSha256 = existingSha;
                 ReleaseNotes = existingNotes;
                 UpdateReady?.Invoke(existingVer, existingNotes);
                 return;
             }
 
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            if (force)
+            {
+                if ((now - _lastInMemoryCheckAt) < ManualCheckCooldown)
+                {
+                    return;
+                }
+            }
+            else
+            {
+                if ((now - _lastInMemoryCheckAt) < AutoCheckCooldown)
+                {
+                    return;
+                }
+                DesktopAppConfig cfg = AppPaths.LoadOrDefaultConfig(_paths, _currentVersion);
+                if (cfg.LastUpdateCheckUtc.HasValue && (now - cfg.LastUpdateCheckUtc.Value) < AutoCheckCooldown)
+                {
+                    _lastInMemoryCheckAt = cfg.LastUpdateCheckUtc.Value;
+                    return;
+                }
+            }
+
+            _lastInMemoryCheckAt = now;
+            try
+            {
+                DesktopAppConfig cfg = AppPaths.LoadOrDefaultConfig(_paths, _currentVersion);
+                cfg.LastUpdateCheckUtc = now;
+                AppPaths.SaveConfig(_paths, cfg);
+            }
+            catch { }
+
             Directory.CreateDirectory(_updatesDir);
 
             using var manifestCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            manifestCts.CancelAfter(TimeSpan.FromSeconds(20));
-            string manifestUrl = $"{ManifestUrl}?t={DateTimeOffset.UtcNow.ToUnixTimeSeconds()}";
+            manifestCts.CancelAfter(TimeSpan.FromSeconds(18));
+            string manifestUrl = $"{ManifestUrl}?t={now.ToUnixTimeSeconds()}";
             string manifestJson = await Http.GetStringAsync(manifestUrl, manifestCts.Token).ConfigureAwait(false);
 
             using JsonDocument doc = JsonDocument.Parse(manifestJson);
@@ -126,6 +167,7 @@ public sealed class AutoUpdater : IDisposable
                 SaveStagedMeta(remoteVersion.ToString(), targetExePath, expectedSha256, notes);
                 StagedVersion = remoteVersion;
                 StagedExePath = targetExePath;
+                _stagedSha256 = expectedSha256;
                 ReleaseNotes = notes;
                 UpdateReady?.Invoke(remoteVersion, notes);
                 return;
@@ -159,12 +201,17 @@ public sealed class AutoUpdater : IDisposable
 
             StagedVersion = remoteVersion;
             StagedExePath = targetExePath;
+            _stagedSha256 = expectedSha256;
             ReleaseNotes = notes;
             UpdateReady?.Invoke(remoteVersion, notes);
         }
         catch
         {
             // Never interrupt playback or startup if offline/unreachable
+        }
+        finally
+        {
+            _checkGate.Release();
         }
     }
 
@@ -179,6 +226,10 @@ public sealed class AutoUpdater : IDisposable
         catch { }
     }
 
+    /// <summary>
+    /// Applies the verified staged update in-place using Windows NTFS native live executable rename
+    /// (100% in-process file operations, zero external scripts, zero AV behavioral false positives).
+    /// </summary>
     public bool TryApplyPendingUpdate(bool relaunch)
     {
         if (!HasStagedUpdate || string.IsNullOrWhiteSpace(StagedExePath))
@@ -192,6 +243,14 @@ public sealed class AutoUpdater : IDisposable
 
         try
         {
+            if (!string.IsNullOrWhiteSpace(_stagedSha256) &&
+                !VerifyFileIntegrity(StagedExePath, 0, _stagedSha256))
+            {
+                TryDeleteFile(_stagedMetaPath);
+                Interlocked.Exchange(ref _applyTriggered, 0);
+                return false;
+            }
+
             string? currentExe = Environment.ProcessPath;
             if (!IsUpdatableProcessPath(currentExe))
             {
@@ -206,101 +265,37 @@ public sealed class AutoUpdater : IDisposable
                 }
             }
 
-            Directory.CreateDirectory(_updatesDir);
-            Directory.CreateDirectory(_paths.LogsDir);
-            string logPath = Path.Combine(_paths.LogsDir, "updater.log");
+            string oldExePath = currentExe! + ".old";
+            TryDeleteFile(oldExePath);
 
-            string scriptPath = Path.Combine(_updatesDir, "apply_update.ps1");
-            string scriptBody = """
-                $ErrorActionPreference = 'SilentlyContinue'
-                $targetPid = [int]$env:KURFA_PID
-                $cur = $env:KURFA_CUR
-                $newExe = $env:KURFA_NEW
-                $meta = $env:KURFA_META
-                $logFile = $env:KURFA_LOG
-                $relaunch = $env:KURFA_RELAUNCH -eq '1'
-                $bak = "$cur.bak"
-
-                for ($i = 0; $i -lt 30; $i++) {
-                  $proc = Get-Process -Id $targetPid -ErrorAction SilentlyContinue
-                  if (-not $proc) { break }
-                  Start-Sleep -Milliseconds 500
-                }
-
-                if (-not (Test-Path -LiteralPath $newExe)) { exit 1 }
-
-                $swapped = $false
-                for ($attempt = 0; $attempt -lt 8; $attempt++) {
-                  try {
-                    if (Test-Path -LiteralPath $cur) {
-                      Move-Item -LiteralPath $cur -Destination $bak -Force -ErrorAction Stop
-                    }
-                    Move-Item -LiteralPath $newExe -Destination $cur -Force -ErrorAction Stop
-                    $swapped = $true
-                    break
-                  } catch {
-                    if ((-not (Test-Path -LiteralPath $cur)) -and (Test-Path -LiteralPath $bak)) {
-                      Move-Item -LiteralPath $bak -Destination $cur -Force -ErrorAction SilentlyContinue
-                    }
-                    Start-Sleep -Milliseconds 600
-                  }
-                }
-
-                if ($swapped) {
-                  Remove-Item -LiteralPath $bak -Force -ErrorAction SilentlyContinue
-                  Remove-Item -LiteralPath $meta -Force -ErrorAction SilentlyContinue
-                  if ($logFile) {
-                    $ts = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
-                    Add-Content -LiteralPath $logFile -Value "[$ts] Update applied successfully to $cur" -ErrorAction SilentlyContinue
-                  }
-                  if ($relaunch -and (Test-Path -LiteralPath $cur)) {
-                    Start-Process -FilePath $cur
-                  }
-                }
-
-                Remove-Item -LiteralPath $PSCommandPath -Force -ErrorAction SilentlyContinue
-                """;
-            File.WriteAllText(scriptPath, scriptBody, new UTF8Encoding(encoderShouldEmitUTF8Identifier: true));
-
-            bool dirWritable = CanWriteToDirectory(Path.GetDirectoryName(currentExe!));
-            var psi = new ProcessStartInfo
+            // NTFS allows renaming a running executable within the same directory
+            File.Move(currentExe!, oldExePath, overwrite: true);
+            try
             {
-                FileName = "powershell.exe",
-                Arguments = $"-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File \"{scriptPath}\"",
-                UseShellExecute = !dirWritable,
-                CreateNoWindow = dirWritable,
-                WindowStyle = ProcessWindowStyle.Hidden
-            };
-            if (!dirWritable)
-            {
-                psi.Verb = "runas";
-                // Pass via Environment fails when UseShellExecute = true; only fall back to args when UAC is needed
-                psi.Arguments =
-                    $"-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -Command \"" +
-                    $"$env:KURFA_PID='{Environment.ProcessId}';" +
-                    $"$env:KURFA_CUR='{EscapePsSingleQuote(currentExe!)}';" +
-                    $"$env:KURFA_NEW='{EscapePsSingleQuote(StagedExePath)}';" +
-                    $"$env:KURFA_META='{EscapePsSingleQuote(_stagedMetaPath)}';" +
-                    $"$env:KURFA_LOG='{EscapePsSingleQuote(logPath)}';" +
-                    $"$env:KURFA_RELAUNCH='{(relaunch ? "1" : "0")}';" +
-                    $"& '{EscapePsSingleQuote(scriptPath)}'\"";
+                File.Move(StagedExePath, currentExe!, overwrite: true);
             }
-            else
+            catch
             {
-                psi.Environment["KURFA_PID"] = Environment.ProcessId.ToString();
-                psi.Environment["KURFA_CUR"] = currentExe!;
-                psi.Environment["KURFA_NEW"] = StagedExePath;
-                psi.Environment["KURFA_META"] = _stagedMetaPath;
-                psi.Environment["KURFA_LOG"] = logPath;
-                psi.Environment["KURFA_RELAUNCH"] = relaunch ? "1" : "0";
-            }
-
-            Process? started = Process.Start(psi);
-            if (started is null)
-            {
+                if (!File.Exists(currentExe!) && File.Exists(oldExePath))
+                {
+                    try { File.Move(oldExePath, currentExe!, overwrite: true); } catch { }
+                }
                 Interlocked.Exchange(ref _applyTriggered, 0);
                 return false;
             }
+
+            TryDeleteFile(_stagedMetaPath);
+            LogUpdater($"Update applied natively in-place to {currentExe} (v{StagedVersion})");
+
+            if (relaunch && File.Exists(currentExe!))
+            {
+                Process.Start(new ProcessStartInfo(currentExe!)
+                {
+                    WorkingDirectory = Path.GetDirectoryName(currentExe!) ?? _paths.InstallDir,
+                    UseShellExecute = true
+                });
+            }
+
             return true;
         }
         catch
@@ -310,10 +305,11 @@ public sealed class AutoUpdater : IDisposable
         }
     }
 
-    private bool TryLoadExistingStaged(out Version? version, out string? exePath, out string? notes)
+    private bool TryLoadExistingStaged(out Version? version, out string? exePath, out string? sha256, out string? notes)
     {
         version = null;
         exePath = null;
+        sha256 = null;
         notes = null;
         try
         {
@@ -338,6 +334,7 @@ public sealed class AutoUpdater : IDisposable
             }
 
             exePath = path;
+            sha256 = sha;
             return true;
         }
         catch
@@ -369,15 +366,29 @@ public sealed class AutoUpdater : IDisposable
     {
         try
         {
-            if (!Directory.Exists(_updatesDir)) return;
-            foreach (string part in Directory.EnumerateFiles(_updatesDir, "*.part"))
+            if (Directory.Exists(_updatesDir))
             {
-                TryDeleteFile(part);
+                foreach (string part in Directory.EnumerateFiles(_updatesDir, "*.part"))
+                {
+                    TryDeleteFile(part);
+                }
             }
             string? currentExe = Environment.ProcessPath;
             if (!string.IsNullOrWhiteSpace(currentExe))
             {
                 TryDeleteFile(currentExe + ".bak");
+                TryDeleteFile(currentExe + ".old");
+            }
+            if (Directory.Exists(_paths.InstallDir))
+            {
+                foreach (string oldFile in Directory.EnumerateFiles(_paths.InstallDir, "*.old"))
+                {
+                    TryDeleteFile(oldFile);
+                }
+                foreach (string bakFile in Directory.EnumerateFiles(_paths.InstallDir, "*.bak"))
+                {
+                    TryDeleteFile(bakFile);
+                }
             }
         }
         catch
@@ -434,24 +445,6 @@ public sealed class AutoUpdater : IDisposable
         return File.Exists(exePath);
     }
 
-    private static bool CanWriteToDirectory(string? dirPath)
-    {
-        if (string.IsNullOrWhiteSpace(dirPath)) return false;
-        try
-        {
-            string probe = Path.Combine(dirPath, $".kurfa_write_test_{Guid.NewGuid():N}");
-            using (File.Create(probe)) { }
-            File.Delete(probe);
-            return true;
-        }
-        catch
-        {
-            return false;
-        }
-    }
-
-    private static string EscapePsSingleQuote(string value) => value.Replace("'", "''");
-
     private static void TryDeleteFile(string path)
     {
         try
@@ -484,6 +477,6 @@ public sealed class AutoUpdater : IDisposable
 
     public void Dispose()
     {
-        // Shared HttpClient stays static for reuse; nothing unmanaged held here
+        _checkGate.Dispose();
     }
 }

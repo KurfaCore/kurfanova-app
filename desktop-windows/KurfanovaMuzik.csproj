@@ -14,6 +14,8 @@
     <Product>Kurfanova Müzik</Product>
     <Company>KurfaCore</Company>
     <Authors>KurfaCode</Authors>
+    <Description>Kurfamüzik Resmi Windows Masaüstü Uygulaması</Description>
+    <Copyright>Copyright © 2026 KurfaCore</Copyright>
   </PropertyGroup>
 
   <ItemGroup>
