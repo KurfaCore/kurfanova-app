@@ -1,0 +1,54 @@
+name: Build Kurfanova Windows Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'desktop-windows/**'
+      - '.github/workflows/build-windows.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Windows Desktop EXE
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Publish Single-File Windows Executable
+        run: >
+          dotnet publish desktop-windows/KurfanovaMuzik.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -o dist-win
+
+      - name: Verify Built Executable
+        shell: pwsh
+        run: |
+          $exe = Get-Item "dist-win/Kurfanova-Muzik-Windows.exe"
+          Write-Host "Built: $($exe.FullName) ($($exe.Length) bytes)"
+
+      - name: Upload Windows EXE as Workflow Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Kurfanova-Muzik-Windows
+          path: dist-win/Kurfanova-Muzik-Windows.exe
+
+      - name: Upload Windows EXE to Release v1.0.0-apk
+        if: github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload v1.0.0-apk dist-win/Kurfanova-Muzik-Windows.exe --clobber
