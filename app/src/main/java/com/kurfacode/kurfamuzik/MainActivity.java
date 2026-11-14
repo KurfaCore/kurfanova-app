@@ -43,6 +43,9 @@ import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
 import android.widget.Toast;
 
+import androidx.webkit.WebViewCompat;
+import androidx.webkit.WebViewFeature;
+
 import org.json.JSONObject;
 
 import java.io.ByteArrayInputStream;
@@ -70,8 +73,68 @@ public class MainActivity extends Activity {
             "doubleclick.net",
             "googlesyndication.com",
             "googleadservices.com",
-            "2mdn.net"
+            "2mdn.net",
+            "imasdk.googleapis.com",
+            "google-analytics.com",
+            "googletagmanager.com",
+            "googletagservices.com"
     ));
+
+    private static final String YOUTUBE_ZERO_AD_SHIELD_SCRIPT =
+            "(() => {"
+            + "  try {"
+            + "    const host = String((window.location && window.location.hostname) || '').toLowerCase();"
+            + "    if (host !== 'www.youtube.com' && host !== 'youtube.com' && host !== 'www.youtube-nocookie.com' && host !== 'youtube-nocookie.com') return;"
+            + "    const stripAds = (obj) => {"
+            + "      if (!obj || typeof obj !== 'object') return obj;"
+            + "      try { delete obj.adPlacements; delete obj.playerAds; delete obj.adSlots; delete obj.adBreakHeartbeatParams; } catch (_) {}"
+            + "      return obj;"
+            + "    };"
+            + "    try {"
+            + "      let cachedInitial = undefined;"
+            + "      Object.defineProperty(window, 'ytInitialPlayerResponse', {"
+            + "        configurable: true, enumerable: true,"
+            + "        get() { return cachedInitial; },"
+            + "        set(v) { cachedInitial = stripAds(v); }"
+            + "      });"
+            + "    } catch (_) {}"
+            + "    try {"
+            + "      const origFetch = window.fetch;"
+            + "      if (typeof origFetch === 'function') {"
+            + "        window.fetch = async function(...args) {"
+            + "          const res = await origFetch.apply(this, args);"
+            + "          try {"
+            + "            const reqUrl = String((args[0] && args[0].url) || args[0] || '');"
+            + "            if (reqUrl.includes('/youtubei/v1/player') || reqUrl.includes('/youtubei/v1/next')) {"
+            + "              const txt = await res.clone().text();"
+            + "              const data = stripAds(JSON.parse(txt));"
+            + "              const hdrs = new Headers(res.headers);"
+            + "              hdrs.delete('content-length');"
+            + "              return new Response(JSON.stringify(data), { status: res.status, statusText: res.statusText, headers: hdrs });"
+            + "            }"
+            + "          } catch (_) {}"
+            + "          return res;"
+            + "        };"
+            + "      }"
+            + "    } catch (_) {}"
+            + "    setInterval(() => {"
+            + "      try {"
+            + "        const player = document.querySelector('.html5-video-player');"
+            + "        if (player && player.classList.contains('ad-showing')) {"
+            + "          const v = player.querySelector('video');"
+            + "          if (v) {"
+            + "            v.muted = true;"
+            + "            if (Number.isFinite(v.duration) && v.duration > 0 && v.currentTime < v.duration - 0.15) {"
+            + "              v.currentTime = v.duration;"
+            + "            }"
+            + "          }"
+            + "          const skipBtn = document.querySelector('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern');"
+            + "          if (skipBtn) skipBtn.click();"
+            + "        }"
+            + "      } catch (_) {}"
+            + "    }, 150);"
+            + "  } catch (_) {}"
+            + "})();";
 
     private static final Set<String> IN_APP_HOSTS = new HashSet<>(Arrays.asList(
             "kurfanova.github.io",
@@ -262,6 +325,19 @@ public class MainActivity extends Activity {
         webView.setWebViewClient(new KurfaWebViewClient());
         webView.setDownloadListener(createDownloadListener());
 
+        if (WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) {
+            WebViewCompat.addDocumentStartJavaScript(
+                    webView,
+                    YOUTUBE_ZERO_AD_SHIELD_SCRIPT,
+                    new HashSet<>(Arrays.asList(
+                            "https://www.youtube.com",
+                            "https://youtube.com",
+                            "https://www.youtube-nocookie.com",
+                            "https://youtube-nocookie.com"
+                    ))
+            );
+        }
+
         webView.loadUrl(TARGET_URL);
         ApkAutoUpdater.checkInBackground(this, nativeExecutor, webView);
     }
@@ -312,9 +388,17 @@ public class MainActivity extends Activity {
         if (host == null || host.isEmpty()) return false;
         String lowerHost = host.toLowerCase(Locale.ROOT);
 
-        // Never interfere with media streams, app origin, or Google Auth
-        if (matchesHostOrSubdomain(lowerHost, "googlevideo.com")
-                || matchesHostOrSubdomain(lowerHost, "kurfanova.github.io")
+        if (matchesHostOrSubdomain(lowerHost, "googlevideo.com")) {
+            String query = uri.getEncodedQuery();
+            if (query != null) {
+                String lowerQuery = query.toLowerCase(Locale.ROOT);
+                return lowerQuery.contains("oad=") || lowerQuery.contains("adformat=");
+            }
+            return false;
+        }
+
+        // Never interfere with app origin or Google Auth
+        if (matchesHostOrSubdomain(lowerHost, "kurfanova.github.io")
                 || matchesHostOrSubdomain(lowerHost, "kurfanova.kurfa.workers.dev")
                 || matchesHostOrSubdomain(lowerHost, "accounts.google.com")) {
             return false;
@@ -333,15 +417,23 @@ public class MainActivity extends Activity {
         if (matchesHostOrSubdomain(lowerHost, "youtube.com")
                 || matchesHostOrSubdomain(lowerHost, "youtube-nocookie.com")) {
             String path = uri.getPath();
+            String query = uri.getEncodedQuery();
             if (path != null) {
                 String lowerPath = path.toLowerCase(Locale.ROOT);
-                return lowerPath.equals("/pagead")
+                if (lowerPath.equals("/pagead")
                         || lowerPath.startsWith("/pagead/")
                         || lowerPath.startsWith("/api/stats/ads")
                         || lowerPath.equals("/ptracking")
                         || lowerPath.startsWith("/ptracking/")
                         || lowerPath.equals("/get_midroll_info")
-                        || lowerPath.startsWith("/get_midroll_info/");
+                        || lowerPath.startsWith("/get_midroll_info/")
+                        || lowerPath.startsWith("/pcs/activeview")) {
+                    return true;
+                }
+                if (lowerPath.startsWith("/api/stats/qoe") && query != null
+                        && query.toLowerCase(Locale.ROOT).contains("ad")) {
+                    return true;
+                }
             }
         }
 
