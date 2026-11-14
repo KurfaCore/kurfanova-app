@@ -8,6 +8,7 @@ import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Intent;
+import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.graphics.Bitmap;
 import android.graphics.Color;
@@ -202,6 +203,35 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public boolean isNativeEngineReady() {
             return true;
+        }
+
+        @JavascriptInterface
+        public String getAppVersionInfo() {
+            JSONObject info = new JSONObject();
+            try {
+                PackageInfo pInfo;
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    pInfo = getPackageManager().getPackageInfo(
+                            getPackageName(),
+                            PackageManager.PackageInfoFlags.of(0)
+                    );
+                } else {
+                    @SuppressWarnings("deprecation")
+                    PackageInfo legacyInfo = getPackageManager().getPackageInfo(getPackageName(), 0);
+                    pInfo = legacyInfo;
+                }
+                long vCode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.P
+                        ? pInfo.getLongVersionCode()
+                        : pInfo.versionCode;
+                info.put("versionName", pInfo.versionName != null ? pInfo.versionName : "");
+                info.put("versionCode", vCode);
+            } catch (Exception e) {
+                try {
+                    info.put("versionName", "");
+                    info.put("versionCode", 0);
+                } catch (Exception ignored) {}
+            }
+            return info.toString();
         }
 
         @JavascriptInterface
