@@ -55,11 +55,11 @@ jobs:
         if: github.ref == 'refs/heads/main'
         with:
           tag_name: v1.0.0-apk
-          name: "Kurfanova Müzik Android APK v1.1.0"
+          name: "Kurfanova Müzik Android APK v1.2.0"
           make_latest: true
           body: |
-            Kurfanova Müzik Canlı Senkronize Android APK Kurulum Paketi (v1.1.0).
-            Bu APK bir kez kurulduktan sonra sitede yapılan tüm güncellemeler otomatik olarak uygulamaya yansır.
+            Kurfanova Müzik Android APK v1.2.0 — Cihaz Üstü Doğrudan Ses Çözücü (NewPipeExtractor + %0 Reklam Plak Modu + Yerel Arama).
+            Bu APK bir kez kurulduktan sonra sitedeki tüm güncellemeler otomatik olarak uygulamaya yansır.
           files: dist/Kurfanova-Muzik.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

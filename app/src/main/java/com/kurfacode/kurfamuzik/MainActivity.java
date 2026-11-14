@@ -16,6 +16,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Environment;
+import android.os.PowerManager;
 import android.provider.MediaStore;
 import android.text.TextUtils;
 import android.util.Base64;
@@ -55,6 +56,8 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Locale;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 public class MainActivity extends Activity {
 
@@ -91,6 +94,8 @@ public class MainActivity extends Activity {
     private PendingDownload pendingDownload;
     private String lastFailedUrl = TARGET_URL;
     private int originalSystemUiVisibility;
+    private final ExecutorService nativeExecutor = Executors.newCachedThreadPool();
+    private PowerManager.WakeLock playbackWakeLock;
 
     private static final class PendingDownload {
         final String url;
@@ -130,6 +135,90 @@ public class MainActivity extends Activity {
                     Toast.LENGTH_SHORT
             ).show());
         }
+
+        @JavascriptInterface
+        public boolean isNativeEngineReady() {
+            return true;
+        }
+
+        @JavascriptInterface
+        public void resolveAudioStreamAsync(String videoId, String requestId) {
+            final String safeId = requestId == null ? "" : requestId.replaceAll("[^A-Za-z0-9_-]", "");
+            if (safeId.isEmpty()) return;
+            nativeExecutor.execute(() -> {
+                JSONObject res = new JSONObject();
+                try {
+                    KurfaNativeEngine.ResolvedAudio resolved = KurfaNativeEngine.resolveAudioStream(videoId);
+                    if (resolved != null) {
+                        res.put("success", true);
+                        res.put("videoId", resolved.videoId);
+                        res.put("streamUrl", "https://kurfanova.github.io"
+                                + KurfaNativeEngine.NATIVE_AUDIO_PATH_PREFIX + resolved.videoId);
+                        res.put("mimeType", resolved.mimeType);
+                        res.put("title", resolved.title);
+                        res.put("artist", resolved.artist);
+                        res.put("duration", resolved.durationSec);
+                    } else {
+                        res.put("success", false);
+                        res.put("error", "Audio stream unavailable");
+                    }
+                } catch (Exception e) {
+                    try {
+                        res.put("success", false);
+                        res.put("error", e.getMessage() != null ? e.getMessage() : "Resolve error");
+                    } catch (Exception ignored) {}
+                }
+                dispatchJsCallback("__kurfaNativeStreamCallback", safeId, res.toString());
+            });
+        }
+
+        @JavascriptInterface
+        public void searchTracksAsync(String query, boolean filterSingles, String requestId) {
+            final String safeId = requestId == null ? "" : requestId.replaceAll("[^A-Za-z0-9_-]", "");
+            if (safeId.isEmpty()) return;
+            nativeExecutor.execute(() -> {
+                JSONObject res = KurfaNativeEngine.searchYouTubeLocal(query, filterSingles);
+                dispatchJsCallback("__kurfaNativeSearchCallback", safeId, res.toString());
+            });
+        }
+
+        @JavascriptInterface
+        public void setNativePlaybackState(boolean playing) {
+            runOnUiThread(() -> updatePlaybackWakeLock(playing));
+        }
+    }
+
+    private void dispatchJsCallback(String fnName, String safeRequestId, String jsonPayload) {
+        runOnUiThread(() -> {
+            if (webView == null) return;
+            String script = "if (typeof window." + fnName + " === 'function') { try { window."
+                    + fnName + "(" + JSONObject.quote(safeRequestId) + ", JSON.parse("
+                    + JSONObject.quote(jsonPayload) + ")); } catch(e) {} }";
+            webView.evaluateJavascript(script, null);
+        });
+    }
+
+    @SuppressLint("WakelockTimeout")
+    private void updatePlaybackWakeLock(boolean active) {
+        try {
+            if (active) {
+                if (playbackWakeLock == null) {
+                    PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+                    if (pm != null) {
+                        playbackWakeLock = pm.newWakeLock(
+                                PowerManager.PARTIAL_WAKE_LOCK,
+                                "KurfaMuzik::PlaybackWakeLock"
+                        );
+                        playbackWakeLock.setReferenceCounted(false);
+                    }
+                }
+                if (playbackWakeLock != null && !playbackWakeLock.isHeld()) {
+                    playbackWakeLock.acquire();
+                }
+            } else if (playbackWakeLock != null && playbackWakeLock.isHeld()) {
+                playbackWakeLock.release();
+            }
+        } catch (Exception ignored) {}
     }
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -834,8 +923,18 @@ public class MainActivity extends Activity {
 
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
-            if (request != null && request.getUrl() != null && isAdRequest(request.getUrl())) {
-                return createEmptyResponse();
+            if (request != null && request.getUrl() != null) {
+                String nativeVid = KurfaNativeEngine.extractVideoIdFromNativeAudioUri(request.getUrl());
+                if (nativeVid != null) {
+                    return KurfaNativeEngine.handleNativeAudioIntercept(
+                            nativeVid,
+                            request.getMethod(),
+                            request.getRequestHeaders()
+                    );
+                }
+                if (isAdRequest(request.getUrl())) {
+                    return createEmptyResponse();
+                }
             }
             return super.shouldInterceptRequest(view, request);
         }
@@ -843,8 +942,15 @@ public class MainActivity extends Activity {
         @SuppressWarnings("deprecation")
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView view, String url) {
-            if (isHttpUrl(url) && isAdRequest(Uri.parse(url))) {
-                return createEmptyResponse();
+            if (isHttpUrl(url)) {
+                Uri parsed = Uri.parse(url);
+                String nativeVid = KurfaNativeEngine.extractVideoIdFromNativeAudioUri(parsed);
+                if (nativeVid != null) {
+                    return KurfaNativeEngine.handleNativeAudioIntercept(nativeVid, "GET", null);
+                }
+                if (isAdRequest(parsed)) {
+                    return createEmptyResponse();
+                }
             }
             return super.shouldInterceptRequest(view, url);
         }
@@ -928,6 +1034,8 @@ public class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        updatePlaybackWakeLock(false);
+        nativeExecutor.shutdownNow();
         hideCustomView();
         CookieManager.getInstance().flush();
         if (webView != null) {
