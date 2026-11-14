@@ -36,30 +36,50 @@ jobs:
       - name: Build Debug APK with Gradle
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: |
+          VER_CODE=$((GITHUB_RUN_NUMBER + 3))
+          VER_NAME="1.2.${GITHUB_RUN_NUMBER}"
+          echo "Building APK versionCode=${VER_CODE} versionName=${VER_NAME}"
+          gradle assembleDebug -PappVersionCode="${VER_CODE}" -PappVersionName="${VER_NAME}" --no-daemon --stacktrace
 
-      - name: Prepare APK Output
+      - name: Prepare APK Output & Update Manifest
         run: |
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk dist/Kurfanova-Muzik.apk
-          ls -lh dist/Kurfanova-Muzik.apk
+          VER_CODE=$((GITHUB_RUN_NUMBER + 3))
+          VER_NAME="1.2.${GITHUB_RUN_NUMBER}"
+          SHA256=$(sha256sum dist/Kurfanova-Muzik.apk | awk '{print $1}')
+          SIZE=$(stat -c%s dist/Kurfanova-Muzik.apk)
+          cat > dist/apk-update.json <<EOF
+          {
+            "versionCode": ${VER_CODE},
+            "versionName": "${VER_NAME}",
+            "sha256": "${SHA256}",
+            "size": ${SIZE},
+            "url": "https://github.com/KurfaCore/kurfanova-app/releases/latest/download/Kurfanova-Muzik.apk"
+          }
+          EOF
+          ls -lh dist/Kurfanova-Muzik.apk dist/apk-update.json
 
       - name: Upload APK as Workflow Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Kurfanova-Muzik-APK
-          path: dist/Kurfanova-Muzik.apk
+          path: |
+            dist/Kurfanova-Muzik.apk
+            dist/apk-update.json
 
       - name: Publish GitHub Release with APK
         uses: softprops/action-gh-release@v2
         if: github.ref == 'refs/heads/main'
         with:
           tag_name: v1.0.0-apk
-          name: "Kurfanova Müzik Android APK v1.2.0"
+          name: "Kurfamüzik v1.2.${{ github.run_number }} (Android + Windows)"
           make_latest: true
           body: |
-            Kurfanova Müzik Android APK v1.2.0 — Cihaz Üstü Doğrudan Ses Çözücü (NewPipeExtractor + %0 Reklam Plak Modu + Yerel Arama).
-            Bu APK bir kez kurulduktan sonra sitedeki tüm güncellemeler otomatik olarak uygulamaya yansır.
-          files: dist/Kurfanova-Muzik.apk
+            Kurfamüzik v1.2.${{ github.run_number }} — Cihaz Üstü Doğrudan Ses Çözücü ve Otomatik Güncelleme Sistemi.
+          files: |
+            dist/Kurfanova-Muzik.apk
+            dist/apk-update.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

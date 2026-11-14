@@ -186,6 +186,11 @@ public class MainActivity extends Activity {
         public void setNativePlaybackState(boolean playing) {
             runOnUiThread(() -> updatePlaybackWakeLock(playing));
         }
+
+        @JavascriptInterface
+        public void checkForUpdates() {
+            ApkAutoUpdater.checkInBackground(MainActivity.this, nativeExecutor, webView);
+        }
     }
 
     private void dispatchJsCallback(String fnName, String safeRequestId, String jsonPayload) {
@@ -258,6 +263,7 @@ public class MainActivity extends Activity {
         webView.setDownloadListener(createDownloadListener());
 
         webView.loadUrl(TARGET_URL);
+        ApkAutoUpdater.checkInBackground(this, nativeExecutor, webView);
     }
 
     private void configureCookies(WebView view) {
@@ -1010,6 +1016,7 @@ public class MainActivity extends Activity {
             webView.onResume();
             webView.resumeTimers();
         }
+        ApkAutoUpdater.resumePendingInstallIfPermitted(this);
     }
 
     @Override

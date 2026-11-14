@@ -25,30 +25,48 @@ jobs:
           dotnet-version: '10.0.x'
 
       - name: Publish Single-File Windows Executable
-        run: >
-          dotnet publish desktop-windows/KurfanovaMuzik.csproj
-          -c Release
-          -r win-x64
-          --self-contained true
-          -p:PublishSingleFile=true
-          -p:IncludeNativeLibrariesForSelfExtract=true
-          -p:EnableCompressionInSingleFile=true
-          -o dist-win
-
-      - name: Verify Built Executable
         shell: pwsh
         run: |
+          $appVersion = "1.1.$($env:GITHUB_RUN_NUMBER)"
+          Write-Host "Building Kurfanova Windows Desktop v$appVersion"
+          dotnet publish desktop-windows/KurfanovaMuzik.csproj `
+            -c Release `
+            -r win-x64 `
+            --self-contained true `
+            -p:Version=$appVersion `
+            -p:AssemblyVersion="$appVersion.0" `
+            -p:FileVersion="$appVersion.0" `
+            -p:PublishSingleFile=true `
+            -p:IncludeNativeLibrariesForSelfExtract=true `
+            -p:EnableCompressionInSingleFile=true `
+            -o dist-win
+
+      - name: Verify Built Executable & Generate Update Manifest
+        shell: pwsh
+        run: |
+          $appVersion = "1.1.$($env:GITHUB_RUN_NUMBER)"
           $exe = Get-Item "dist-win/Kurfanova-Muzik-Windows.exe"
-          Write-Host "Built: $($exe.FullName) ($($exe.Length) bytes)"
+          $sha256 = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $manifest = @{
+            version = $appVersion
+            sha256 = $sha256
+            size = $exe.Length
+            url = "https://github.com/KurfaCore/kurfanova-app/releases/latest/download/Kurfanova-Muzik-Windows.exe"
+            notes = "Otomatik güncelleme ve performans iyileştirmeleri"
+          } | ConvertTo-Json
+          [System.IO.File]::WriteAllText("dist-win/win-update.json", $manifest, [System.Text.UTF8Encoding]::new($false))
+          Write-Host "Built: $($exe.FullName) ($($exe.Length) bytes) sha256=$sha256"
 
       - name: Upload Windows EXE as Workflow Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Kurfanova-Muzik-Windows
-          path: dist-win/Kurfanova-Muzik-Windows.exe
+          path: |
+            dist-win/Kurfanova-Muzik-Windows.exe
+            dist-win/win-update.json
 
-      - name: Upload Windows EXE to Release v1.0.0-apk
+      - name: Upload Windows EXE & Manifest to Release v1.0.0-apk
         if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release upload v1.0.0-apk dist-win/Kurfanova-Muzik-Windows.exe --clobber
+        run: gh release upload v1.0.0-apk dist-win/Kurfanova-Muzik-Windows.exe dist-win/win-update.json --clobber

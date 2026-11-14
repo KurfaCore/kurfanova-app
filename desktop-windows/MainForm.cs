@@ -62,9 +62,12 @@ public sealed class MainForm : Form
     ];
 
     private readonly NativeDesktopEngine _engine = new();
+    private readonly AutoUpdater _updater = new();
     private readonly WebView2 _webView = new();
     private readonly CancellationTokenSource _shutdownCts = new();
     private Icon? _embeddedIcon;
+    private bool _restartForUpdate;
+    private int _updatePromptShown;
 
     public MainForm()
     {
@@ -139,6 +142,17 @@ public sealed class MainForm : Form
             await core.AddScriptToExecuteOnDocumentCreatedAsync(BuildBridgeInjectionScript());
 
             core.Navigate(TargetUrl);
+
+            _updater.UpdateReady += OnUpdateReady;
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    await Task.Delay(3500, _shutdownCts.Token).ConfigureAwait(false);
+                    await _updater.CheckAndStageAsync(_shutdownCts.Token).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException) { }
+            });
         }
         catch (WebView2RuntimeNotFoundException)
         {
@@ -300,7 +314,31 @@ public sealed class MainForm : Form
                 switch (action.ToUpperInvariant())
                 {
                     case "PING":
-                        responseObj = new { success = true, mode = DesktopBridgeMode };
+                        responseObj = new { success = true, mode = DesktopBridgeMode, version = _updater.CurrentVersion.ToString() };
+                        break;
+
+                    case "CHECK_UPDATE":
+                        await _updater.CheckAndStageAsync(ct).ConfigureAwait(false);
+                        responseObj = new
+                        {
+                            success = true,
+                            version = _updater.CurrentVersion.ToString(),
+                            hasUpdate = _updater.HasStagedUpdate,
+                            stagedVersion = _updater.StagedVersion?.ToString()
+                        };
+                        break;
+
+                    case "APPLY_UPDATE":
+                        if (_updater.HasStagedUpdate)
+                        {
+                            _restartForUpdate = true;
+                            BeginInvoke(Close);
+                            responseObj = new { success = true };
+                        }
+                        else
+                        {
+                            responseObj = new { success = false, error = "No staged update" };
+                        }
                         break;
 
                     case "SEARCH":
@@ -521,9 +559,53 @@ public sealed class MainForm : Form
         }
     }
 
+    private void OnUpdateReady(Version version, string? notes)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        if (Interlocked.CompareExchange(ref _updatePromptShown, 1, 0) != 0) return;
+
+        try
+        {
+            BeginInvoke(() =>
+            {
+                if (IsDisposed) return;
+
+                if (_webView.CoreWebView2 is not null)
+                {
+                    string verJson = JsonSerializer.Serialize(version.ToString());
+                    _ = _webView.CoreWebView2.ExecuteScriptAsync(
+                        $"if (typeof window.__kurfaOnNativeUpdateReady === 'function') {{ window.__kurfaOnNativeUpdateReady({{ version: {verJson}, platform: 'windows' }}); }}");
+                }
+
+                string noteLine = string.IsNullOrWhiteSpace(notes) ? string.Empty : $"\nYenilikler: {notes}\n";
+                DialogResult choice = MessageBox.Show(
+                    this,
+                    $"Kurfamüzik v{version} arka planda indirildi ve doğrulandı.{noteLine}\nŞimdi güncellenip yeniden başlatılsın mı?\n(\"Hayır\" derseniz uygulamayı kapattığınızda otomatik güncellenecek.)",
+                    "Kurfamüzik Otomatik Güncelleme",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Information);
+
+                if (choice == DialogResult.Yes)
+                {
+                    _restartForUpdate = true;
+                    Close();
+                }
+            });
+        }
+        catch
+        {
+            // Ignore form shutdown races
+        }
+    }
+
     private void OnFormClosed(object? sender, FormClosedEventArgs e)
     {
         try { _shutdownCts.Cancel(); } catch { /* ignore */ }
+        if (_updater.HasStagedUpdate)
+        {
+            _updater.TryApplyPendingUpdate(relaunch: _restartForUpdate);
+        }
+        _updater.Dispose();
         _engine.Dispose();
         _webView.Dispose();
         _embeddedIcon?.Dispose();

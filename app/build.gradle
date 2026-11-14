@@ -10,8 +10,10 @@ android {
         applicationId "com.kurfacode.kurfamuzik"
         minSdk 24
         targetSdk 34
-        versionCode 3
-        versionName "1.2.0"
+        def ciVersionCode = project.hasProperty('appVersionCode') ? project.property('appVersionCode').toInteger() : 4
+        def ciVersionName = project.hasProperty('appVersionName') ? project.property('appVersionName').toString() : "1.2.1"
+        versionCode ciVersionCode
+        versionName ciVersionName
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
