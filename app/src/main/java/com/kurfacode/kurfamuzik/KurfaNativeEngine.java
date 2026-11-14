@@ -37,7 +37,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import javax.annotation.Nonnull;
+import androidx.annotation.NonNull;
 
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
@@ -565,7 +565,7 @@ final class KurfaNativeEngine {
         }
 
         @Override
-        public Response execute(@Nonnull final Request request) throws IOException, ReCaptchaException {
+        public Response execute(@NonNull final Request request) throws IOException, ReCaptchaException {
             final byte[] dataToSend = request.dataToSend();
             RequestBody requestBody = null;
             if (dataToSend != null) {
