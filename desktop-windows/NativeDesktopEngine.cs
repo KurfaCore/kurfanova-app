@@ -25,11 +25,13 @@ public sealed partial class NativeDesktopEngine : IDisposable
     ];
     public const string NativeAudioPathPrefix = "/__kurfa_native_audio__/";
 
-    private const long MaxIosUpstreamChunkBytes = 524_288; // 512 KB bounded chunk (googlevideo IOS blocks open-ended/large Ranges with 403)
-    private const long MaxGeneralUpstreamChunkBytes = 2_097_152; // 2 MB bounded chunk for VISIONOS / ANDROID_VR
+    private const long MaxIosUpstreamChunkBytes = 2_097_152; // 2 MB bounded chunk (reduces HTTP churn on IOS streams)
+    private const long MaxGeneralUpstreamChunkBytes = 10_485_760; // 10 MB bounded chunk for ANDROID / ANDROID_VR / VISIONOS
     private const long HeadProbeEndByte = 1023;
     private static readonly TimeSpan VisitorDataTtl = TimeSpan.FromMinutes(30);
 
+    private const string AndroidUserAgent =
+        "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US; Pixel 8) gzip";
     private const string VisionOsUserAgent =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
     private const string AndroidVrUserAgent =
@@ -697,15 +699,22 @@ public sealed partial class NativeDesktopEngine : IDisposable
         bool preferAlternateClient,
         CancellationToken ct)
     {
-        // Primary: VISIONOS with sw.js_data visitorData (no 1 MiB CDN cap, no PO Token needed)
-        // Fallbacks: IOS -> ANDROID_VR
-        ResolvedAudio? resolved = preferAlternateClient
-            ? await ResolveViaIosAsync(cleanId, ct).ConfigureAwait(false)
-                ?? await ResolveViaAndroidVrAsync(cleanId, ct).ConfigureAwait(false)
-                ?? await ResolveViaVisionOsAsync(cleanId, forceRefreshVisitor: true, ct).ConfigureAwait(false)
-            : await ResolveViaVisionOsAsync(cleanId, forceRefreshVisitor: forceRefresh, ct).ConfigureAwait(false)
-                ?? await ResolveViaIosAsync(cleanId, ct).ConfigureAwait(false)
-                ?? await ResolveViaAndroidVrAsync(cleanId, ct).ConfigureAwait(false);
+        // Range-verify every candidate before caching so 403/PoToken-locked URLs never break playback.
+        ResolvedAudio? resolved = null;
+        if (preferAlternateClient)
+        {
+            resolved = await TryVerifyStreamRangeAsync(await ResolveViaIosAsync(cleanId, ct).ConfigureAwait(false), ct).ConfigureAwait(false)
+                ?? await TryVerifyStreamRangeAsync(await ResolveViaAndroidAsync(cleanId, forceRefreshVisitor: true, ct).ConfigureAwait(false), ct).ConfigureAwait(false)
+                ?? await TryVerifyStreamRangeAsync(await ResolveViaAndroidVrAsync(cleanId, ct).ConfigureAwait(false), ct).ConfigureAwait(false)
+                ?? await TryVerifyStreamRangeAsync(await ResolveViaVisionOsAsync(cleanId, forceRefreshVisitor: true, ct).ConfigureAwait(false), ct).ConfigureAwait(false);
+        }
+        else
+        {
+            resolved = await TryVerifyStreamRangeAsync(await ResolveViaAndroidAsync(cleanId, forceRefreshVisitor: forceRefresh, ct).ConfigureAwait(false), ct).ConfigureAwait(false)
+                ?? await TryVerifyStreamRangeAsync(await ResolveViaIosAsync(cleanId, ct).ConfigureAwait(false), ct).ConfigureAwait(false)
+                ?? await TryVerifyStreamRangeAsync(await ResolveViaAndroidVrAsync(cleanId, ct).ConfigureAwait(false), ct).ConfigureAwait(false)
+                ?? await TryVerifyStreamRangeAsync(await ResolveViaVisionOsAsync(cleanId, forceRefreshVisitor: forceRefresh, ct).ConfigureAwait(false), ct).ConfigureAwait(false);
+        }
 
         if (resolved is not null)
         {
@@ -713,6 +722,93 @@ public sealed partial class NativeDesktopEngine : IDisposable
             _streamCache[cleanId] = resolved;
         }
         return resolved;
+    }
+
+    private async Task<ResolvedAudio?> ResolveViaAndroidAsync(
+        string videoId,
+        bool forceRefreshVisitor,
+        CancellationToken ct)
+    {
+        string? visitorData = await ResolveVisitorDataAsync(forceRefreshVisitor, ct).ConfigureAwait(false);
+        var payloadObj = new
+        {
+            context = new
+            {
+                client = new
+                {
+                    clientName = "ANDROID",
+                    clientVersion = "20.10.38",
+                    androidSdkVersion = 34,
+                    osName = "Android",
+                    osVersion = "14",
+                    visitorData,
+                    hl = "tr",
+                    gl = "TR"
+                }
+            },
+            videoId,
+            contentCheckOk = true,
+            racyCheckOk = true
+        };
+
+        return await ResolveViaPlayerClientAsync(
+            videoId,
+            payloadObj,
+            AndroidUserAgent,
+            clientNameId: "3",
+            clientVersion: "20.10.38",
+            visitorData: visitorData,
+            clientKind: "ANDROID",
+            ct).ConfigureAwait(false);
+    }
+
+    private async Task<ResolvedAudio?> TryVerifyStreamRangeAsync(ResolvedAudio? candidate, CancellationToken ct)
+    {
+        if (candidate is null || string.IsNullOrEmpty(candidate.StreamUrl))
+        {
+            return null;
+        }
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Get, candidate.StreamUrl);
+            req.Headers.TryAddWithoutValidation("User-Agent", candidate.RequestUserAgent);
+            req.Headers.TryAddWithoutValidation("Range", $"bytes=0-{HeadProbeEndByte}");
+
+            using var probeCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            probeCts.CancelAfter(TimeSpan.FromSeconds(8));
+
+            using HttpResponseMessage resp = await _streamHttpClient
+                .SendAsync(req, HttpCompletionOption.ResponseHeadersRead, probeCts.Token)
+                .ConfigureAwait(false);
+
+            int code = (int)resp.StatusCode;
+            if (code != 200 && code != 206)
+            {
+                return null;
+            }
+
+            long resolvedLength = candidate.ContentLength;
+            if (resolvedLength <= 0 && resp.Content.Headers.ContentRange?.Length is long crLen && crLen > 0)
+            {
+                resolvedLength = crLen;
+            }
+            else if (resolvedLength <= 0 && code == 200 && resp.Content.Headers.ContentLength is long cl && cl > 0)
+            {
+                resolvedLength = cl;
+            }
+
+            return resolvedLength != candidate.ContentLength
+                ? candidate with { ContentLength = resolvedLength }
+                : candidate;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     private void PruneStreamCacheIfNeeded()
@@ -1410,7 +1506,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                          string.Equals(format, "video", StringComparison.OrdinalIgnoreCase);
 
         ResolvedAudio? media = wantVideo
-            ? await ResolveMuxedVideoAsync(safeId, ct).ConfigureAwait(false)
+            ? await ResolveMuxedVideoAsync(safeId, skipClient: null, ct).ConfigureAwait(false)
             : await ResolveAudioStreamAsync(safeId, ct: ct).ConfigureAwait(false);
 
         if (media is null || string.IsNullOrEmpty(media.StreamUrl))
@@ -1425,7 +1521,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
         }
 
         string ext = wantVideo
-            ? ".mp4"
+            ? (media.MimeType.Contains("webm", StringComparison.OrdinalIgnoreCase) ? ".webm" : ".mp4")
             : (media.MimeType.Contains("webm", StringComparison.OrdinalIgnoreCase) ? ".webm" : ".m4a");
         string baseTitle = !string.IsNullOrWhiteSpace(preferredTitle)
             ? preferredTitle!
@@ -1445,86 +1541,126 @@ public sealed partial class NativeDesktopEngine : IDisposable
         string tempPath = targetPath + ".part";
         string finalFileName = Path.GetFileName(targetPath);
 
-        long chunkCap = string.Equals(media.ClientKind, "IOS", StringComparison.Ordinal)
-            ? MaxIosUpstreamChunkBytes
-            : MaxGeneralUpstreamChunkBytes;
-
-        long totalBytes = media.ContentLength;
-        long offset = 0;
         long lastReportedTicks = 0;
+        long offset = 0;
         byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(65536);
+        bool movedToFinal = false;
 
         try
         {
-            onProgress?.Invoke(0, totalBytes, 0);
+            onProgress?.Invoke(0, media.ContentLength, 0);
 
-            await using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, useAsync: true))
+            bool retriedAlternate = false;
+            ResolvedAudio activeMedia = media;
+
+            while (true)
             {
-                while (true)
+                long chunkCap = string.Equals(activeMedia.ClientKind, "IOS", StringComparison.Ordinal)
+                    ? MaxIosUpstreamChunkBytes
+                    : MaxGeneralUpstreamChunkBytes;
+
+                long totalBytes = activeMedia.ContentLength;
+                offset = 0;
+                bool needsAlternateRetry = false;
+                int failureStatusCode = 0;
+
+                await using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, useAsync: true))
                 {
-                    ct.ThrowIfCancellationRequested();
-                    long chunkEnd = offset + chunkCap - 1;
-                    if (totalBytes > 0)
+                    while (true)
                     {
-                        if (offset >= totalBytes) break;
-                        chunkEnd = Math.Min(chunkEnd, totalBytes - 1);
-                    }
-
-                    using var req = new HttpRequestMessage(HttpMethod.Get, media.StreamUrl);
-                    req.Headers.TryAddWithoutValidation("User-Agent", media.RequestUserAgent);
-                    req.Headers.TryAddWithoutValidation("Range", $"bytes={offset}-{chunkEnd}");
-
-                    using HttpResponseMessage resp = await _streamHttpClient
-                        .SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)
-                        .ConfigureAwait(false);
-
-                    int code = (int)resp.StatusCode;
-                    if (code < 200 || code >= 300)
-                    {
-                        if (offset > 0 && code == 416) break;
-                        return new DownloadMediaResult(false, null, null, null, offset, $"Sunucu hatası ({code})");
-                    }
-
-                    if (resp.Content.Headers.ContentRange?.Length is long crTotal && crTotal > 0)
-                    {
-                        totalBytes = crTotal;
-                    }
-                    else if (totalBytes <= 0 && resp.Content.Headers.ContentLength is long cl && cl > 0 && code == 200)
-                    {
-                        totalBytes = cl;
-                    }
-
-                    await using Stream upstream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
-                    long readInChunk = 0;
-                    int read;
-                    while ((read = await upstream.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false)) > 0)
-                    {
-                        await fs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
-                        offset += read;
-                        readInChunk += read;
-
-                        long nowTicks = Environment.TickCount64;
-                        if (nowTicks - lastReportedTicks >= 110)
+                        ct.ThrowIfCancellationRequested();
+                        long chunkEnd = offset + chunkCap - 1;
+                        if (totalBytes > 0)
                         {
-                            lastReportedTicks = nowTicks;
-                            int pct = totalBytes > 0
-                                ? Math.Clamp((int)((offset * 100L) / totalBytes), 1, 99)
-                                : 15;
-                            onProgress?.Invoke(offset, totalBytes, pct);
+                            if (offset >= totalBytes) break;
+                            chunkEnd = Math.Min(chunkEnd, totalBytes - 1);
+                        }
+
+                        using var req = new HttpRequestMessage(HttpMethod.Get, activeMedia.StreamUrl);
+                        req.Headers.TryAddWithoutValidation("User-Agent", activeMedia.RequestUserAgent);
+                        req.Headers.TryAddWithoutValidation("Range", $"bytes={offset}-{chunkEnd}");
+
+                        using HttpResponseMessage resp = await _streamHttpClient
+                            .SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)
+                            .ConfigureAwait(false);
+
+                        int code = (int)resp.StatusCode;
+                        if (code < 200 || code >= 300)
+                        {
+                            if (offset > 0 && code == 416) break;
+                            if (!retriedAlternate && (code == 401 || code == 403 || code == 410))
+                            {
+                                needsAlternateRetry = true;
+                                break;
+                            }
+                            failureStatusCode = code;
+                            break;
+                        }
+
+                        if (resp.Content.Headers.ContentRange?.Length is long crTotal && crTotal > 0)
+                        {
+                            totalBytes = crTotal;
+                        }
+                        else if (totalBytes <= 0 && resp.Content.Headers.ContentLength is long cl && cl > 0 && code == 200)
+                        {
+                            totalBytes = cl;
+                        }
+
+                        await using Stream upstream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                        long readInChunk = 0;
+                        int read;
+                        while ((read = await upstream.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false)) > 0)
+                        {
+                            await fs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                            offset += read;
+                            readInChunk += read;
+
+                            long nowTicks = Environment.TickCount64;
+                            if (nowTicks - lastReportedTicks >= 110)
+                            {
+                                lastReportedTicks = nowTicks;
+                                int pct = totalBytes > 0
+                                    ? Math.Clamp((int)((offset * 100L) / totalBytes), 1, 99)
+                                    : 15;
+                                onProgress?.Invoke(offset, totalBytes, pct);
+                            }
+                        }
+
+                        if (readInChunk == 0 || code == 200 || (totalBytes > 0 && offset >= totalBytes))
+                        {
+                            break;
                         }
                     }
 
-                    if (readInChunk == 0 || code == 200 || (totalBytes > 0 && offset >= totalBytes))
-                    {
-                        break;
-                    }
+                    await fs.FlushAsync(ct).ConfigureAwait(false);
                 }
-                await fs.FlushAsync(ct).ConfigureAwait(false);
-            }
 
-            File.Move(tempPath, targetPath, overwrite: true);
-            onProgress?.Invoke(offset, Math.Max(totalBytes, offset), 100);
-            return new DownloadMediaResult(true, finalFileName, targetPath, media.MimeType, offset, null);
+                if (needsAlternateRetry)
+                {
+                    retriedAlternate = true;
+                    TryDeleteTempFile(tempPath);
+                    ResolvedAudio? fallback = wantVideo
+                        ? await ResolveMuxedVideoAsync(safeId, skipClient: activeMedia.ClientKind, ct).ConfigureAwait(false)
+                        : await ResolveAudioStreamCoreAsync(safeId, forceRefresh: true, preferAlternateClient: true, ct).ConfigureAwait(false);
+                    if (fallback is not null && !string.IsNullOrEmpty(fallback.StreamUrl))
+                    {
+                        activeMedia = fallback;
+                        continue;
+                    }
+                    return new DownloadMediaResult(false, null, null, null, 0, "Sunucu erişimi reddedildi (403)");
+                }
+
+                if (failureStatusCode != 0)
+                {
+                    TryDeleteTempFile(tempPath);
+                    return new DownloadMediaResult(false, null, null, null, offset, $"Sunucu hatası ({failureStatusCode})");
+                }
+
+                File.Move(tempPath, targetPath, overwrite: true);
+                movedToFinal = true;
+                onProgress?.Invoke(offset, Math.Max(totalBytes, offset), 100);
+                return new DownloadMediaResult(true, finalFileName, targetPath, activeMedia.MimeType, offset, null);
+            }
         }
         catch (OperationCanceledException)
         {
@@ -1538,80 +1674,136 @@ public sealed partial class NativeDesktopEngine : IDisposable
         }
         finally
         {
+            if (!movedToFinal)
+            {
+                TryDeleteTempFile(tempPath);
+            }
             System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
-    private async Task<ResolvedAudio?> ResolveMuxedVideoAsync(string videoId, CancellationToken ct)
+    private async Task<ResolvedAudio?> ResolveMuxedVideoAsync(
+        string videoId,
+        string? skipClient,
+        CancellationToken ct)
     {
         string? visitorData = await ResolveVisitorDataAsync(false, ct).ConfigureAwait(false);
-        var iosPayload = new
+
+        if (!string.Equals(skipClient, "ANDROID", StringComparison.Ordinal))
         {
-            context = new
+            var androidPayload = new
             {
-                client = new
+                context = new
                 {
-                    clientName = "IOS",
-                    clientVersion = "20.10.4",
-                    deviceMake = "Apple",
-                    deviceModel = "iPhone16,2",
-                    osName = "iPhone",
-                    osVersion = "18.3.2.22D82",
-                    hl = "tr",
-                    gl = "TR"
-                }
-            },
-            videoId
-        };
+                    client = new
+                    {
+                        clientName = "ANDROID",
+                        clientVersion = "20.10.38",
+                        androidSdkVersion = 34,
+                        osName = "Android",
+                        osVersion = "14",
+                        visitorData,
+                        hl = "tr",
+                        gl = "TR"
+                    }
+                },
+                videoId,
+                contentCheckOk = true,
+                racyCheckOk = true
+            };
 
-        ResolvedAudio? res = await ResolveMuxedVideoFromClientAsync(
-            videoId, iosPayload, IosUserAgent, "5", "20.10.4", null, "IOS", ct).ConfigureAwait(false);
-        if (res is not null) return res;
+            ResolvedAudio? androidRes = await TryVerifyStreamRangeAsync(
+                await ResolveMuxedVideoFromClientAsync(
+                    videoId, androidPayload, AndroidUserAgent, "3", "20.10.38", visitorData, "ANDROID", ct).ConfigureAwait(false),
+                ct).ConfigureAwait(false);
+            if (androidRes is not null) return androidRes;
+        }
 
-        var visionPayload = new
+        if (!string.Equals(skipClient, "IOS", StringComparison.Ordinal))
         {
-            context = new
+            var iosPayload = new
             {
-                client = new
+                context = new
                 {
-                    clientName = "VISIONOS",
-                    clientVersion = "1.02",
-                    deviceMake = "Apple",
-                    deviceModel = "RealityDevice17,1",
-                    osName = "visionOS",
-                    osVersion = "26.5.23O471",
-                    visitorData,
-                    hl = "tr",
-                    gl = "TR"
-                }
-            },
-            videoId,
-            contentCheckOk = true,
-            racyCheckOk = true
-        };
+                    client = new
+                    {
+                        clientName = "IOS",
+                        clientVersion = "20.10.4",
+                        deviceMake = "Apple",
+                        deviceModel = "iPhone16,2",
+                        osName = "iPhone",
+                        osVersion = "18.3.2.22D82",
+                        hl = "tr",
+                        gl = "TR"
+                    }
+                },
+                videoId
+            };
 
-        res = await ResolveMuxedVideoFromClientAsync(
-            videoId, visionPayload, VisionOsUserAgent, null, null, visitorData, "VISIONOS", ct).ConfigureAwait(false);
-        if (res is not null) return res;
+            ResolvedAudio? iosRes = await TryVerifyStreamRangeAsync(
+                await ResolveMuxedVideoFromClientAsync(
+                    videoId, iosPayload, IosUserAgent, "5", "20.10.4", null, "IOS", ct).ConfigureAwait(false),
+                ct).ConfigureAwait(false);
+            if (iosRes is not null) return iosRes;
+        }
 
-        var vrPayload = new
+        if (!string.Equals(skipClient, "ANDROID_VR", StringComparison.Ordinal))
         {
-            context = new
+            var vrPayload = new
             {
-                client = new
+                context = new
                 {
-                    clientName = "ANDROID_VR",
-                    clientVersion = "1.57.29",
-                    androidSdkVersion = 34,
-                    hl = "tr",
-                    gl = "TR"
-                }
-            },
-            videoId
-        };
+                    client = new
+                    {
+                        clientName = "ANDROID_VR",
+                        clientVersion = "1.57.29",
+                        androidSdkVersion = 34,
+                        hl = "tr",
+                        gl = "TR"
+                    }
+                },
+                videoId
+            };
 
-        return await ResolveMuxedVideoFromClientAsync(
-            videoId, vrPayload, AndroidVrUserAgent, "28", "1.57.29", null, "ANDROID_VR", ct).ConfigureAwait(false);
+            ResolvedAudio? vrRes = await TryVerifyStreamRangeAsync(
+                await ResolveMuxedVideoFromClientAsync(
+                    videoId, vrPayload, AndroidVrUserAgent, "28", "1.57.29", null, "ANDROID_VR", ct).ConfigureAwait(false),
+                ct).ConfigureAwait(false);
+            if (vrRes is not null) return vrRes;
+        }
+
+        if (!string.Equals(skipClient, "VISIONOS", StringComparison.Ordinal))
+        {
+            var visionPayload = new
+            {
+                context = new
+                {
+                    client = new
+                    {
+                        clientName = "VISIONOS",
+                        clientVersion = "1.02",
+                        deviceMake = "Apple",
+                        deviceModel = "RealityDevice17,1",
+                        osName = "visionOS",
+                        osVersion = "26.5.23O471",
+                        visitorData,
+                        hl = "tr",
+                        gl = "TR"
+                    }
+                },
+                videoId,
+                contentCheckOk = true,
+                racyCheckOk = true
+            };
+
+            ResolvedAudio? visionRes = await TryVerifyStreamRangeAsync(
+                await ResolveMuxedVideoFromClientAsync(
+                    videoId, visionPayload, VisionOsUserAgent, null, null, visitorData, "VISIONOS", ct).ConfigureAwait(false),
+                ct).ConfigureAwait(false);
+            if (visionRes is not null) return visionRes;
+        }
+
+        return null;
     }
 
     private async Task<ResolvedAudio?> ResolveMuxedVideoFromClientAsync(
@@ -1661,7 +1853,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 if (format.ValueKind != JsonValueKind.Object) continue;
                 string mime = GetString(format, "mimeType");
                 string url = GetString(format, "url");
-                if (!mime.StartsWith("video/mp4", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(url)) continue;
+                bool isMp4 = mime.StartsWith("video/mp4", StringComparison.OrdinalIgnoreCase);
+                bool isWebm = mime.StartsWith("video/webm", StringComparison.OrdinalIgnoreCase);
+                if ((!isMp4 && !isWebm) || string.IsNullOrEmpty(url)) continue;
 
                 int itag = GetInt32(format, "itag");
                 int height = GetInt32(format, "height");
@@ -1672,7 +1866,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     _ = long.TryParse(clenStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out clen);
                 }
 
-                int score = height;
+                int score = height + (isMp4 ? 500 : 0);
                 if (itag == 22) score += 2000; // 720p muxed MP4
                 else if (itag == 18) score += 1000; // 360p muxed MP4
 
@@ -1683,7 +1877,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     bestItag = itag;
                     bestContentLength = clen;
                     int semiIdx = mime.IndexOf(';');
-                    bestMime = semiIdx > 0 ? mime[..semiIdx].Trim() : "video/mp4";
+                    bestMime = semiIdx > 0 ? mime[..semiIdx].Trim() : (isWebm ? "video/webm" : "video/mp4");
                 }
             }
 

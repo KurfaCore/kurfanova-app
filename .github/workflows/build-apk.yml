@@ -33,14 +33,30 @@ jobs:
         with:
           gradle-version: '8.6'
 
+      - name: Prepare Persistent Android Keystore
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KURFA_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+        run: |
+          printf '%s' "$KEYSTORE_B64" | tr -d '\r\n ' | base64 -d > app/kurfa-release.p12
+          keytool -list -keystore app/kurfa-release.p12 -storetype PKCS12 -storepass "$KURFA_KEYSTORE_PASS" | head -n 10
+
       - name: Build Debug APK with Gradle
         env:
           ANDROID_HOME: /usr/local/lib/android/sdk
+          KURFA_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
+          KURFA_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KURFA_KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
         run: |
           VER_CODE=$((GITHUB_RUN_NUMBER + 3))
           VER_NAME="1.2.${GITHUB_RUN_NUMBER}"
           echo "Building APK versionCode=${VER_CODE} versionName=${VER_NAME}"
           gradle assembleDebug -PappVersionCode="${VER_CODE}" -PappVersionName="${VER_NAME}" --no-daemon --stacktrace
+
+      - name: Cleanup Keystore File
+        if: always()
+        run: rm -f app/kurfa-release.p12
 
       - name: Prepare APK Output & Update Manifest
         run: |

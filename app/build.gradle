@@ -18,6 +18,22 @@ android {
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    signingConfigs {
+        kurfaPersistent {
+            def ksFile = file("kurfa-release.p12")
+            def ksPass = System.getenv("KURFA_KEYSTORE_PASS")
+            def kAlias = System.getenv("KURFA_KEY_ALIAS") ?: "kurfanova"
+            def kPass = System.getenv("KURFA_KEY_PASS")
+            if (ksFile.exists() && ksPass && kPass) {
+                storeFile ksFile
+                storePassword ksPass
+                keyAlias kAlias
+                keyPassword kPass
+                storeType "PKCS12"
+            }
+        }
+    }
+
     buildTypes {
         release {
             minifyEnabled false
@@ -26,6 +42,9 @@ android {
         debug {
             applicationIdSuffix ".debug"
             debuggable true
+            if (file("kurfa-release.p12").exists() && System.getenv("KURFA_KEYSTORE_PASS")) {
+                signingConfig signingConfigs.kurfaPersistent
+            }
         }
     }
     compileOptions {

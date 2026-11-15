@@ -11,6 +11,8 @@ import android.content.pm.PackageManager;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
+import android.os.Handler;
+import android.os.Looper;
 import android.provider.MediaStore;
 import android.provider.Settings;
 import android.webkit.WebView;
@@ -145,12 +147,26 @@ public final class ApkAutoUpdater {
                             return;
                         }
                         ResponseBody body = apkResp.body();
+                        long totalBytes = body.contentLength();
+                        long downloadedBytes = 0L;
+                        long lastNotifyMs = 0L;
                         try (InputStream is = body.byteStream();
                              FileOutputStream fos = new FileOutputStream(tempApk)) {
                             byte[] buf = new byte[16384];
                             int read;
                             while ((read = is.read(buf)) != -1) {
                                 fos.write(buf, 0, read);
+                                downloadedBytes += read;
+                                long nowMs = System.currentTimeMillis();
+                                if (nowMs - lastNotifyMs >= 450L) {
+                                    lastNotifyMs = nowMs;
+                                    if (totalBytes > 0L) {
+                                        int pct = (int) Math.min(99L, Math.max(1L, (downloadedBytes * 100L) / totalBytes));
+                                        notifyWebStatus(webView, "İndiriliyor (v" + latestName + "): %" + pct, false);
+                                    } else {
+                                        notifyWebStatus(webView, "İndiriliyor (v" + latestName + "): " + (downloadedBytes / (1024L * 1024L)) + " MB", false);
+                                    }
+                                }
                             }
                             fos.flush();
                         }
@@ -173,8 +189,9 @@ public final class ApkAutoUpdater {
                     }
                 }
 
-                // Always export verified APK to public İndirilenler so user has 1-tap manual install fallback
+                // Always export verified APK directly to public İndirilenler root so 1-tap manual/uninstall flow finds it immediately
                 exportApkToPublicDownloads(activity, targetApk, safeFileName);
+                notifyWebStatus(webView, "İndirildi (v" + latestName + ") — Kuruluma hazır", false);
 
                 stagedApkFile = targetApk;
                 stagedVersionName = latestName.isEmpty() ? String.valueOf(latestCode) : latestName;
@@ -209,26 +226,42 @@ public final class ApkAutoUpdater {
                 if (sameSignature) {
                     new AlertDialog.Builder(activity)
                             .setTitle("Kurfanova v" + versionName + " Hazır")
-                            .setMessage("Yeni sürüm doğrulandı ve İndirilenler > Kurfanova klasörüne kaydedildi:\n" + publicFileName)
-                            .setPositiveButton("Şimdi Kur", (dialog, which) -> installApk(activity, apkFile))
+                            .setMessage("Yeni sürüm doğrulandı. Mevcut verileriniz korunarak doğrudan güncellenecek.\n\nYedek kopya: İndirilenler/" + publicFileName)
+                            .setPositiveButton("Güncelle", (dialog, which) -> installApk(activity, apkFile))
                             .setNeutralButton("İndirilenleri Aç", (dialog, which) -> openDownloadsFolder(activity))
-                            .setNegativeButton("Kapat", null)
+                            .setNegativeButton("Sonra", null)
                             .show();
                 } else {
                     new AlertDialog.Builder(activity)
-                            .setTitle("Kurfanova v" + versionName + " İndirildi")
+                            .setTitle("Kaldırıp Güncelle (v" + versionName + ")")
                             .setMessage(
-                                    "Yeni APK İndirilenler > Kurfanova klasörüne kaydedildi:\n"
+                                    "Yeni sürüm indirildi ve İndirilenler klasörüne kaydedildi:\n"
                                     + publicFileName + "\n\n"
-                                    + "Mevcut uygulama farklı imza taşıdığı için Android üzerine kurulumu engeller. Önce 'Mevcut Sürümü Kaldır' ile kaldırıp ardından 'İndirilenleri Aç' üzerinden bu dosyaya dokunun."
+                                    + "Mevcut sürüm eski imza taşıdığı için kaldırma işlemi gerekir. 'Kaldır ve Güncelle'ye dokunduğunuzda önce İndirilenler açılır, ardından mevcut sürüm kaldırılır; açılan listedeki " + publicFileName + " dosyasına dokunup kurulumu tamamlayın.\n\n"
+                                    + "(Bu kurulumdan sonraki tüm güncellemeler kaldırma gerektirmeden tek dokunuşla kurulacaktır.)"
                             )
-                            .setPositiveButton("Mevcut Sürümü Kaldır", (dialog, which) -> requestUninstallCurrentApp(activity))
+                            .setPositiveButton("Kaldır ve Güncelle", (dialog, which) -> uninstallAndContinueToDownloads(activity, publicFileName))
                             .setNeutralButton("İndirilenleri Aç", (dialog, which) -> openDownloadsFolder(activity))
                             .setNegativeButton("Kapat", null)
                             .show();
                 }
             } catch (Throwable ignored) {}
         });
+    }
+
+    private static void uninstallAndContinueToDownloads(Activity activity, String publicFileName) {
+        if (activity == null) return;
+        try {
+            Toast.makeText(
+                    activity,
+                    "Kaldırdıktan sonra açılan İndirilenler listesinden " + publicFileName + " dosyasına dokunun.",
+                    Toast.LENGTH_LONG
+            ).show();
+            openDownloadsFolder(activity);
+            new Handler(Looper.getMainLooper()).postDelayed(() -> requestUninstallCurrentApp(activity), 350L);
+        } catch (Throwable ignored) {
+            requestUninstallCurrentApp(activity);
+        }
     }
 
     private static void requestUninstallCurrentApp(Activity activity) {
@@ -276,10 +309,18 @@ public final class ApkAutoUpdater {
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ContentResolver resolver = activity.getContentResolver();
+                try {
+                    resolver.delete(
+                            MediaStore.Downloads.EXTERNAL_CONTENT_URI,
+                            MediaStore.Downloads.DISPLAY_NAME + "=?",
+                            new String[]{displayName}
+                    );
+                } catch (Throwable ignored) {}
+
                 ContentValues values = new ContentValues();
                 values.put(MediaStore.Downloads.DISPLAY_NAME, displayName);
                 values.put(MediaStore.Downloads.MIME_TYPE, "application/vnd.android.package-archive");
-                values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS + "/Kurfanova");
+                values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
                 Uri uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
                 if (uri != null) {
                     try (InputStream is = new FileInputStream(sourceApk);
@@ -312,9 +353,18 @@ public final class ApkAutoUpdater {
 
     private static void openDownloadsFolder(Activity activity) {
         try {
-            activity.startActivity(new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS));
+            Intent dlIntent = new Intent(DownloadManager.ACTION_VIEW_DOWNLOADS);
+            dlIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            activity.startActivity(dlIntent);
         } catch (Throwable t) {
-            Toast.makeText(activity, "Dosya Yöneticisi > İndirilenler > Kurfanova klasörünü açın.", Toast.LENGTH_LONG).show();
+            try {
+                Intent filesIntent = new Intent(Intent.ACTION_VIEW);
+                filesIntent.setDataAndType(Uri.parse("content://com.android.externalstorage.documents/root/downloads"), "vnd.android.document/root");
+                filesIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                activity.startActivity(filesIntent);
+            } catch (Throwable ignored) {
+                Toast.makeText(activity, "Dosya Yöneticisi > İndirilenler klasörünü açın.", Toast.LENGTH_LONG).show();
+            }
         }
     }
 
