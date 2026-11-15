@@ -20,12 +20,14 @@ import org.schabi.newpipe.extractor.stream.DeliveryMethod;
 import org.schabi.newpipe.extractor.stream.StreamInfo;
 import org.schabi.newpipe.extractor.stream.StreamInfoItem;
 import org.schabi.newpipe.extractor.stream.StreamType;
+import org.schabi.newpipe.extractor.stream.VideoStream;
 
 import java.io.ByteArrayInputStream;
 import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -39,6 +41,7 @@ import java.util.regex.Pattern;
 
 import androidx.annotation.NonNull;
 
+import okhttp3.ConnectionPool;
 import okhttp3.MediaType;
 import okhttp3.OkHttpClient;
 import okhttp3.RequestBody;
@@ -67,8 +70,8 @@ final class KurfaNativeEngine {
     private static final String ANDROID_VR_UA =
             "com.google.android.apps.youtube.vr.oculus/1.57.29 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
     private static final long VISITOR_DATA_TTL_MS = 30L * 60L * 1000L;
-    private static final long MAX_GENERAL_CHUNK_BYTES = 2L * 1024L * 1024L;
-    private static final long MAX_IOS_CHUNK_BYTES = 512L * 1024L;
+    private static final long MAX_GENERAL_CHUNK_BYTES = 10L * 1024L * 1024L;
+    private static final long MAX_IOS_CHUNK_BYTES = 2L * 1024L * 1024L;
     private static final long HEAD_PROBE_END_BYTE = 1023L;
     private static final MediaType JSON_MEDIA_TYPE = MediaType.get("application/json; charset=utf-8");
 
@@ -110,7 +113,9 @@ final class KurfaNativeEngine {
 
     private static final OkHttpClient HTTP_CLIENT = new OkHttpClient.Builder()
             .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(25, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .connectionPool(new ConnectionPool(8, 3, TimeUnit.MINUTES))
+            .retryOnConnectionFailure(true)
             .followRedirects(true)
             .build();
 
@@ -183,17 +188,18 @@ final class KurfaNativeEngine {
         }
         STREAM_CACHE.remove(videoId);
 
-        ResolvedAudio resolved;
+        ResolvedAudio resolved = null;
         if (preferAlternate) {
-            resolved = resolveViaNewPipe(videoId);
-            if (resolved == null) resolved = resolveViaIos(videoId);
-            if (resolved == null) resolved = resolveViaAndroidVr(videoId);
-            if (resolved == null) resolved = resolveViaVisionOs(videoId, true);
+            resolved = tryVerifiedAudioCandidate(resolveViaAndroidVr(videoId));
+            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaIos(videoId));
+            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaVisionOs(videoId, true));
+            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaNewPipe(videoId));
         } else {
-            resolved = resolveViaVisionOs(videoId, forceRefresh);
-            if (resolved == null) resolved = resolveViaNewPipe(videoId);
-            if (resolved == null) resolved = resolveViaIos(videoId);
-            if (resolved == null) resolved = resolveViaAndroidVr(videoId);
+            // Prefer NewPipe first: solves YouTube n-parameter throttling and avoids VisionOS/iOS mid-stream 403 drops
+            resolved = tryVerifiedAudioCandidate(resolveViaNewPipe(videoId));
+            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaAndroidVr(videoId));
+            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaIos(videoId));
+            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaVisionOs(videoId, forceRefresh));
         }
 
         if (resolved != null) {
@@ -201,6 +207,42 @@ final class KurfaNativeEngine {
             STREAM_CACHE.put(videoId, resolved);
         }
         return resolved;
+    }
+
+    private static ResolvedAudio tryVerifiedAudioCandidate(ResolvedAudio candidate) {
+        if (candidate == null || candidate.streamUrl == null || candidate.streamUrl.isEmpty()) {
+            return null;
+        }
+        okhttp3.Request req = new okhttp3.Request.Builder()
+                .url(candidate.streamUrl)
+                .get()
+                .header("User-Agent", candidate.requestUserAgent)
+                .header("Range", "bytes=0-" + HEAD_PROBE_END_BYTE)
+                .build();
+        try (okhttp3.Response res = HTTP_CLIENT.newCall(req).execute()) {
+            int code = res.code();
+            if (code < 200 || code >= 300) {
+                return null;
+            }
+            long totalLen = parseTotalLengthFromContentRange(res.header("Content-Range"));
+            if (totalLen <= 0L) totalLen = candidate.contentLength;
+            if (totalLen > 0L && candidate.contentLength <= 0L) {
+                return new ResolvedAudio(
+                        candidate.videoId,
+                        candidate.streamUrl,
+                        candidate.mimeType,
+                        candidate.title,
+                        candidate.artist,
+                        candidate.durationSec,
+                        totalLen,
+                        candidate.requestUserAgent,
+                        candidate.clientKind
+                );
+            }
+            return candidate;
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     private static void pruneCacheIfNeeded() {
@@ -567,12 +609,25 @@ final class KurfaNativeEngine {
         long[] parsedRange = parseByteRangeHeader(rangeHeader);
         boolean isHead = "HEAD".equalsIgnoreCase(method);
         boolean forceAlternate = false;
+        String expectedMime = null;
+        long expectedLength = -1L;
 
         for (int attempt = 0; attempt < 2; attempt++) {
             ResolvedAudio audio = resolveAudioStream(videoId, attempt > 0, forceAlternate);
             if (audio == null) {
                 break;
             }
+            if (attempt > 0 && parsedRange != null && parsedRange[0] > 0L) {
+                // Avoid feeding bytes from a differently-encoded stream mid-file into Chromium's decoder
+                if (expectedMime != null && !expectedMime.equals(cleanMimeType(null, audio.mimeType))) {
+                    return buildErrorResponse(502, "Stream format changed", allowOrigin);
+                }
+                if (expectedLength > 0L && audio.contentLength > 0L && expectedLength != audio.contentLength) {
+                    return buildErrorResponse(502, "Stream length changed", allowOrigin);
+                }
+            }
+            expectedMime = cleanMimeType(null, audio.mimeType);
+            expectedLength = audio.contentLength;
             long chunkCap = "IOS".equals(audio.clientKind) ? MAX_IOS_CHUNK_BYTES : MAX_GENERAL_CHUNK_BYTES;
 
             try {
@@ -753,13 +808,14 @@ final class KurfaNativeEngine {
     }
 
     private static final class BoundedChunkInputStream extends InputStream {
-        private final ResolvedAudio audio;
+        private ResolvedAudio audio;
         private final long chunkCap;
         private long totalLength;
         private long nextOffset;
         private okhttp3.Response currentResponse;
         private InputStream currentBodyStream;
         private boolean closed;
+        private int recoveryCount = 0;
 
         BoundedChunkInputStream(
                 ResolvedAudio audio,
@@ -790,10 +846,18 @@ final class KurfaNativeEngine {
 
             while (true) {
                 if (currentBodyStream != null) {
-                    int n = currentBodyStream.read(b, off, len);
-                    if (n > 0) {
-                        nextOffset += n;
-                        return n;
+                    try {
+                        int n = currentBodyStream.read(b, off, len);
+                        if (n > 0) {
+                            nextOffset += n;
+                            return n;
+                        }
+                    } catch (IOException readErr) {
+                        closeCurrentUpstream();
+                        if (!tryRefreshMatchingStream()) {
+                            throw readErr;
+                        }
+                        continue;
                     }
                     closeCurrentUpstream();
                 }
@@ -813,10 +877,25 @@ final class KurfaNativeEngine {
                         .header("Range", "bytes=" + nextOffset + "-" + chunkEnd)
                         .build();
 
-                okhttp3.Response nextResp = HTTP_CLIENT.newCall(nextReq).execute();
+                okhttp3.Response nextResp;
+                try {
+                    nextResp = HTTP_CLIENT.newCall(nextReq).execute();
+                } catch (IOException connErr) {
+                    if (tryRefreshMatchingStream()) {
+                        continue;
+                    }
+                    throw connErr;
+                }
                 int code = nextResp.code();
                 if (code == 416) {
                     nextResp.close();
+                    return -1;
+                }
+                if (code == 403 || code == 410 || code >= 500) {
+                    nextResp.close();
+                    if (tryRefreshMatchingStream()) {
+                        continue;
+                    }
                     return -1;
                 }
                 if (code < 200 || code >= 300) {
@@ -835,6 +914,19 @@ final class KurfaNativeEngine {
                 currentResponse = nextResp;
                 currentBodyStream = nextBody.byteStream();
             }
+        }
+
+        private boolean tryRefreshMatchingStream() {
+            if (closed || recoveryCount >= 2) return false;
+            recoveryCount++;
+            invalidateStream(audio.videoId);
+            ResolvedAudio fresh = resolveAudioStream(audio.videoId, true, recoveryCount > 1);
+            if (fresh == null || fresh.streamUrl == null) return false;
+            if (totalLength > 0L && fresh.contentLength > 0L && fresh.contentLength != totalLength) {
+                return false;
+            }
+            this.audio = fresh;
+            return true;
         }
 
         private void closeCurrentUpstream() {
@@ -969,11 +1061,71 @@ final class KurfaNativeEngine {
             return resolveAudioStream(videoId);
         }
 
-        ResolvedAudio res = resolveVideoViaIos(videoId);
+        ensureInitialized();
+        // Verify each candidate with a quick range probe so 403-gated clients never win blindly
+        ResolvedAudio res = tryVerifiedAudioCandidate(resolveVideoViaNewPipe(videoId));
         if (res != null) return res;
-        res = resolveVideoViaVisionOs(videoId);
+        res = tryVerifiedAudioCandidate(resolveVideoViaAndroidVr(videoId));
         if (res != null) return res;
-        return resolveVideoViaAndroidVr(videoId);
+        res = tryVerifiedAudioCandidate(resolveVideoViaIos(videoId));
+        if (res != null) return res;
+        return tryVerifiedAudioCandidate(resolveVideoViaVisionOs(videoId));
+    }
+
+    private static ResolvedAudio resolveVideoViaNewPipe(String videoId) {
+        try {
+            String watchUrl = "https://www.youtube.com/watch?v=" + videoId;
+            StreamInfo info = StreamInfo.getInfo(ServiceList.YouTube, watchUrl);
+            List<VideoStream> videoStreams = info.getVideoStreams();
+            if (videoStreams == null || videoStreams.isEmpty()) return null;
+
+            VideoStream best = null;
+            int bestScore = Integer.MIN_VALUE;
+            for (VideoStream v : videoStreams) {
+                if (v == null || v.isVideoOnly() || !v.isUrl()
+                        || v.getDeliveryMethod() != DeliveryMethod.PROGRESSIVE_HTTP) {
+                    continue;
+                }
+                String url = v.getContent();
+                if (url == null || url.isEmpty()) continue;
+
+                MediaFormat fmt = v.getFormat();
+                String resStr = v.getResolution() != null ? v.getResolution().toLowerCase(Locale.ROOT) : "";
+                int height = 0;
+                try {
+                    String digits = resStr.replaceAll("[^0-9]", "");
+                    if (!digits.isEmpty()) height = Integer.parseInt(digits);
+                } catch (Exception ignored) {}
+
+                int score = height;
+                if (fmt == MediaFormat.MPEG_4) score += 2000;
+                if (height == 720) score += 800;
+                else if (height == 360) score += 400;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    best = v;
+                }
+            }
+            if (best == null || best.getContent() == null) return null;
+            MediaFormat fmt = best.getFormat();
+            String mime = (fmt != null && fmt.mimeType != null && !fmt.mimeType.isEmpty())
+                    ? fmt.mimeType
+                    : "video/mp4";
+            return new ResolvedAudio(
+                    videoId,
+                    best.getContent(),
+                    mime,
+                    info.getName() != null ? info.getName() : "",
+                    info.getUploaderName() != null ? info.getUploaderName() : "",
+                    info.getDuration(),
+                    0L,
+                    DOWNLOADER_UA,
+                    "NEWPIPE"
+            );
+        } catch (Exception ignored) {
+            return null;
+        }
     }
 
     static long downloadStreamChunked(

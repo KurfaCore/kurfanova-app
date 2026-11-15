@@ -237,6 +237,11 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void invalidateAudioStream(String videoId) {
+            KurfaNativeEngine.invalidateStream(KurfaNativeEngine.extractVideoId(videoId));
+        }
+
+        @JavascriptInterface
         public void resolveAudioStreamAsync(String videoId, String requestId) {
             final String safeId = requestId == null ? "" : requestId.replaceAll("[^A-Za-z0-9_-]", "");
             if (safeId.isEmpty()) return;
@@ -344,11 +349,12 @@ public class MainActivity extends Activity {
                             ? media.mimeType
                             : (wantVideo ? "video/mp4" : "audio/mp4");
 
-                    boolean saved = streamDownloadToDevice(media, safeFileName, resolvedMime, progressCb);
-                    if (saved) {
+                    long savedBytes = streamDownloadToDevice(media, safeFileName, resolvedMime, progressCb);
+                    if (savedBytes > 0L) {
                         res.put("success", true);
                         res.put("fileName", safeFileName);
                         res.put("mimeType", resolvedMime);
+                        res.put("bytesDownloaded", savedBytes);
                     } else {
                         res.put("success", false);
                         res.put("error", "Cihaz depolamasına yazılamadı");
@@ -914,12 +920,12 @@ public class MainActivity extends Activity {
         return true;
     }
 
-    private boolean streamDownloadToDevice(
+    private long streamDownloadToDevice(
             KurfaNativeEngine.ResolvedAudio media,
             String fileName,
             String mimeType,
             KurfaNativeEngine.DownloadProgressListener progressCb
-    ) {
+    ) throws IOException {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             ContentResolver resolver = getContentResolver();
             ContentValues values = new ContentValues();
@@ -929,36 +935,39 @@ public class MainActivity extends Activity {
             values.put(MediaStore.Downloads.IS_PENDING, 1);
 
             Uri itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
-            if (itemUri == null) return false;
+            if (itemUri == null) throw new IOException("İndirilenler klasöründe dosya oluşturulamadı");
             try (OutputStream out = resolver.openOutputStream(itemUri)) {
                 if (out == null) {
                     resolver.delete(itemUri, null, null);
-                    return false;
+                    throw new IOException("Dosya akışı açılamadı");
                 }
-                KurfaNativeEngine.downloadStreamChunked(media, out, progressCb);
+                long bytes = KurfaNativeEngine.downloadStreamChunked(media, out, progressCb);
                 values.clear();
                 values.put(MediaStore.Downloads.IS_PENDING, 0);
                 resolver.update(itemUri, values, null, null);
-                return true;
+                return bytes;
             } catch (IOException | SecurityException e) {
                 try { resolver.delete(itemUri, null, null); } catch (Exception ignored) {}
-                return false;
+                if (e instanceof IOException) throw (IOException) e;
+                throw new IOException(e.getMessage() != null ? e.getMessage() : "Depolama izni hatası");
             }
         }
 
         if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-            return false;
+            throw new IOException("Depolama izni verilmedi");
         }
         File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
         if (downloadsDir == null || (!downloadsDir.exists() && !downloadsDir.mkdirs())) {
-            return false;
+            throw new IOException("İndirilenler klasörü bulunamadı");
         }
         File targetFile = resolveUniqueFile(downloadsDir, fileName);
+        long bytes;
         try (FileOutputStream fos = new FileOutputStream(targetFile)) {
-            KurfaNativeEngine.downloadStreamChunked(media, fos, progressCb);
+            bytes = KurfaNativeEngine.downloadStreamChunked(media, fos, progressCb);
         } catch (IOException | SecurityException e) {
             try { if (targetFile.exists()) targetFile.delete(); } catch (Exception ignored) {}
-            return false;
+            if (e instanceof IOException) throw (IOException) e;
+            throw new IOException(e.getMessage() != null ? e.getMessage() : "Yazma hatası");
         }
         MediaScannerConnection.scanFile(
                 this,
@@ -966,7 +975,7 @@ public class MainActivity extends Activity {
                 new String[]{mimeType},
                 null
         );
-        return true;
+        return bytes;
     }
 
     private static File resolveUniqueFile(File directory, String fileName) {
