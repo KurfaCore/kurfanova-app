@@ -284,6 +284,69 @@ public class MainActivity extends Activity {
         public void checkForUpdates() {
             ApkAutoUpdater.checkInBackground(MainActivity.this, nativeExecutor, webView);
         }
+
+        @JavascriptInterface
+        public void downloadMediaAsync(String videoId, String format, String title, String requestId) {
+            final String safeId = requestId == null ? "" : requestId.replaceAll("[^A-Za-z0-9_-]", "");
+            if (safeId.isEmpty()) return;
+            final boolean wantVideo = "mp4".equalsIgnoreCase(format) || "video".equalsIgnoreCase(format);
+
+            nativeExecutor.execute(() -> {
+                JSONObject res = new JSONObject();
+                try {
+                    KurfaNativeEngine.ResolvedAudio media = KurfaNativeEngine.resolveMediaForDownload(videoId, wantVideo);
+                    if (media == null) {
+                        res.put("success", false);
+                        res.put("error", wantVideo ? "Video akışı bulunamadı" : "Ses akışı bulunamadı");
+                        dispatchJsCallback("__kurfaNativeDownloadCallback", safeId, res.toString());
+                        return;
+                    }
+
+                    String ext = wantVideo
+                            ? ".mp4"
+                            : (media.mimeType != null && media.mimeType.contains("webm") ? ".webm" : ".m4a");
+                    String baseName = !TextUtils.isEmpty(title)
+                            ? title
+                            : (!TextUtils.isEmpty(media.title) ? media.title : ("Kurfamuzik_" + media.videoId));
+                    String safeFileName = sanitizeFileName(baseName);
+                    if (safeFileName.length() > 90) safeFileName = safeFileName.substring(0, 90).trim();
+                    if (safeFileName.isEmpty()) safeFileName = "Kurfamuzik";
+                    if (!safeFileName.toLowerCase(Locale.ROOT).endsWith(ext)) {
+                        safeFileName = safeFileName + ext;
+                    }
+
+                    KurfaNativeEngine.DownloadProgressListener progressCb = (dl, total, pct) -> {
+                        try {
+                            JSONObject p = new JSONObject();
+                            p.put("bytesDownloaded", dl);
+                            p.put("totalBytes", total);
+                            p.put("percent", pct);
+                            dispatchJsCallback("__kurfaNativeDownloadProgress", safeId, p.toString());
+                        } catch (Exception ignored) {}
+                    };
+
+                    String resolvedMime = media.mimeType != null && !media.mimeType.isEmpty()
+                            ? media.mimeType
+                            : (wantVideo ? "video/mp4" : "audio/mp4");
+
+                    boolean saved = streamDownloadToDevice(media, safeFileName, resolvedMime, progressCb);
+                    if (saved) {
+                        res.put("success", true);
+                        res.put("fileName", safeFileName);
+                        res.put("mimeType", resolvedMime);
+                    } else {
+                        res.put("success", false);
+                        res.put("error", "Cihaz depolamasına yazılamadı");
+                    }
+                } catch (Exception e) {
+                    try {
+                        res.put("success", false);
+                        res.put("error", e.getMessage() != null ? e.getMessage() : "İndirme hatası");
+                    } catch (Exception ignored) {}
+                }
+                dispatchJsCallback("__kurfaNativeDownloadCallback", safeId, res.toString());
+            });
+        }
     }
 
     private void dispatchJsCallback(String fnName, String safeRequestId, String jsonPayload) {
@@ -812,6 +875,61 @@ public class MainActivity extends Activity {
             fos.write(bytes);
             fos.flush();
         } catch (IOException | SecurityException e) {
+            return false;
+        }
+        MediaScannerConnection.scanFile(
+                this,
+                new String[]{targetFile.getAbsolutePath()},
+                new String[]{mimeType},
+                null
+        );
+        return true;
+    }
+
+    private boolean streamDownloadToDevice(
+            KurfaNativeEngine.ResolvedAudio media,
+            String fileName,
+            String mimeType,
+            KurfaNativeEngine.DownloadProgressListener progressCb
+    ) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            ContentResolver resolver = getContentResolver();
+            ContentValues values = new ContentValues();
+            values.put(MediaStore.Downloads.DISPLAY_NAME, fileName);
+            values.put(MediaStore.Downloads.MIME_TYPE, mimeType);
+            values.put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS);
+            values.put(MediaStore.Downloads.IS_PENDING, 1);
+
+            Uri itemUri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values);
+            if (itemUri == null) return false;
+            try (OutputStream out = resolver.openOutputStream(itemUri)) {
+                if (out == null) {
+                    resolver.delete(itemUri, null, null);
+                    return false;
+                }
+                KurfaNativeEngine.downloadStreamChunked(media, out, progressCb);
+                values.clear();
+                values.put(MediaStore.Downloads.IS_PENDING, 0);
+                resolver.update(itemUri, values, null, null);
+                return true;
+            } catch (IOException | SecurityException e) {
+                try { resolver.delete(itemUri, null, null); } catch (Exception ignored) {}
+                return false;
+            }
+        }
+
+        if (checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+            return false;
+        }
+        File downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        if (downloadsDir == null || (!downloadsDir.exists() && !downloadsDir.mkdirs())) {
+            return false;
+        }
+        File targetFile = resolveUniqueFile(downloadsDir, fileName);
+        try (FileOutputStream fos = new FileOutputStream(targetFile)) {
+            KurfaNativeEngine.downloadStreamChunked(media, fos, progressCb);
+        } catch (IOException | SecurityException e) {
+            try { if (targetFile.exists()) targetFile.delete(); } catch (Exception ignored) {}
             return false;
         }
         MediaScannerConnection.scanFile(

@@ -14,6 +14,7 @@ public sealed class DesktopAppConfig
     public bool DesktopShortcut { get; set; } = true;
     public bool StartMenuShortcut { get; set; } = true;
     public bool RunOnStartup { get; set; } = false;
+    public bool MinimizeToTray { get; set; } = true;
     public string InstalledVersion { get; set; } = "1.1.0";
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? LastUpdateCheckUtc { get; set; }

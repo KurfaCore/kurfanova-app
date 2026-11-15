@@ -1385,6 +1385,361 @@ public sealed partial class NativeDesktopEngine : IDisposable
         return 0;
     }
 
+    public sealed record DownloadMediaResult(
+        bool Success,
+        string? FileName,
+        string? FilePath,
+        string? MimeType,
+        long BytesDownloaded,
+        string? Error);
+
+    public async Task<DownloadMediaResult> DownloadMediaToDownloadsAsync(
+        string? videoId,
+        string format,
+        string? preferredTitle,
+        Action<long, long, int>? onProgress,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrWhiteSpace(videoId))
+        {
+            return new DownloadMediaResult(false, null, null, null, 0, "Geçersiz video kimliği");
+        }
+
+        string safeId = videoId.Trim();
+        bool wantVideo = string.Equals(format, "mp4", StringComparison.OrdinalIgnoreCase) ||
+                         string.Equals(format, "video", StringComparison.OrdinalIgnoreCase);
+
+        ResolvedAudio? media = wantVideo
+            ? await ResolveMuxedVideoAsync(safeId, ct).ConfigureAwait(false)
+            : await ResolveAudioStreamAsync(safeId, ct: ct).ConfigureAwait(false);
+
+        if (media is null || string.IsNullOrEmpty(media.StreamUrl))
+        {
+            return new DownloadMediaResult(
+                false,
+                null,
+                null,
+                null,
+                0,
+                wantVideo ? "MP4 video akışı bu parça için bulunamadı" : "Ses akışı çözümlenemedi");
+        }
+
+        string ext = wantVideo
+            ? ".mp4"
+            : (media.MimeType.Contains("webm", StringComparison.OrdinalIgnoreCase) ? ".webm" : ".m4a");
+        string baseTitle = !string.IsNullOrWhiteSpace(preferredTitle)
+            ? preferredTitle!
+            : (!string.IsNullOrWhiteSpace(media.Title) ? media.Title : $"Kurfamuzik_{safeId}");
+        string safeFileName = SanitizeDownloadFileName(baseTitle) + ext;
+
+        string downloadsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "Downloads");
+        if (string.IsNullOrWhiteSpace(downloadsDir) || !Directory.Exists(downloadsDir))
+        {
+            downloadsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic));
+        }
+        Directory.CreateDirectory(downloadsDir);
+
+        string targetPath = ResolveUniqueDownloadPath(downloadsDir, safeFileName);
+        string tempPath = targetPath + ".part";
+        string finalFileName = Path.GetFileName(targetPath);
+
+        long chunkCap = string.Equals(media.ClientKind, "IOS", StringComparison.Ordinal)
+            ? MaxIosUpstreamChunkBytes
+            : MaxGeneralUpstreamChunkBytes;
+
+        long totalBytes = media.ContentLength;
+        long offset = 0;
+        long lastReportedTicks = 0;
+        byte[] buffer = System.Buffers.ArrayPool<byte>.Shared.Rent(65536);
+
+        try
+        {
+            onProgress?.Invoke(0, totalBytes, 0);
+
+            await using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, useAsync: true))
+            {
+                while (true)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    long chunkEnd = offset + chunkCap - 1;
+                    if (totalBytes > 0)
+                    {
+                        if (offset >= totalBytes) break;
+                        chunkEnd = Math.Min(chunkEnd, totalBytes - 1);
+                    }
+
+                    using var req = new HttpRequestMessage(HttpMethod.Get, media.StreamUrl);
+                    req.Headers.TryAddWithoutValidation("User-Agent", media.RequestUserAgent);
+                    req.Headers.TryAddWithoutValidation("Range", $"bytes={offset}-{chunkEnd}");
+
+                    using HttpResponseMessage resp = await _streamHttpClient
+                        .SendAsync(req, HttpCompletionOption.ResponseHeadersRead, ct)
+                        .ConfigureAwait(false);
+
+                    int code = (int)resp.StatusCode;
+                    if (code < 200 || code >= 300)
+                    {
+                        if (offset > 0 && code == 416) break;
+                        return new DownloadMediaResult(false, null, null, null, offset, $"Sunucu hatası ({code})");
+                    }
+
+                    if (resp.Content.Headers.ContentRange?.Length is long crTotal && crTotal > 0)
+                    {
+                        totalBytes = crTotal;
+                    }
+                    else if (totalBytes <= 0 && resp.Content.Headers.ContentLength is long cl && cl > 0 && code == 200)
+                    {
+                        totalBytes = cl;
+                    }
+
+                    await using Stream upstream = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+                    long readInChunk = 0;
+                    int read;
+                    while ((read = await upstream.ReadAsync(buffer.AsMemory(0, buffer.Length), ct).ConfigureAwait(false)) > 0)
+                    {
+                        await fs.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                        offset += read;
+                        readInChunk += read;
+
+                        long nowTicks = Environment.TickCount64;
+                        if (nowTicks - lastReportedTicks >= 110)
+                        {
+                            lastReportedTicks = nowTicks;
+                            int pct = totalBytes > 0
+                                ? Math.Clamp((int)((offset * 100L) / totalBytes), 1, 99)
+                                : 15;
+                            onProgress?.Invoke(offset, totalBytes, pct);
+                        }
+                    }
+
+                    if (readInChunk == 0 || code == 200 || (totalBytes > 0 && offset >= totalBytes))
+                    {
+                        break;
+                    }
+                }
+                await fs.FlushAsync(ct).ConfigureAwait(false);
+            }
+
+            File.Move(tempPath, targetPath, overwrite: true);
+            onProgress?.Invoke(offset, Math.Max(totalBytes, offset), 100);
+            return new DownloadMediaResult(true, finalFileName, targetPath, media.MimeType, offset, null);
+        }
+        catch (OperationCanceledException)
+        {
+            TryDeleteTempFile(tempPath);
+            throw;
+        }
+        catch (Exception ex)
+        {
+            TryDeleteTempFile(tempPath);
+            return new DownloadMediaResult(false, null, null, null, offset, ex.Message);
+        }
+        finally
+        {
+            System.Buffers.ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
+
+    private async Task<ResolvedAudio?> ResolveMuxedVideoAsync(string videoId, CancellationToken ct)
+    {
+        string? visitorData = await ResolveVisitorDataAsync(false, ct).ConfigureAwait(false);
+        var iosPayload = new
+        {
+            context = new
+            {
+                client = new
+                {
+                    clientName = "IOS",
+                    clientVersion = "20.10.4",
+                    deviceMake = "Apple",
+                    deviceModel = "iPhone16,2",
+                    osName = "iPhone",
+                    osVersion = "18.3.2.22D82",
+                    hl = "tr",
+                    gl = "TR"
+                }
+            },
+            videoId
+        };
+
+        ResolvedAudio? res = await ResolveMuxedVideoFromClientAsync(
+            videoId, iosPayload, IosUserAgent, "5", "20.10.4", null, "IOS", ct).ConfigureAwait(false);
+        if (res is not null) return res;
+
+        var visionPayload = new
+        {
+            context = new
+            {
+                client = new
+                {
+                    clientName = "VISIONOS",
+                    clientVersion = "1.02",
+                    deviceMake = "Apple",
+                    deviceModel = "RealityDevice17,1",
+                    osName = "visionOS",
+                    osVersion = "26.5.23O471",
+                    visitorData,
+                    hl = "tr",
+                    gl = "TR"
+                }
+            },
+            videoId,
+            contentCheckOk = true,
+            racyCheckOk = true
+        };
+
+        res = await ResolveMuxedVideoFromClientAsync(
+            videoId, visionPayload, VisionOsUserAgent, null, null, visitorData, "VISIONOS", ct).ConfigureAwait(false);
+        if (res is not null) return res;
+
+        var vrPayload = new
+        {
+            context = new
+            {
+                client = new
+                {
+                    clientName = "ANDROID_VR",
+                    clientVersion = "1.57.29",
+                    androidSdkVersion = 34,
+                    hl = "tr",
+                    gl = "TR"
+                }
+            },
+            videoId
+        };
+
+        return await ResolveMuxedVideoFromClientAsync(
+            videoId, vrPayload, AndroidVrUserAgent, "28", "1.57.29", null, "ANDROID_VR", ct).ConfigureAwait(false);
+    }
+
+    private async Task<ResolvedAudio?> ResolveMuxedVideoFromClientAsync(
+        string videoId,
+        object payloadObj,
+        string userAgent,
+        string? clientNameId,
+        string? clientVersion,
+        string? visitorData,
+        string clientKind,
+        CancellationToken ct)
+    {
+        try
+        {
+            string jsonBody = JsonSerializer.Serialize(payloadObj);
+            using var req = new HttpRequestMessage(
+                HttpMethod.Post,
+                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+            {
+                Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
+            };
+            req.Headers.TryAddWithoutValidation("User-Agent", userAgent);
+            if (!string.IsNullOrEmpty(clientNameId)) req.Headers.TryAddWithoutValidation("X-YouTube-Client-Name", clientNameId);
+            if (!string.IsNullOrEmpty(clientVersion)) req.Headers.TryAddWithoutValidation("X-YouTube-Client-Version", clientVersion);
+            if (!string.IsNullOrEmpty(visitorData)) req.Headers.TryAddWithoutValidation("X-Goog-Visitor-Id", visitorData);
+
+            using HttpResponseMessage res = await _apiHttpClient.SendAsync(req, ct).ConfigureAwait(false);
+            if (!res.IsSuccessStatusCode) return null;
+
+            await using Stream bodyStream = await res.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using JsonDocument doc = await JsonDocument.ParseAsync(bodyStream, cancellationToken: ct).ConfigureAwait(false);
+            JsonElement root = doc.RootElement;
+
+            if (!root.TryGetProperty("streamingData", out JsonElement streamingData) || streamingData.ValueKind != JsonValueKind.Object)
+                return null;
+            if (!streamingData.TryGetProperty("formats", out JsonElement formats) || formats.ValueKind != JsonValueKind.Array)
+                return null;
+
+            string? bestUrl = null;
+            string bestMime = "video/mp4";
+            int bestItag = 0;
+            long bestContentLength = 0;
+            int bestScore = int.MinValue;
+
+            foreach (JsonElement format in formats.EnumerateArray())
+            {
+                if (format.ValueKind != JsonValueKind.Object) continue;
+                string mime = GetString(format, "mimeType");
+                string url = GetString(format, "url");
+                if (!mime.StartsWith("video/mp4", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(url)) continue;
+
+                int itag = GetInt32(format, "itag");
+                int height = GetInt32(format, "height");
+                long clen = 0;
+                string clenStr = GetString(format, "contentLength");
+                if (!string.IsNullOrEmpty(clenStr))
+                {
+                    _ = long.TryParse(clenStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out clen);
+                }
+
+                int score = height;
+                if (itag == 22) score += 2000; // 720p muxed MP4
+                else if (itag == 18) score += 1000; // 360p muxed MP4
+
+                if (score > bestScore)
+                {
+                    bestScore = score;
+                    bestUrl = url;
+                    bestItag = itag;
+                    bestContentLength = clen;
+                    int semiIdx = mime.IndexOf(';');
+                    bestMime = semiIdx > 0 ? mime[..semiIdx].Trim() : "video/mp4";
+                }
+            }
+
+            if (string.IsNullOrEmpty(bestUrl)) return null;
+
+            string title = string.Empty;
+            string artist = string.Empty;
+            long durationSec = 0;
+            if (root.TryGetProperty("videoDetails", out JsonElement details) && details.ValueKind == JsonValueKind.Object)
+            {
+                title = GetString(details, "title");
+                artist = GetString(details, "author");
+                string lenStr = GetString(details, "lengthSeconds");
+                _ = long.TryParse(lenStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out durationSec);
+            }
+
+            return new ResolvedAudio(
+                videoId, bestUrl, bestMime, bestItag, bestContentLength,
+                title, artist, durationSec, userAgent, clientKind, DateTimeOffset.UtcNow.Add(StreamCacheTtl));
+        }
+        catch (OperationCanceledException) { throw; }
+        catch { return null; }
+    }
+
+    private static string SanitizeDownloadFileName(string raw)
+    {
+        char[] invalid = Path.GetInvalidFileNameChars();
+        var sb = new StringBuilder(raw.Length);
+        foreach (char c in raw.Trim())
+        {
+            sb.Append(Array.IndexOf(invalid, c) >= 0 || c == '\r' || c == '\n' || c == '\t' ? '_' : c);
+        }
+        string cleaned = sb.ToString().Trim().TrimStart('.');
+        if (cleaned.Length > 100) cleaned = cleaned[..100].Trim();
+        return string.IsNullOrWhiteSpace(cleaned) ? "Kurfamuzik" : cleaned;
+    }
+
+    private static string ResolveUniqueDownloadPath(string directory, string fileName)
+    {
+        string candidate = Path.Combine(directory, fileName);
+        if (!File.Exists(candidate)) return candidate;
+        string name = Path.GetFileNameWithoutExtension(fileName);
+        string ext = Path.GetExtension(fileName);
+        for (int i = 1; i < 500; i++)
+        {
+            string next = Path.Combine(directory, $"{name} ({i}){ext}");
+            if (!File.Exists(next)) return next;
+        }
+        return Path.Combine(directory, $"{name}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}{ext}");
+    }
+
+    private static void TryDeleteTempFile(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); } catch { /* ignore */ }
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)

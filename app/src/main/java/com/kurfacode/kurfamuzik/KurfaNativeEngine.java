@@ -950,6 +950,215 @@ final class KurfaNativeEngine {
         return String.format(Locale.US, "%d:%02d", m, s);
     }
 
+    interface DownloadProgressListener {
+        void onProgress(long bytesDownloaded, long totalBytes, int percent);
+    }
+
+    static ResolvedAudio resolveMediaForDownload(String rawVideoId, boolean wantVideo) {
+        String videoId = extractVideoId(rawVideoId);
+        if (videoId == null) return null;
+        if (!wantVideo) {
+            return resolveAudioStream(videoId);
+        }
+
+        ResolvedAudio res = resolveVideoViaIos(videoId);
+        if (res != null) return res;
+        res = resolveVideoViaVisionOs(videoId);
+        if (res != null) return res;
+        return resolveVideoViaAndroidVr(videoId);
+    }
+
+    static long downloadStreamChunked(
+            ResolvedAudio media,
+            java.io.OutputStream out,
+            DownloadProgressListener listener
+    ) throws IOException {
+        if (media == null || out == null) throw new IOException("Invalid media");
+        long chunkCap = "IOS".equals(media.clientKind) ? MAX_IOS_CHUNK_BYTES : MAX_GENERAL_CHUNK_BYTES;
+        long totalBytes = media.contentLength;
+        long offset = 0L;
+        long lastNotify = 0L;
+        byte[] buf = new byte[32768];
+
+        if (listener != null) listener.onProgress(0L, totalBytes, 0);
+
+        while (true) {
+            long chunkEnd = offset + chunkCap - 1L;
+            if (totalBytes > 0L) {
+                if (offset >= totalBytes) break;
+                chunkEnd = Math.min(chunkEnd, totalBytes - 1L);
+            }
+
+            okhttp3.Request req = new okhttp3.Request.Builder()
+                    .url(media.streamUrl)
+                    .get()
+                    .header("User-Agent", media.requestUserAgent)
+                    .header("Range", "bytes=" + offset + "-" + chunkEnd)
+                    .build();
+
+            try (okhttp3.Response resp = HTTP_CLIENT.newCall(req).execute()) {
+                int code = resp.code();
+                if (code < 200 || code >= 300) {
+                    if (offset > 0L && code == 416) break;
+                    throw new IOException("HTTP " + code);
+                }
+                long probedTotal = parseTotalLengthFromContentRange(resp.header("Content-Range"));
+                if (probedTotal > 0L) {
+                    totalBytes = probedTotal;
+                } else if (totalBytes <= 0L && code == 200) {
+                    long cl = parseLongSafe(resp.header("Content-Length"));
+                    if (cl > 0L) totalBytes = cl;
+                }
+
+                ResponseBody body = resp.body();
+                if (body == null) break;
+                InputStream in = body.byteStream();
+                long readChunk = 0L;
+                int n;
+                while ((n = in.read(buf)) != -1) {
+                    out.write(buf, 0, n);
+                    offset += n;
+                    readChunk += n;
+                    long now = System.currentTimeMillis();
+                    if (listener != null && now - lastNotify >= 150L) {
+                        lastNotify = now;
+                        int pct = totalBytes > 0L ? (int) Math.min(99L, Math.max(1L, (offset * 100L) / totalBytes)) : 15;
+                        listener.onProgress(offset, totalBytes, pct);
+                    }
+                }
+                if (readChunk == 0L || code == 200 || (totalBytes > 0L && offset >= totalBytes)) {
+                    break;
+                }
+            }
+        }
+        out.flush();
+        if (listener != null) listener.onProgress(offset, Math.max(totalBytes, offset), 100);
+        return offset;
+    }
+
+    private static ResolvedAudio resolveVideoViaIos(String videoId) {
+        try {
+            JSONObject client = new JSONObject()
+                    .put("clientName", "IOS")
+                    .put("clientVersion", "20.10.4")
+                    .put("deviceMake", "Apple")
+                    .put("deviceModel", "iPhone16,2")
+                    .put("osName", "iPhone")
+                    .put("osVersion", "18.3.2.22D82")
+                    .put("hl", "tr")
+                    .put("gl", "TR");
+            JSONObject payload = new JSONObject()
+                    .put("context", new JSONObject().put("client", client))
+                    .put("videoId", videoId);
+            return executeMuxedVideoClient(videoId, payload, IOS_UA, "5", "20.10.4", null, "IOS");
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static ResolvedAudio resolveVideoViaVisionOs(String videoId) {
+        try {
+            String visitorData = resolveVisitorData(false);
+            JSONObject client = new JSONObject()
+                    .put("clientName", "VISIONOS")
+                    .put("clientVersion", "1.02")
+                    .put("deviceMake", "Apple")
+                    .put("deviceModel", "RealityDevice17,1")
+                    .put("osName", "visionOS")
+                    .put("osVersion", "26.5.23O471")
+                    .put("hl", "tr")
+                    .put("gl", "TR");
+            if (visitorData != null && !visitorData.isEmpty()) client.put("visitorData", visitorData);
+            JSONObject payload = new JSONObject()
+                    .put("context", new JSONObject().put("client", client))
+                    .put("videoId", videoId)
+                    .put("contentCheckOk", true)
+                    .put("racyCheckOk", true);
+            return executeMuxedVideoClient(videoId, payload, VISIONOS_UA, null, null, visitorData, "VISIONOS");
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static ResolvedAudio resolveVideoViaAndroidVr(String videoId) {
+        try {
+            JSONObject client = new JSONObject()
+                    .put("clientName", "ANDROID_VR")
+                    .put("clientVersion", "1.57.29")
+                    .put("androidSdkVersion", 32)
+                    .put("hl", "tr")
+                    .put("gl", "TR");
+            JSONObject payload = new JSONObject()
+                    .put("context", new JSONObject().put("client", client))
+                    .put("videoId", videoId);
+            return executeMuxedVideoClient(videoId, payload, ANDROID_VR_UA, "28", "1.57.29", null, "ANDROID_VR");
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static ResolvedAudio executeMuxedVideoClient(
+            String videoId,
+            JSONObject payload,
+            String userAgent,
+            String clientNameId,
+            String clientVersion,
+            String visitorData,
+            String clientKind
+    ) throws IOException {
+        okhttp3.Request.Builder rb = new okhttp3.Request.Builder()
+                .url("https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+                .post(RequestBody.create(payload.toString(), JSON_MEDIA_TYPE))
+                .header("User-Agent", userAgent);
+        if (clientNameId != null && !clientNameId.isEmpty()) rb.header("X-YouTube-Client-Name", clientNameId);
+        if (clientVersion != null && !clientVersion.isEmpty()) rb.header("X-YouTube-Client-Version", clientVersion);
+        if (visitorData != null && !visitorData.isEmpty()) rb.header("X-Goog-Visitor-Id", visitorData);
+
+        try (okhttp3.Response res = HTTP_CLIENT.newCall(rb.build()).execute()) {
+            if (!res.isSuccessful() || res.body() == null) return null;
+            JSONObject json = new JSONObject(res.body().string());
+            JSONObject streamingData = json.optJSONObject("streamingData");
+            if (streamingData == null) return null;
+            JSONArray formats = streamingData.optJSONArray("formats");
+            if (formats == null) return null;
+
+            String bestUrl = null;
+            String bestMime = "video/mp4";
+            long bestContentLength = 0L;
+            int bestScore = Integer.MIN_VALUE;
+
+            for (int i = 0; i < formats.length(); i++) {
+                JSONObject f = formats.optJSONObject(i);
+                if (f == null) continue;
+                String mime = f.optString("mimeType", "");
+                String url = f.optString("url", "");
+                if (!mime.startsWith("video/mp4") || url.isEmpty()) continue;
+
+                int itag = f.optInt("itag", 0);
+                int height = f.optInt("height", 0);
+                long contentLen = parseLongSafe(f.optString("contentLength", ""));
+                int score = height;
+                if (itag == 22) score += 2000;
+                else if (itag == 18) score += 1000;
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestUrl = url;
+                    bestContentLength = contentLen;
+                    bestMime = mime.contains(";") ? mime.substring(0, mime.indexOf(';')).trim() : "video/mp4";
+                }
+            }
+            if (bestUrl == null) return null;
+            JSONObject details = json.optJSONObject("videoDetails");
+            String title = details != null ? details.optString("title", "") : "";
+            String author = details != null ? details.optString("author", "") : "";
+            long dur = details != null ? details.optLong("lengthSeconds", 0L) : 0L;
+            return new ResolvedAudio(videoId, bestUrl, bestMime, title, author, dur, bestContentLength, userAgent, clientKind);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private static final class ResponseClosingInputStream extends FilterInputStream {
         private final okhttp3.Response response;
 
