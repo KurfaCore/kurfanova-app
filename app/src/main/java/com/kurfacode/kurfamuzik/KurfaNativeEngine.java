@@ -135,6 +135,14 @@ final class KurfaNativeEngine {
         return videoId != null && YOUTUBE_ID_PATTERN.matcher(videoId).matches();
     }
 
+    static String extractVideoId(String raw) {
+        if (raw == null) return null;
+        String trimmed = raw.trim();
+        if (isValidVideoId(trimmed)) return trimmed;
+        Matcher m = WATCH_ID_PATTERN.matcher(trimmed);
+        return m.find() ? m.group(1) : null;
+    }
+
     static String extractVideoIdFromNativeAudioUri(Uri uri) {
         if (uri == null || uri.getHost() == null) {
             return null;
