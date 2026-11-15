@@ -118,7 +118,9 @@ public class MainActivity extends Activity {
             + "        };"
             + "      }"
             + "    } catch (_) {}"
-            + "    setInterval(() => {"
+        + "    try { Object.defineProperty(document, 'hidden', { configurable: true, get: () => false }); } catch (_) {}"
+        + "    try { Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'visible' }); } catch (_) {}"
+        + "    setInterval(() => {"
             + "      try {"
             + "        const player = document.querySelector('.html5-video-player');"
             + "        if (player && player.classList.contains('ad-showing')) {"
@@ -286,6 +288,11 @@ public class MainActivity extends Activity {
         @JavascriptInterface
         public void updateNowPlayingMetadata(String title, String artist, String thumbUrl) {
             KurfaPlaybackService.updateMetadata(MainActivity.this, title, artist, thumbUrl);
+        }
+
+        @JavascriptInterface
+        public void updatePlaybackTiming(long positionSec, long durationSec) {
+            KurfaPlaybackService.updateProgress(MainActivity.this, positionSec, durationSec);
         }
 
         @JavascriptInterface
@@ -1291,6 +1298,17 @@ public class MainActivity extends Activity {
         }
         // Intentionally avoid webView.onPause() and webView.pauseTimers() so background playback continues
         super.onPause();
+    }
+
+    @Override
+    protected void onStop() {
+        super.onStop();
+        if (KurfaPlaybackService.isPlaying && webView != null) {
+            try {
+                webView.onResume();
+                webView.resumeTimers();
+            } catch (Throwable ignored) {}
+        }
     }
 
     @Override

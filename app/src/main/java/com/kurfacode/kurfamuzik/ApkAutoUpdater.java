@@ -202,22 +202,73 @@ public final class ApkAutoUpdater {
 
     private static void showManualFriendlyUpdatePrompt(Activity activity, String versionName, File apkFile, String publicFileName) {
         if (activity == null || activity.isFinishing() || activity.isDestroyed()) return;
+        final boolean sameSignature = hasMatchingPackageSignature(activity, apkFile);
         activity.runOnUiThread(() -> {
             if (activity.isFinishing() || activity.isDestroyed()) return;
             try {
-                new AlertDialog.Builder(activity)
-                        .setTitle("Kurfanova v" + versionName + " İndirildi")
-                        .setMessage(
-                                "APK dosyası İndirilenler klasörüne kaydedildi:\n"
-                                + publicFileName + "\n\n"
-                                + "Not: Eski sürümden geçişte Android 'Paket yüklenemedi' uyarısı verirse mevcut uygulamayı kaldırıp İndirilenler'deki bu dosyaya dokunarak temiz kurulum yapabilirsiniz."
-                        )
-                        .setPositiveButton("Şimdi Kur", (dialog, which) -> installApk(activity, apkFile))
-                        .setNeutralButton("İndirilenleri Aç", (dialog, which) -> openDownloadsFolder(activity))
-                        .setNegativeButton("Kapat", null)
-                        .show();
+                if (sameSignature) {
+                    new AlertDialog.Builder(activity)
+                            .setTitle("Kurfanova v" + versionName + " Hazır")
+                            .setMessage("Yeni sürüm doğrulandı ve İndirilenler > Kurfanova klasörüne kaydedildi:\n" + publicFileName)
+                            .setPositiveButton("Şimdi Kur", (dialog, which) -> installApk(activity, apkFile))
+                            .setNeutralButton("İndirilenleri Aç", (dialog, which) -> openDownloadsFolder(activity))
+                            .setNegativeButton("Kapat", null)
+                            .show();
+                } else {
+                    new AlertDialog.Builder(activity)
+                            .setTitle("Kurfanova v" + versionName + " İndirildi")
+                            .setMessage(
+                                    "Yeni APK İndirilenler > Kurfanova klasörüne kaydedildi:\n"
+                                    + publicFileName + "\n\n"
+                                    + "Mevcut uygulama farklı imza taşıdığı için Android üzerine kurulumu engeller. Önce 'Mevcut Sürümü Kaldır' ile kaldırıp ardından 'İndirilenleri Aç' üzerinden bu dosyaya dokunun."
+                            )
+                            .setPositiveButton("Mevcut Sürümü Kaldır", (dialog, which) -> requestUninstallCurrentApp(activity))
+                            .setNeutralButton("İndirilenleri Aç", (dialog, which) -> openDownloadsFolder(activity))
+                            .setNegativeButton("Kapat", null)
+                            .show();
+                }
             } catch (Throwable ignored) {}
         });
+    }
+
+    private static void requestUninstallCurrentApp(Activity activity) {
+        if (activity == null) return;
+        try {
+            Intent del = new Intent(Intent.ACTION_DELETE, Uri.parse("package:" + activity.getPackageName()));
+            del.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            activity.startActivity(del);
+        } catch (Throwable t) {
+            Toast.makeText(activity, "Ayarlar > Uygulamalar bölümünden mevcut sürümü kaldırıp İndirilenler'deki APK'yı açın.", Toast.LENGTH_LONG).show();
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static boolean hasMatchingPackageSignature(Activity activity, File apkFile) {
+        if (activity == null || apkFile == null || !apkFile.exists()) return false;
+        try {
+            PackageManager pm = activity.getPackageManager();
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                PackageInfo installed = pm.getPackageInfo(activity.getPackageName(), PackageManager.GET_SIGNING_CERTIFICATES);
+                PackageInfo archive = pm.getPackageArchiveInfo(apkFile.getAbsolutePath(), PackageManager.GET_SIGNING_CERTIFICATES);
+                if (installed == null || archive == null || installed.signingInfo == null || archive.signingInfo == null) {
+                    return false;
+                }
+                android.content.pm.Signature[] curSigs = installed.signingInfo.getApkContentsSigners();
+                android.content.pm.Signature[] newSigs = archive.signingInfo.getApkContentsSigners();
+                if (curSigs == null || newSigs == null || curSigs.length == 0 || newSigs.length == 0) return false;
+                return java.util.Arrays.equals(curSigs[0].toByteArray(), newSigs[0].toByteArray());
+            } else {
+                PackageInfo installed = pm.getPackageInfo(activity.getPackageName(), PackageManager.GET_SIGNATURES);
+                PackageInfo archive = pm.getPackageArchiveInfo(apkFile.getAbsolutePath(), PackageManager.GET_SIGNATURES);
+                if (installed == null || archive == null || installed.signatures == null || archive.signatures == null
+                        || installed.signatures.length == 0 || archive.signatures.length == 0) {
+                    return false;
+                }
+                return java.util.Arrays.equals(installed.signatures[0].toByteArray(), archive.signatures[0].toByteArray());
+            }
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private static void exportApkToPublicDownloads(Activity activity, File sourceApk, String displayName) {
