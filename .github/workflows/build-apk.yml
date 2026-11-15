@@ -34,13 +34,16 @@ jobs:
           gradle-version: '8.6'
 
       - name: Prepare Persistent Android Keystore
-        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' }}
         env:
           KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KURFA_KEYSTORE_PASS: ${{ secrets.ANDROID_KEYSTORE_PASS }}
         run: |
-          printf '%s' "$KEYSTORE_B64" | tr -d '\r\n ' | base64 -d > app/kurfa-release.p12
-          keytool -list -keystore app/kurfa-release.p12 -storetype PKCS12 -storepass "$KURFA_KEYSTORE_PASS" | head -n 10
+          if [ -n "$KEYSTORE_B64" ]; then
+            printf '%s' "$KEYSTORE_B64" | tr -d '\r\n ' | base64 -d > app/kurfa-release.p12
+            keytool -list -keystore app/kurfa-release.p12 -storetype PKCS12 -storepass "$KURFA_KEYSTORE_PASS" | head -n 10
+          else
+            echo "No persistent keystore secret configured; falling back to default debug keystore."
+          fi
 
       - name: Build Debug APK with Gradle
         env:
