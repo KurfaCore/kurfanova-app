@@ -277,12 +277,20 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void setNativePlaybackState(boolean playing) {
-            runOnUiThread(() -> updatePlaybackWakeLock(playing));
+            runOnUiThread(() -> {
+                updatePlaybackWakeLock(playing);
+                KurfaPlaybackService.updateState(MainActivity.this, playing);
+            });
+        }
+
+        @JavascriptInterface
+        public void updateNowPlayingMetadata(String title, String artist, String thumbUrl) {
+            KurfaPlaybackService.updateMetadata(MainActivity.this, title, artist, thumbUrl);
         }
 
         @JavascriptInterface
         public void checkForUpdates() {
-            ApkAutoUpdater.checkInBackground(MainActivity.this, nativeExecutor, webView);
+            ApkAutoUpdater.checkInteractive(MainActivity.this, nativeExecutor, webView);
         }
 
         @JavascriptInterface
@@ -399,7 +407,8 @@ public class MainActivity extends Activity {
         rootContainer = new FrameLayout(this);
         rootContainer.setBackgroundColor(Color.parseColor("#07090e"));
 
-        webView = new WebView(this);
+        webView = new KurfaWebView(this);
+        KurfaPlaybackService.attachWebView(webView);
         rootContainer.addView(webView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
@@ -432,6 +441,18 @@ public class MainActivity extends Activity {
         }
 
         webView.loadUrl(TARGET_URL);
+        if (Build.VERSION.SDK_INT >= 33) {
+            try {
+                if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                    android.content.SharedPreferences prefs = getSharedPreferences("kurfa_prefs", MODE_PRIVATE);
+                    if (!prefs.getBoolean("notif_asked", false)) {
+                        prefs.edit().putBoolean("notif_asked", true).apply();
+                        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1003);
+                    }
+                }
+            } catch (Throwable ignored) {}
+        }
+
         ApkAutoUpdater.checkInBackground(this, nativeExecutor, webView);
     }
 
@@ -1262,6 +1283,12 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         CookieManager.getInstance().flush();
+        if (KurfaPlaybackService.isPlaying && webView != null) {
+            try {
+                webView.onResume();
+                webView.resumeTimers();
+            } catch (Throwable ignored) {}
+        }
         // Intentionally avoid webView.onPause() and webView.pauseTimers() so background playback continues
         super.onPause();
     }
@@ -1282,6 +1309,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         updatePlaybackWakeLock(false);
+        KurfaPlaybackService.stopService(this);
         nativeExecutor.shutdownNow();
         hideCustomView();
         CookieManager.getInstance().flush();

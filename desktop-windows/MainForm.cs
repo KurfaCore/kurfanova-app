@@ -1317,49 +1317,45 @@ public sealed class MainForm : Form
         {
             _trayIcon = new NotifyIcon
             {
-                Text = "Kurfamüzik",
+                Text = $"Kurfamüzik v{_updater.CurrentVersion.ToString(3)}",
                 Icon = _embeddedIcon ?? SystemIcons.Application,
                 Visible = true
             };
 
-            var menu = new ContextMenuStrip();
-            menu.Renderer = new ToolStripProfessionalRenderer(new DarkColorTable());
-            menu.BackColor = Color.FromArgb(20, 22, 37);
-            menu.ForeColor = Color.White;
+            Color textDark = Color.FromArgb(15, 23, 42);
+            Color textMuted = Color.FromArgb(100, 116, 139);
+            Color dangerRed = Color.FromArgb(225, 29, 72);
 
-            var itemShow = new ToolStripMenuItem("Kurfamüzik'i Göster", null, (_, _) => RestoreWindow());
-            itemShow.Font = new Font(Font, FontStyle.Bold);
-            itemShow.ForeColor = Color.White;
-
-            var itemHideTray = new ToolStripMenuItem("Arka Plana Küçült (Tepsi)", null, (_, _) => HideToTray())
+            var menu = new ContextMenuStrip
             {
-                ForeColor = Color.White
+                ShowImageMargin = false,
+                ShowCheckMargin = false,
+                Font = new Font("Segoe UI", 9.25F, FontStyle.Regular),
+                BackColor = Color.FromArgb(252, 252, 254),
+                ForeColor = textDark,
+                Padding = new Padding(4, 6, 4, 6)
+            };
+            menu.Renderer = new ToolStripProfessionalRenderer(new LightTrayColorTable());
+
+            var itemHeader = new ToolStripMenuItem($"Kurfamüzik v{_updater.CurrentVersion.ToString(3)}")
+            {
+                Enabled = false,
+                ForeColor = textMuted,
+                Font = new Font("Segoe UI", 8.25F, FontStyle.Bold),
+                Padding = new Padding(10, 4, 14, 4)
             };
 
-            var itemShortcut = new ToolStripMenuItem("Masaüstü Kısayolu Oluştur / Yenile", null, (_, _) =>
+            var itemToggleWindow = new ToolStripMenuItem("Pencereyi Göster / Gizle", null, (_, _) =>
             {
-                lock (_config)
-                {
-                    _config.DesktopShortcut = true;
-                    AppPaths.SaveConfig(_paths, _config);
-                    InstallerService.ApplyShortcutsAndRegistry(_paths, _config, _updater.CurrentVersion);
-                }
-                _trayIcon.ShowBalloonTip(2000, "Kurfamüzik", "Masaüstü kısayolu oluşturuldu.", ToolTipIcon.Info);
+                if (Visible && WindowState != FormWindowState.Minimized)
+                    HideToTray();
+                else
+                    RestoreWindow();
             })
             {
-                ForeColor = Color.White
-            };
-
-            var itemOpenDir = new ToolStripMenuItem("Kurulum Klasörünü Aç", null, (_, _) =>
-            {
-                try
-                {
-                    Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_paths.InstallDir}\"") { UseShellExecute = true });
-                }
-                catch { }
-            })
-            {
-                ForeColor = Color.White
+                ForeColor = textDark,
+                Font = new Font("Segoe UI", 9.25F, FontStyle.Bold),
+                Padding = new Padding(10, 6, 14, 6)
             };
 
             var itemCheckUpdate = new ToolStripMenuItem("Güncellemeleri Denetle", null, async (_, _) =>
@@ -1372,15 +1368,42 @@ public sealed class MainForm : Form
                 }
             })
             {
-                ForeColor = Color.White
+                ForeColor = textDark,
+                Padding = new Padding(10, 5, 14, 5)
             };
 
-            var itemSetup = new ToolStripMenuItem("Kurulum Sihirbazını Aç", null, (_, _) =>
+            var itemShortcut = new ToolStripMenuItem("Masaüstü Kısayolu Oluştur", null, (_, _) =>
             {
-                LaunchSetup();
+                lock (_config)
+                {
+                    _config.DesktopShortcut = true;
+                    AppPaths.SaveConfig(_paths, _config);
+                    InstallerService.ApplyShortcutsAndRegistry(_paths, _config, _updater.CurrentVersion);
+                }
+                _trayIcon.ShowBalloonTip(2000, "Kurfamüzik", "Masaüstü kısayolu oluşturuldu.", ToolTipIcon.Info);
             })
             {
-                ForeColor = Color.White
+                ForeColor = textDark,
+                Padding = new Padding(10, 5, 14, 5)
+            };
+
+            var itemOpenDir = new ToolStripMenuItem("Kurulum Klasörünü Aç", null, (_, _) =>
+            {
+                try
+                {
+                    Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_paths.InstallDir}\"") { UseShellExecute = true });
+                }
+                catch { }
+            })
+            {
+                ForeColor = textDark,
+                Padding = new Padding(10, 5, 14, 5)
+            };
+
+            var itemSetup = new ToolStripMenuItem("Kurulum Sihirbazı", null, (_, _) => LaunchSetup())
+            {
+                ForeColor = textDark,
+                Padding = new Padding(10, 5, 14, 5)
             };
 
             var itemUninstall = new ToolStripMenuItem("Uygulamayı Kaldır...", null, (_, _) =>
@@ -1389,27 +1412,37 @@ public sealed class MainForm : Form
                 BeginInvoke(() => InstallerService.RunUninstall(silent: false));
             })
             {
-                ForeColor = Color.White
+                ForeColor = textMuted,
+                Padding = new Padding(10, 5, 14, 5)
             };
 
-            var itemExit = new ToolStripMenuItem("Tamamen Çıkış", null, (_, _) =>
+            var itemExit = new ToolStripMenuItem("Çıkış", null, (_, _) =>
             {
                 _allowExit = true;
                 Close();
             })
             {
-                ForeColor = Color.White
+                ForeColor = dangerRed,
+                Font = new Font("Segoe UI", 9.25F, FontStyle.Bold),
+                Padding = new Padding(10, 6, 14, 6)
             };
 
-            menu.Items.Add(itemShow);
-            menu.Items.Add(itemHideTray);
+            menu.Opening += (_, _) =>
+            {
+                bool isVisible = Visible && WindowState != FormWindowState.Minimized;
+                itemToggleWindow.Text = isVisible ? "Arka Plana Küçült" : "Pencereyi Aç";
+            };
+
+            menu.Items.Add(itemHeader);
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(itemToggleWindow);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(itemCheckUpdate);
             menu.Items.Add(itemShortcut);
             menu.Items.Add(itemOpenDir);
-            menu.Items.Add(itemCheckUpdate);
             menu.Items.Add(itemSetup);
-            menu.Items.Add(itemUninstall);
             menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(itemUninstall);
             menu.Items.Add(itemExit);
 
             _trayIcon.ContextMenuStrip = menu;
@@ -1510,24 +1543,24 @@ public sealed class MainForm : Form
         _shutdownCts.Dispose();
     }
 
-    private sealed class DarkColorTable : ProfessionalColorTable
+    private sealed class LightTrayColorTable : ProfessionalColorTable
     {
-        private readonly Color _bg = Color.FromArgb(20, 22, 37);
-        private readonly Color _selected = Color.FromArgb(38, 42, 65);
-        private readonly Color _border = Color.FromArgb(48, 54, 80);
+        private readonly Color _bg = Color.FromArgb(252, 252, 254);
+        private readonly Color _selected = Color.FromArgb(241, 245, 249);
+        private readonly Color _border = Color.FromArgb(226, 232, 240);
 
         public override Color ToolStripDropDownBackground => _bg;
         public override Color ImageMarginGradientBegin => _bg;
         public override Color ImageMarginGradientMiddle => _bg;
         public override Color ImageMarginGradientEnd => _bg;
         public override Color MenuBorder => _border;
-        public override Color MenuItemBorder => _border;
+        public override Color MenuItemBorder => _selected;
         public override Color MenuItemSelected => _selected;
         public override Color MenuItemSelectedGradientBegin => _selected;
         public override Color MenuItemSelectedGradientEnd => _selected;
         public override Color MenuItemPressedGradientBegin => _selected;
         public override Color MenuItemPressedGradientEnd => _selected;
         public override Color SeparatorDark => _border;
-        public override Color SeparatorLight => _border;
+        public override Color SeparatorLight => _bg;
     }
 }
