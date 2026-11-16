@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Drawing.Drawing2D;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text.Json;
@@ -81,6 +82,8 @@ public sealed class MainForm : Form
     private volatile bool _webContentLoaded;
     private AutoUpdater.UpdateProgressInfo? _latestUpdateProgress;
     private MiniPlayerForm? _miniPlayer;
+    private Icon? _trayCroppedIcon;
+    private bool _darkTitleBar = true;
 
     public MainForm() : this(null, null)
     {
@@ -112,8 +115,9 @@ public sealed class MainForm : Form
         Controls.Add(_webView);
 
         Load += OnFormLoad;
-        Resize += (_, _) => UpdateWebViewMemoryMode();
-        VisibleChanged += (_, _) => UpdateWebViewMemoryMode();
+        Activated += (_, _) => ApplyTitleBarDarkMode(_darkTitleBar);
+        Resize += (_, _) => { ApplyTitleBarDarkMode(_darkTitleBar); UpdateWebViewMemoryMode(); };
+        VisibleChanged += (_, _) => { if (Visible) ApplyTitleBarDarkMode(_darkTitleBar); UpdateWebViewMemoryMode(); };
         FormClosing += OnMainFormClosing;
         FormClosed += OnFormClosed;
     }
@@ -150,13 +154,70 @@ public sealed class MainForm : Form
     [DllImport("dwmapi.dll")]
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
+    [DllImport("user32.dll")]
+    private static extern bool DestroyIcon(IntPtr hIcon);
+
+    private static Icon? CreateCroppedTrayIcon()
+    {
+        try
+        {
+            using Icon? baseIco = LoadEmbeddedIcon(128) ?? LoadEmbeddedIcon(64);
+            if (baseIco is null) return null;
+            using Bitmap src = baseIco.ToBitmap();
+            int minX = src.Width, minY = src.Height, maxX = -1, maxY = -1;
+            for (int y = 0; y < src.Height; y++)
+            {
+                for (int x = 0; x < src.Width; x++)
+                {
+                    if (src.GetPixel(x, y).A > 20)
+                    {
+                        if (x < minX) minX = x;
+                        if (y < minY) minY = y;
+                        if (x > maxX) maxX = x;
+                        if (y > maxY) maxY = y;
+                    }
+                }
+            }
+            if (maxX <= minX || maxY <= minY) return null;
+            int side = Math.Max(maxX - minX + 1, maxY - minY + 1);
+            int cx = (minX + maxX) / 2;
+            int cy = (minY + maxY) / 2;
+            var crop = new Rectangle(
+                Math.Max(0, cx - side / 2),
+                Math.Max(0, cy - side / 2),
+                Math.Min(src.Width, side),
+                Math.Min(src.Height, side));
+
+            using var dest = new Bitmap(48, 48);
+            using (Graphics g = Graphics.FromImage(dest))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                g.DrawImage(src, new Rectangle(2, 2, 44, 44), crop, GraphicsUnit.Pixel);
+            }
+            IntPtr hIcon = dest.GetHicon();
+            using Icon temp = Icon.FromHandle(hIcon);
+            var cloned = (Icon)temp.Clone();
+            DestroyIcon(hIcon);
+            return cloned;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private void ApplyTitleBarDarkMode(bool dark)
     {
+        _darkTitleBar = dark;
         try
         {
             if (IsDisposed || !IsHandleCreated) return;
             int val = dark ? 1 : 0;
-            _ = DwmSetWindowAttribute(Handle, 20, ref val, sizeof(int));
+            if (DwmSetWindowAttribute(Handle, 20, ref val, sizeof(int)) != 0)
+            {
+                _ = DwmSetWindowAttribute(Handle, 19, ref val, sizeof(int));
+            }
         }
         catch
         {
@@ -751,6 +812,7 @@ public sealed class MainForm : Form
         string? miniArtist = null;
         string? miniThumb = null;
         bool miniPlaying = false;
+        bool miniMuted = false;
         double miniCur = 0;
         double miniDur = 0;
         bool themeDarkMode = true;
@@ -816,6 +878,11 @@ public sealed class MainForm : Form
                     (mpEl.ValueKind == JsonValueKind.True || mpEl.ValueKind == JsonValueKind.False))
                 {
                     miniPlaying = mpEl.GetBoolean();
+                }
+                if (payload.TryGetProperty("isMuted", out JsonElement mmEl) &&
+                    (mmEl.ValueKind == JsonValueKind.True || mmEl.ValueKind == JsonValueKind.False))
+                {
+                    miniMuted = mmEl.GetBoolean();
                 }
                 if (payload.TryGetProperty("cur", out JsonElement mcEl) && mcEl.ValueKind == JsonValueKind.Number)
                 {
@@ -1062,14 +1129,14 @@ public sealed class MainForm : Form
 
                     case "TOGGLE_MINI_PLAYER":
                     {
-                        bool nowVisible = ToggleOrUpdateMiniPlayer(true, downloadTitle, miniArtist, miniThumb, miniPlaying, miniCur, miniDur);
+                        bool nowVisible = ToggleOrUpdateMiniPlayer(true, downloadTitle, miniArtist, miniThumb, miniPlaying, miniMuted, miniCur, miniDur);
                         responseObj = new { success = true, visible = nowVisible };
                         break;
                     }
 
                     case "UPDATE_MINI_PLAYER":
                     {
-                        ToggleOrUpdateMiniPlayer(false, downloadTitle, miniArtist, miniThumb, miniPlaying, miniCur, miniDur);
+                        ToggleOrUpdateMiniPlayer(false, downloadTitle, miniArtist, miniThumb, miniPlaying, miniMuted, miniCur, miniDur);
                         responseObj = new { success = true };
                         break;
                     }
@@ -1105,6 +1172,7 @@ public sealed class MainForm : Form
         string? artist,
         string? thumbUrl,
         bool isPlaying,
+        bool isMuted,
         double curSec,
         double durSec)
     {
@@ -1119,6 +1187,8 @@ public sealed class MainForm : Form
                     onPrev: () => ExecuteMiniPlayerJs("if(typeof window.playPrevTrack==='function')window.playPrevTrack();"),
                     onTogglePlay: () => ExecuteMiniPlayerJs("if(typeof window.togglePlay==='function')window.togglePlay();"),
                     onNext: () => ExecuteMiniPlayerJs("if(typeof window.playNextTrack==='function')window.playNextTrack();"),
+                    onToggleMute: () => ExecuteMiniPlayerJs("if(typeof window.toggleMute==='function')window.toggleMute();"),
+                    onSeekFraction: frac => ExecuteMiniPlayerJs($"if(typeof window.seekPlaybackToFraction==='function')window.seekPlaybackToFraction({frac.ToString(System.Globalization.CultureInfo.InvariantCulture)});"),
                     onRestoreMain: () =>
                     {
                         Show();
@@ -1127,7 +1197,7 @@ public sealed class MainForm : Form
                     });
             }
 
-            _miniPlayer.UpdateState(title, artist, thumbUrl, isPlaying, curSec, durSec);
+            _miniPlayer.UpdateState(title, artist, thumbUrl, isPlaying, isMuted, curSec, durSec);
             if (toggleVisibility)
             {
                 if (_miniPlayer.Visible)
@@ -1462,10 +1532,11 @@ public sealed class MainForm : Form
     {
         try
         {
+            _trayCroppedIcon = CreateCroppedTrayIcon();
             _trayIcon = new NotifyIcon
             {
                 Text = $"Kurfamüzik v{_updater.CurrentVersion.ToString(3)}",
-                Icon = LoadEmbeddedIcon(48) ?? _embeddedIcon ?? SystemIcons.Application,
+                Icon = _trayCroppedIcon ?? LoadEmbeddedIcon(48) ?? _embeddedIcon ?? SystemIcons.Application,
                 Visible = true
             };
 

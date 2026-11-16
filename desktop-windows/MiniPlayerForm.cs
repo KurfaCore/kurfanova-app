@@ -13,31 +13,45 @@ public sealed class MiniPlayerForm : Form
     private readonly Action _onPrev;
     private readonly Action _onTogglePlay;
     private readonly Action _onNext;
+    private readonly Action _onToggleMute;
+    private readonly Action<double> _onSeekFraction;
     private readonly Action _onRestoreMain;
 
     private string _title = "Kurfamüzik";
     private string _artist = "Bir parça seçin";
     private bool _isPlaying;
+    private bool _isMuted;
     private double _curSec;
     private double _durSec;
     private string? _lastThumbUrl;
     private Bitmap? _coverBitmap;
 
     private readonly Rectangle _coverRect = new(14, 14, 68, 68);
-    private readonly Rectangle _closeRect = new(296, 10, 22, 22);
-    private readonly Rectangle _prevRect = new(102, 54, 28, 28);
-    private readonly Rectangle _playRect = new(138, 52, 32, 32);
-    private readonly Rectangle _nextRect = new(178, 54, 28, 28);
+    private readonly Rectangle _closeRect = new(298, 10, 22, 22);
+    private readonly Rectangle _prevRect = new(98, 53, 28, 28);
+    private readonly Rectangle _playRect = new(132, 51, 32, 32);
+    private readonly Rectangle _nextRect = new(170, 53, 28, 28);
+    private readonly Rectangle _muteRect = new(204, 53, 28, 28);
+    private readonly Rectangle _trackHitRect = new(14, 86, 304, 16);
 
     private Point _dragStart;
-    private bool _dragging;
-    private int _hoverBtn; // 1=prev, 2=play, 3=next, 4=close
+    private bool _draggingWindow;
+    private bool _scrubbingSeek;
+    private int _hoverBtn; // 1=prev, 2=play, 3=next, 4=close, 5=mute, 6=seek
 
-    public MiniPlayerForm(Action onPrev, Action onTogglePlay, Action onNext, Action onRestoreMain)
+    public MiniPlayerForm(
+        Action onPrev,
+        Action onTogglePlay,
+        Action onNext,
+        Action onToggleMute,
+        Action<double> onSeekFraction,
+        Action onRestoreMain)
     {
         _onPrev = onPrev;
         _onTogglePlay = onTogglePlay;
         _onNext = onNext;
+        _onToggleMute = onToggleMute;
+        _onSeekFraction = onSeekFraction;
         _onRestoreMain = onRestoreMain;
 
         FormBorderStyle = FormBorderStyle.None;
@@ -45,7 +59,7 @@ public sealed class MiniPlayerForm : Form
         ShowInTaskbar = false;
         TopMost = true;
         DoubleBuffered = true;
-        Size = new Size(332, 102);
+        Size = new Size(332, 104);
         BackColor = Color.FromArgb(20, 23, 32);
 
         Rectangle wa = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1280, 720);
@@ -54,8 +68,16 @@ public sealed class MiniPlayerForm : Form
 
         MouseDown += OnCardMouseDown;
         MouseMove += OnCardMouseMove;
-        MouseUp += (_, _) => _dragging = false;
-        MouseLeave += (_, _) => { if (_hoverBtn != 0) { _hoverBtn = 0; Cursor = Cursors.Default; Invalidate(); } };
+        MouseUp += OnCardMouseUp;
+        MouseLeave += (_, _) =>
+        {
+            if (!_scrubbingSeek && _hoverBtn != 0)
+            {
+                _hoverBtn = 0;
+                Cursor = Cursors.Default;
+                Invalidate();
+            }
+        };
         DoubleClick += (_, e) =>
         {
             if (_coverRect.Contains(((MouseEventArgs)e).Location)) _onRestoreMain();
@@ -65,18 +87,35 @@ public sealed class MiniPlayerForm : Form
     private void OnCardMouseDown(object? sender, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
+        if (_trackHitRect.Contains(e.Location) && _durSec > 0)
+        {
+            _scrubbingSeek = true;
+            double frac = Math.Clamp((e.X - _trackHitRect.X) / (double)_trackHitRect.Width, 0.0, 1.0);
+            _curSec = frac * _durSec;
+            Invalidate();
+            return;
+        }
         if (_closeRect.Contains(e.Location)) { Hide(); return; }
         if (_prevRect.Contains(e.Location)) { _onPrev(); return; }
         if (_playRect.Contains(e.Location)) { _onTogglePlay(); return; }
         if (_nextRect.Contains(e.Location)) { _onNext(); return; }
+        if (_muteRect.Contains(e.Location)) { _onToggleMute(); return; }
 
-        _dragging = true;
+        _draggingWindow = true;
         _dragStart = e.Location;
     }
 
     private void OnCardMouseMove(object? sender, MouseEventArgs e)
     {
-        if (_dragging)
+        if (_scrubbingSeek && _durSec > 0)
+        {
+            double frac = Math.Clamp((e.X - _trackHitRect.X) / (double)_trackHitRect.Width, 0.0, 1.0);
+            _curSec = frac * _durSec;
+            Invalidate();
+            return;
+        }
+
+        if (_draggingWindow)
         {
             Point screenPos = PointToScreen(e.Location);
             Location = new Point(screenPos.X - _dragStart.X, screenPos.Y - _dragStart.Y);
@@ -87,6 +126,8 @@ public sealed class MiniPlayerForm : Form
             : _playRect.Contains(e.Location) ? 2
             : _nextRect.Contains(e.Location) ? 3
             : _closeRect.Contains(e.Location) ? 4
+            : _muteRect.Contains(e.Location) ? 5
+            : _trackHitRect.Contains(e.Location) ? 6
             : 0;
         if (nextHover != _hoverBtn)
         {
@@ -94,6 +135,18 @@ public sealed class MiniPlayerForm : Form
             Cursor = nextHover != 0 ? Cursors.Hand : Cursors.Default;
             Invalidate();
         }
+    }
+
+    private void OnCardMouseUp(object? sender, MouseEventArgs e)
+    {
+        if (_scrubbingSeek)
+        {
+            _scrubbingSeek = false;
+            double frac = Math.Clamp((e.X - _trackHitRect.X) / (double)_trackHitRect.Width, 0.0, 1.0);
+            _onSeekFraction(frac);
+            Invalidate();
+        }
+        _draggingWindow = false;
     }
 
     private void ApplyRoundedRegion()
@@ -152,7 +205,7 @@ public sealed class MiniPlayerForm : Form
             g.DrawPath(cBorder, coverPath);
         }
 
-        // Title & artist
+        // Title, artist, and time readout
         using (var titleFont = new Font("Segoe UI", 9.75f, FontStyle.Bold))
         using (var artistFont = new Font("Segoe UI", 8.25f, FontStyle.Regular))
         using (var timeFont = new Font("Consolas", 7.75f, FontStyle.Regular))
@@ -160,13 +213,13 @@ public sealed class MiniPlayerForm : Form
         using (var mutedBrush = new SolidBrush(Color.FromArgb(164, 174, 194)))
         {
             var fmt = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
-            g.DrawString(_title, titleFont, whiteBrush, new RectangleF(94, 14, 194, 20), fmt);
-            g.DrawString(_artist, artistFont, mutedBrush, new RectangleF(94, 34, 194, 16), fmt);
+            g.DrawString(_title, titleFont, whiteBrush, new RectangleF(94, 14, 196, 20), fmt);
+            g.DrawString(_artist, artistFont, mutedBrush, new RectangleF(94, 34, 196, 16), fmt);
 
             if (_durSec > 0)
             {
                 string tStr = $"{FormatSec(_curSec)} / {FormatSec(_durSec)}";
-                g.DrawString(tStr, timeFont, mutedBrush, new RectangleF(216, 61, 102, 16), new StringFormat { Alignment = StringAlignment.Far });
+                g.DrawString(tStr, timeFont, mutedBrush, new RectangleF(232, 60, 86, 16), new StringFormat { Alignment = StringAlignment.Far });
             }
         }
 
@@ -182,10 +235,9 @@ public sealed class MiniPlayerForm : Form
             g.DrawLine(xPen, _closeRect.Right - 7, _closeRect.Y + 7, _closeRect.X + 7, _closeRect.Bottom - 7);
         }
 
-        // Vector Prev button
+        // Vector Prev / Play / Next / Mute buttons
         DrawSkipButton(g, _prevRect, isNext: false, hovered: _hoverBtn == 1);
 
-        // Circular Pink Play/Pause button
         Color playFill = _hoverBtn == 2 ? Color.FromArgb(255, 72, 118) : Color.FromArgb(255, 46, 99);
         using (var pb = new SolidBrush(playFill))
         {
@@ -210,12 +262,14 @@ public sealed class MiniPlayerForm : Form
             }
         }
 
-        // Vector Next button
         DrawSkipButton(g, _nextRect, isNext: true, hovered: _hoverBtn == 3);
+        DrawMuteButton(g, _muteRect, _isMuted, hovered: _hoverBtn == 5);
 
-        // Bottom rounded progress track + fill
-        var trackRect = new Rectangle(14, Height - 9, Width - 28, 3);
-        using (var trackPath = CreateRoundedPath(trackRect, 1))
+        // Bottom interactive rounded progress bar (grows slightly on hover/scrub)
+        int barH = (_hoverBtn == 6 || _scrubbingSeek) ? 5 : 3;
+        int barY = Height - 9 - (barH - 3) / 2;
+        var trackRect = new Rectangle(14, barY, Width - 28, barH);
+        using (var trackPath = CreateRoundedPath(trackRect, barH / 2))
         using (var trackBrush = new SolidBrush(Color.FromArgb(46, 52, 68)))
         {
             g.FillPath(trackBrush, trackPath);
@@ -226,9 +280,16 @@ public sealed class MiniPlayerForm : Form
         if (fillW >= 3)
         {
             var fillRect = new Rectangle(trackRect.X, trackRect.Y, fillW, trackRect.Height);
-            using var fillPath = CreateRoundedPath(fillRect, 1);
+            using var fillPath = CreateRoundedPath(fillRect, barH / 2);
             using var fillBrush = new SolidBrush(Color.FromArgb(255, 46, 99));
             g.FillPath(fillBrush, fillPath);
+        }
+        if ((_hoverBtn == 6 || _scrubbingSeek) && _durSec > 0)
+        {
+            int knobX = trackRect.X + fillW;
+            int knobY = trackRect.Y + barH / 2;
+            using var kb = new SolidBrush(Color.White);
+            g.FillEllipse(kb, knobX - 5, knobY - 5, 10, 10);
         }
     }
 
@@ -256,6 +317,41 @@ public sealed class MiniPlayerForm : Form
         }
     }
 
+    private static void DrawMuteButton(Graphics g, Rectangle r, bool isMuted, bool hovered)
+    {
+        if (hovered)
+        {
+            using var hb = new SolidBrush(Color.FromArgb(35, 255, 255, 255));
+            g.FillEllipse(hb, r);
+        }
+        Color col = isMuted ? Color.FromArgb(255, 100, 130) : (hovered ? Color.White : Color.FromArgb(200, 210, 225));
+        int cx = r.X + r.Width / 2;
+        int cy = r.Y + r.Height / 2;
+        using var b = new SolidBrush(col);
+        PointF[] speaker =
+        [
+            new(cx - 6, cy - 3),
+            new(cx - 3, cy - 3),
+            new(cx + 1, cy - 6),
+            new(cx + 1, cy + 6),
+            new(cx - 3, cy + 3),
+            new(cx - 6, cy + 3)
+        ];
+        g.FillPolygon(b, speaker);
+
+        if (isMuted)
+        {
+            using var slashPen = new Pen(col, 1.8f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+            g.DrawLine(slashPen, cx + 3, cy - 3, cx + 7, cy + 3);
+            g.DrawLine(slashPen, cx + 7, cy - 3, cx + 3, cy + 3);
+        }
+        else
+        {
+            using var wavePen = new Pen(col, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
+            g.DrawArc(wavePen, cx, cy - 4, 6, 8, -50, 100);
+        }
+    }
+
     private static Rectangle GetCenterSquareCrop(int w, int h)
     {
         int side = Math.Min(w, h);
@@ -268,14 +364,15 @@ public sealed class MiniPlayerForm : Form
         return $"{s / 60}:{s % 60:D2}";
     }
 
-    public void UpdateState(string? title, string? artist, string? thumbUrl, bool isPlaying, double curSec, double durSec)
+    public void UpdateState(string? title, string? artist, string? thumbUrl, bool isPlaying, bool isMuted, double curSec, double durSec)
     {
         if (IsDisposed) return;
 
         if (!string.IsNullOrWhiteSpace(title)) _title = title;
         if (!string.IsNullOrWhiteSpace(artist)) _artist = artist;
         _isPlaying = isPlaying;
-        _curSec = curSec;
+        _isMuted = isMuted;
+        if (!_scrubbingSeek) _curSec = curSec;
         _durSec = durSec;
 
         if (!string.IsNullOrWhiteSpace(thumbUrl) &&
