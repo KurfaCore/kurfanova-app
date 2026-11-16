@@ -79,6 +79,7 @@ public sealed class MainForm : Form
     private int _updatePromptShown;
     private volatile bool _webContentLoaded;
     private AutoUpdater.UpdateProgressInfo? _latestUpdateProgress;
+    private MiniPlayerForm? _miniPlayer;
 
     public MainForm() : this(null, null)
     {
@@ -727,6 +728,11 @@ public sealed class MainForm : Form
         string? downloadFormat = null;
         string? downloadTitle = null;
         string? revealFilePath = null;
+        string? miniArtist = null;
+        string? miniThumb = null;
+        bool miniPlaying = false;
+        double miniCur = 0;
+        double miniDur = 0;
         bool? settingDesktopShortcut = null;
         bool? settingStartMenuShortcut = null;
         bool? settingRunOnStartup = null;
@@ -776,6 +782,27 @@ public sealed class MainForm : Form
                 if (payload.TryGetProperty("filePath", out JsonElement fpEl) && fpEl.ValueKind == JsonValueKind.String)
                 {
                     revealFilePath = fpEl.GetString();
+                }
+                if (payload.TryGetProperty("artist", out JsonElement maEl) && maEl.ValueKind == JsonValueKind.String)
+                {
+                    miniArtist = maEl.GetString();
+                }
+                if (payload.TryGetProperty("thumbnail", out JsonElement mtThumbEl) && mtThumbEl.ValueKind == JsonValueKind.String)
+                {
+                    miniThumb = mtThumbEl.GetString();
+                }
+                if (payload.TryGetProperty("isPlaying", out JsonElement mpEl) &&
+                    (mpEl.ValueKind == JsonValueKind.True || mpEl.ValueKind == JsonValueKind.False))
+                {
+                    miniPlaying = mpEl.GetBoolean();
+                }
+                if (payload.TryGetProperty("cur", out JsonElement mcEl) && mcEl.ValueKind == JsonValueKind.Number)
+                {
+                    miniCur = mcEl.GetDouble();
+                }
+                if (payload.TryGetProperty("dur", out JsonElement mdEl) && mdEl.ValueKind == JsonValueKind.Number)
+                {
+                    miniDur = mdEl.GetDouble();
                 }
                 if (payload.TryGetProperty("desktopShortcut", out JsonElement dsEl) &&
                     (dsEl.ValueKind == JsonValueKind.True || dsEl.ValueKind == JsonValueKind.False))
@@ -1007,6 +1034,20 @@ public sealed class MainForm : Form
                         responseObj = new { success = true };
                         break;
 
+                    case "TOGGLE_MINI_PLAYER":
+                    {
+                        bool nowVisible = ToggleOrUpdateMiniPlayer(true, downloadTitle, miniArtist, miniThumb, miniPlaying, miniCur, miniDur);
+                        responseObj = new { success = true, visible = nowVisible };
+                        break;
+                    }
+
+                    case "UPDATE_MINI_PLAYER":
+                    {
+                        ToggleOrUpdateMiniPlayer(false, downloadTitle, miniArtist, miniThumb, miniPlaying, miniCur, miniDur);
+                        responseObj = new { success = true };
+                        break;
+                    }
+
                     default:
                         responseObj = new { success = false, error = "Unsupported action" };
                         break;
@@ -1023,6 +1064,79 @@ public sealed class MainForm : Form
 
             PostBridgeResponse(requestId, responseObj, targetOrigin);
         }, ct);
+    }
+
+    private bool ToggleOrUpdateMiniPlayer(
+        bool toggleVisibility,
+        string? title,
+        string? artist,
+        string? thumbUrl,
+        bool isPlaying,
+        double curSec,
+        double durSec)
+    {
+        if (IsDisposed || !IsHandleCreated) return false;
+        bool visible = false;
+        void RunOnUi()
+        {
+            if (IsDisposed) return;
+            if (_miniPlayer is null || _miniPlayer.IsDisposed)
+            {
+                _miniPlayer = new MiniPlayerForm(
+                    onPrev: () => ExecuteMiniPlayerJs("if(typeof window.playPrevTrack==='function')window.playPrevTrack();"),
+                    onTogglePlay: () => ExecuteMiniPlayerJs("if(typeof window.togglePlay==='function')window.togglePlay();"),
+                    onNext: () => ExecuteMiniPlayerJs("if(typeof window.playNextTrack==='function')window.playNextTrack();"),
+                    onRestoreMain: () =>
+                    {
+                        Show();
+                        WindowState = FormWindowState.Normal;
+                        Activate();
+                    });
+            }
+
+            _miniPlayer.UpdateState(title, artist, thumbUrl, isPlaying, curSec, durSec);
+            if (toggleVisibility)
+            {
+                if (_miniPlayer.Visible)
+                {
+                    _miniPlayer.Hide();
+                }
+                else
+                {
+                    _miniPlayer.Show();
+                }
+            }
+            visible = _miniPlayer.Visible;
+        }
+
+        if (InvokeRequired)
+        {
+            Invoke(RunOnUi);
+        }
+        else
+        {
+            RunOnUi();
+        }
+        return visible;
+    }
+
+    private void ExecuteMiniPlayerJs(string script)
+    {
+        if (IsDisposed || !IsHandleCreated) return;
+        BeginInvoke(async () =>
+        {
+            try
+            {
+                if (_webView.CoreWebView2 is not null)
+                {
+                    await _webView.CoreWebView2.ExecuteScriptAsync(script);
+                }
+            }
+            catch
+            {
+                // Ignore transient WebView errors
+            }
+        });
     }
 
     private void PostBridgeResponse(string requestId, object responseObj, string targetOrigin)
