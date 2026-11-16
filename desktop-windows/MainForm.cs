@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
@@ -93,7 +94,7 @@ public sealed class MainForm : Form
 
         Color darkBg = Color.FromArgb(11, 11, 20); // #0B0B14
 
-        Text = "Kurfamüzik — Reklamsız Masaüstü";
+        Text = "Kurfamüzik — Masaüstü";
         BackColor = darkBg;
         ForeColor = Color.White;
         Size = new Size(1280, 820);
@@ -131,13 +132,14 @@ public sealed class MainForm : Form
         catch { /* ignore if disposing */ }
     }
 
-    private static Icon? LoadEmbeddedIcon()
+    private static Icon? LoadEmbeddedIcon(int preferredSize = 0)
     {
         try
         {
             using Stream? stream = Assembly.GetExecutingAssembly()
                 .GetManifestResourceStream("KurfanovaMuzik.app.ico");
-            return stream is not null ? new Icon(stream) : null;
+            if (stream is null) return null;
+            return preferredSize > 0 ? new Icon(stream, preferredSize, preferredSize) : new Icon(stream);
         }
         catch
         {
@@ -145,10 +147,28 @@ public sealed class MainForm : Form
         }
     }
 
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+    private void ApplyTitleBarDarkMode(bool dark)
+    {
+        try
+        {
+            if (IsDisposed || !IsHandleCreated) return;
+            int val = dark ? 1 : 0;
+            _ = DwmSetWindowAttribute(Handle, 20, ref val, sizeof(int));
+        }
+        catch
+        {
+            // Ignore on older Windows versions
+        }
+    }
+
     private async void OnFormLoad(object? sender, EventArgs e)
     {
         try
         {
+            ApplyTitleBarDarkMode(true);
             _engine.Start();
             InitializeTrayIcon();
 
@@ -733,6 +753,7 @@ public sealed class MainForm : Form
         bool miniPlaying = false;
         double miniCur = 0;
         double miniDur = 0;
+        bool themeDarkMode = true;
         bool? settingDesktopShortcut = null;
         bool? settingStartMenuShortcut = null;
         bool? settingRunOnStartup = null;
@@ -803,6 +824,11 @@ public sealed class MainForm : Form
                 if (payload.TryGetProperty("dur", out JsonElement mdEl) && mdEl.ValueKind == JsonValueKind.Number)
                 {
                     miniDur = mdEl.GetDouble();
+                }
+                if (payload.TryGetProperty("dark", out JsonElement darkEl) &&
+                    (darkEl.ValueKind == JsonValueKind.True || darkEl.ValueKind == JsonValueKind.False))
+                {
+                    themeDarkMode = darkEl.GetBoolean();
                 }
                 if (payload.TryGetProperty("desktopShortcut", out JsonElement dsEl) &&
                     (dsEl.ValueKind == JsonValueKind.True || dsEl.ValueKind == JsonValueKind.False))
@@ -1044,6 +1070,13 @@ public sealed class MainForm : Form
                     case "UPDATE_MINI_PLAYER":
                     {
                         ToggleOrUpdateMiniPlayer(false, downloadTitle, miniArtist, miniThumb, miniPlaying, miniCur, miniDur);
+                        responseObj = new { success = true };
+                        break;
+                    }
+
+                    case "SET_THEME_MODE":
+                    {
+                        BeginInvoke(() => ApplyTitleBarDarkMode(themeDarkMode));
                         responseObj = new { success = true };
                         break;
                     }
@@ -1432,34 +1465,35 @@ public sealed class MainForm : Form
             _trayIcon = new NotifyIcon
             {
                 Text = $"Kurfamüzik v{_updater.CurrentVersion.ToString(3)}",
-                Icon = _embeddedIcon ?? SystemIcons.Application,
+                Icon = LoadEmbeddedIcon(48) ?? _embeddedIcon ?? SystemIcons.Application,
                 Visible = true
             };
 
-            Color textDark = Color.FromArgb(15, 23, 42);
-            Color textMuted = Color.FromArgb(100, 116, 139);
-            Color dangerRed = Color.FromArgb(225, 29, 72);
+            Color darkBg = Color.FromArgb(24, 24, 27);
+            Color textLight = Color.FromArgb(244, 244, 245);
+            Color textMuted = Color.FromArgb(161, 161, 170);
+            Color dangerRed = Color.FromArgb(251, 113, 133);
 
             var menu = new ContextMenuStrip
             {
                 ShowImageMargin = false,
                 ShowCheckMargin = false,
-                Font = new Font("Segoe UI", 9.25F, FontStyle.Regular),
-                BackColor = Color.FromArgb(252, 252, 254),
-                ForeColor = textDark,
-                Padding = new Padding(4, 6, 4, 6)
+                Font = new Font("Segoe UI", 9.5F, FontStyle.Regular),
+                BackColor = darkBg,
+                ForeColor = textLight,
+                Padding = new Padding(6, 6, 6, 6)
             };
-            menu.Renderer = new ToolStripProfessionalRenderer(new LightTrayColorTable());
+            menu.Renderer = new ToolStripProfessionalRenderer(new DarkTrayColorTable());
 
             var itemHeader = new ToolStripMenuItem($"Kurfamüzik v{_updater.CurrentVersion.ToString(3)}")
             {
                 Enabled = false,
                 ForeColor = textMuted,
-                Font = new Font("Segoe UI", 8.25F, FontStyle.Bold),
-                Padding = new Padding(10, 4, 14, 4)
+                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
+                Padding = new Padding(10, 5, 16, 5)
             };
 
-            var itemToggleWindow = new ToolStripMenuItem("Pencereyi Göster / Gizle", null, (_, _) =>
+            var itemToggleWindow = new ToolStripMenuItem("Pencereyi Aç", null, (_, _) =>
             {
                 if (Visible && WindowState != FormWindowState.Minimized)
                     HideToTray();
@@ -1467,12 +1501,12 @@ public sealed class MainForm : Form
                     RestoreWindow();
             })
             {
-                ForeColor = textDark,
-                Font = new Font("Segoe UI", 9.25F, FontStyle.Bold),
-                Padding = new Padding(10, 6, 14, 6)
+                ForeColor = textLight,
+                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                Padding = new Padding(10, 7, 16, 7)
             };
 
-            var itemCheckUpdate = new ToolStripMenuItem("Güncellemeleri Denetle", null, async (_, _) =>
+            var itemCheckUpdate = new ToolStripMenuItem("Güncelleme Denetle", null, async (_, _) =>
             {
                 _trayIcon.ShowBalloonTip(1500, "Kurfamüzik", "Güncellemeler denetleniyor...", ToolTipIcon.Info);
                 await _updater.CheckAndStageAsync(_shutdownCts.Token, force: true);
@@ -1482,52 +1516,8 @@ public sealed class MainForm : Form
                 }
             })
             {
-                ForeColor = textDark,
-                Padding = new Padding(10, 5, 14, 5)
-            };
-
-            var itemShortcut = new ToolStripMenuItem("Masaüstü Kısayolu Oluştur", null, (_, _) =>
-            {
-                lock (_config)
-                {
-                    _config.DesktopShortcut = true;
-                    AppPaths.SaveConfig(_paths, _config);
-                    InstallerService.ApplyShortcutsAndRegistry(_paths, _config, _updater.CurrentVersion);
-                }
-                _trayIcon.ShowBalloonTip(2000, "Kurfamüzik", "Masaüstü kısayolu oluşturuldu.", ToolTipIcon.Info);
-            })
-            {
-                ForeColor = textDark,
-                Padding = new Padding(10, 5, 14, 5)
-            };
-
-            var itemOpenDir = new ToolStripMenuItem("Kurulum Klasörünü Aç", null, (_, _) =>
-            {
-                try
-                {
-                    Process.Start(new ProcessStartInfo("explorer.exe", $"\"{_paths.InstallDir}\"") { UseShellExecute = true });
-                }
-                catch { }
-            })
-            {
-                ForeColor = textDark,
-                Padding = new Padding(10, 5, 14, 5)
-            };
-
-            var itemSetup = new ToolStripMenuItem("Kurulum Sihirbazı", null, (_, _) => LaunchSetup())
-            {
-                ForeColor = textDark,
-                Padding = new Padding(10, 5, 14, 5)
-            };
-
-            var itemUninstall = new ToolStripMenuItem("Uygulamayı Kaldır...", null, (_, _) =>
-            {
-                _allowExit = true;
-                BeginInvoke(() => InstallerService.RunUninstall(silent: false));
-            })
-            {
-                ForeColor = textMuted,
-                Padding = new Padding(10, 5, 14, 5)
+                ForeColor = textLight,
+                Padding = new Padding(10, 6, 16, 6)
             };
 
             var itemExit = new ToolStripMenuItem("Çıkış", null, (_, _) =>
@@ -1537,26 +1527,21 @@ public sealed class MainForm : Form
             })
             {
                 ForeColor = dangerRed,
-                Font = new Font("Segoe UI", 9.25F, FontStyle.Bold),
-                Padding = new Padding(10, 6, 14, 6)
+                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
+                Padding = new Padding(10, 7, 16, 7)
             };
 
             menu.Opening += (_, _) =>
             {
                 bool isVisible = Visible && WindowState != FormWindowState.Minimized;
-                itemToggleWindow.Text = isVisible ? "Arka Plana Küçült" : "Pencereyi Aç";
+                itemToggleWindow.Text = isVisible ? "Küçült" : "Pencereyi Aç";
             };
 
             menu.Items.Add(itemHeader);
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(itemToggleWindow);
-            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(itemCheckUpdate);
-            menu.Items.Add(itemShortcut);
-            menu.Items.Add(itemOpenDir);
-            menu.Items.Add(itemSetup);
             menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(itemUninstall);
             menu.Items.Add(itemExit);
 
             _trayIcon.ContextMenuStrip = menu;
@@ -1657,11 +1642,11 @@ public sealed class MainForm : Form
         _shutdownCts.Dispose();
     }
 
-    private sealed class LightTrayColorTable : ProfessionalColorTable
+    private sealed class DarkTrayColorTable : ProfessionalColorTable
     {
-        private readonly Color _bg = Color.FromArgb(252, 252, 254);
-        private readonly Color _selected = Color.FromArgb(241, 245, 249);
-        private readonly Color _border = Color.FromArgb(226, 232, 240);
+        private readonly Color _bg = Color.FromArgb(24, 24, 27);
+        private readonly Color _selected = Color.FromArgb(39, 39, 42);
+        private readonly Color _border = Color.FromArgb(46, 46, 52);
 
         public override Color ToolStripDropDownBackground => _bg;
         public override Color ImageMarginGradientBegin => _bg;
