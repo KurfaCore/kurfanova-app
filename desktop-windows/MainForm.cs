@@ -240,7 +240,7 @@ public sealed class MainForm : Form
             Directory.CreateDirectory(_paths.WebView2DataDir);
 
             var envOptions = new CoreWebView2EnvironmentOptions(
-                "--autoplay-policy=no-user-gesture-required --disk-cache-size=33554432 --media-cache-size=33554432 --disable-features=CalculateNativeWinOcclusion --enable-features=msLowPowerMode,msLowPowerModeAudioOnly"
+                "--autoplay-policy=no-user-gesture-required --disk-cache-size=33554432 --media-cache-size=33554432 --disable-features=CalculateNativeWinOcclusion"
             );
             CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, _paths.WebView2DataDir, envOptions);
             await _webView.EnsureCoreWebView2Async(env);
@@ -363,11 +363,12 @@ public sealed class MainForm : Form
                     try {
                       if (document.hidden) return;
                       const player = document.querySelector('.html5-video-player');
-                      if (player && player.classList.contains('ad-showing')) {
+                      const hasRealAdUi = Boolean(document.querySelector('.ytp-ad-player-overlay, .ytp-ad-text, .ytp-ad-preview-container, .ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern'));
+                      if (player && player.classList.contains('ad-showing') && hasRealAdUi) {
                         const v = player.querySelector('video');
                         if (v) {
                           v.muted = true;
-                          if (Number.isFinite(v.duration) && v.duration > 0 && v.currentTime < v.duration - 0.15) {
+                          if (Number.isFinite(v.duration) && v.duration > 0 && v.duration <= 90 && v.currentTime < v.duration - 0.15) {
                             v.currentTime = v.duration;
                           }
                         }
