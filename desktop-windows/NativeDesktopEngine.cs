@@ -24,6 +24,11 @@ public sealed partial class NativeDesktopEngine : IDisposable
         "https://kurfanova.kurfa.workers.dev"
     ];
     public const string NativeAudioPathPrefix = "/__kurfa_native_audio__/";
+    public const string LocalFilePathPrefix = "/__kurfa_local_file__/";
+
+    private readonly ConcurrentDictionary<string, string> _localFileRegistry = new(StringComparer.Ordinal);
+    private readonly object _localAudioLock = new();
+    private bool _localAudioLoadedFromDisk;
 
     private const long MaxIosUpstreamChunkBytes = 2_097_152; // 2 MB bounded chunk (reduces HTTP churn on IOS streams)
     private const long MaxGeneralUpstreamChunkBytes = 10_485_760; // 10 MB bounded chunk for ANDROID / ANDROID_VR / VISIONOS
@@ -236,6 +241,13 @@ public sealed partial class NativeDesktopEngine : IDisposable
             }
 
             string path = context.Request.Url?.AbsolutePath ?? string.Empty;
+            if (path.StartsWith(LocalFilePathPrefix, StringComparison.Ordinal))
+            {
+                string localId = path[LocalFilePathPrefix.Length..].Trim();
+                await ServeLocalAudioFileAsync(context, localId, isHead: method == "HEAD", ct).ConfigureAwait(false);
+                return;
+            }
+
             if (!path.StartsWith(NativeAudioPathPrefix, StringComparison.Ordinal))
             {
                 await WritePlainErrorAsync(context.Response, 404, "Not Found", ct).ConfigureAwait(false);
@@ -1927,6 +1939,225 @@ public sealed partial class NativeDesktopEngine : IDisposable
             if (!File.Exists(next)) return next;
         }
         return Path.Combine(directory, $"{name}_{DateTimeOffset.UtcNow.ToUnixTimeSeconds()}{ext}");
+    }
+
+    private static string GetLocalAudioStorePath()
+    {
+        string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KurfanovaMuzik");
+        Directory.CreateDirectory(dir);
+        return Path.Combine(dir, "local-audio.json");
+    }
+
+    private sealed class StoredLocalTrack
+    {
+        public string id { get; set; } = string.Empty;
+        public string path { get; set; } = string.Empty;
+        public string title { get; set; } = string.Empty;
+        public string artist { get; set; } = string.Empty;
+        public string duration { get; set; } = "3:30";
+        public string fileName { get; set; } = string.Empty;
+        public long fileSize { get; set; }
+    }
+
+    private List<StoredLocalTrack> LoadStoredLocalTracksUnlocked()
+    {
+        string storePath = GetLocalAudioStorePath();
+        if (!File.Exists(storePath)) return [];
+        try
+        {
+            string json = File.ReadAllText(storePath, Encoding.UTF8);
+            return JsonSerializer.Deserialize<List<StoredLocalTrack>>(json) ?? [];
+        }
+        catch
+        {
+            return [];
+        }
+    }
+
+    private void SaveStoredLocalTracksUnlocked(List<StoredLocalTrack> list)
+    {
+        try
+        {
+            string storePath = GetLocalAudioStorePath();
+            string json = JsonSerializer.Serialize(list);
+            File.WriteAllText(storePath, json, Encoding.UTF8);
+        }
+        catch { /* ignore */ }
+    }
+
+    private object ToTrackDto(StoredLocalTrack t) => new
+    {
+        id = t.id,
+        isLocal = true,
+        title = t.title,
+        artist = t.artist,
+        duration = t.duration,
+        fileName = t.fileName,
+        fileSize = t.fileSize,
+        streamUrl = $"http://127.0.0.1:{Port}{LocalFilePathPrefix}{t.id}",
+        thumbnail = "./kurfamuzik_logo.png"
+    };
+
+    public object[] GetRegisteredLocalAudioTracks()
+    {
+        lock (_localAudioLock)
+        {
+            var stored = LoadStoredLocalTracksUnlocked();
+            var valid = new List<StoredLocalTrack>(stored.Count);
+            bool changed = false;
+            foreach (var item in stored)
+            {
+                if (string.IsNullOrWhiteSpace(item.id) || string.IsNullOrWhiteSpace(item.path) || !File.Exists(item.path))
+                {
+                    changed = true;
+                    continue;
+                }
+                _localFileRegistry[item.id] = item.path;
+                valid.Add(item);
+            }
+            if (changed) SaveStoredLocalTracksUnlocked(valid);
+            _localAudioLoadedFromDisk = true;
+            return valid.Select(ToTrackDto).ToArray();
+        }
+    }
+
+    public object[] RegisterLocalAudioFiles(IEnumerable<string> filePaths)
+    {
+        lock (_localAudioLock)
+        {
+            var stored = LoadStoredLocalTracksUnlocked();
+            var existingPaths = new HashSet<string>(stored.Select(x => x.path), StringComparer.OrdinalIgnoreCase);
+            var newlyAdded = new List<StoredLocalTrack>();
+
+            foreach (string raw in filePaths)
+            {
+                if (string.IsNullOrWhiteSpace(raw) || !File.Exists(raw)) continue;
+                string fullPath = Path.GetFullPath(raw);
+                if (existingPaths.Contains(fullPath)) continue;
+                existingPaths.Add(fullPath);
+
+                string fileName = Path.GetFileName(fullPath);
+                string cleanName = Path.GetFileNameWithoutExtension(fullPath);
+                string[] parts = cleanName.Split([" - ", " – ", " — "], 2, StringSplitOptions.None);
+                string title = parts.Length == 2 ? parts[1].Trim() : cleanName;
+                string artist = parts.Length == 2 ? parts[0].Trim() : "Yerel Dosya";
+                long size = 0;
+                try { size = new FileInfo(fullPath).Length; } catch { /* ignore */ }
+
+                string id = "local_win_" + Guid.NewGuid().ToString("N")[..12];
+                var rec = new StoredLocalTrack
+                {
+                    id = id,
+                    path = fullPath,
+                    title = string.IsNullOrWhiteSpace(title) ? cleanName : title,
+                    artist = string.IsNullOrWhiteSpace(artist) ? "Yerel Dosya" : artist,
+                    duration = "3:30",
+                    fileName = fileName,
+                    fileSize = size
+                };
+                _localFileRegistry[id] = fullPath;
+                newlyAdded.Add(rec);
+            }
+
+            if (newlyAdded.Count > 0)
+            {
+                stored.InsertRange(0, newlyAdded);
+                SaveStoredLocalTracksUnlocked(stored);
+            }
+            _localAudioLoadedFromDisk = true;
+            return newlyAdded.Select(ToTrackDto).ToArray();
+        }
+    }
+
+    private async Task ServeLocalAudioFileAsync(HttpListenerContext context, string localId, bool isHead, CancellationToken ct)
+    {
+        ApplyCorsHeaders(context.Response, context.Request);
+        if (string.IsNullOrWhiteSpace(localId))
+        {
+            await WritePlainErrorAsync(context.Response, 400, "Invalid local ID", ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (!_localFileRegistry.TryGetValue(localId, out string? filePath) && !_localAudioLoadedFromDisk)
+        {
+            _ = GetRegisteredLocalAudioTracks();
+            _localFileRegistry.TryGetValue(localId, out filePath);
+        }
+
+        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+        {
+            await WritePlainErrorAsync(context.Response, 404, "Local file not found", ct).ConfigureAwait(false);
+            return;
+        }
+
+        string ext = Path.GetExtension(filePath).ToLowerInvariant();
+        string mime = ext switch
+        {
+            ".mp3" => "audio/mpeg",
+            ".m4a" or ".aac" => "audio/mp4",
+            ".wav" => "audio/wav",
+            ".flac" => "audio/flac",
+            ".ogg" => "audio/ogg",
+            ".opus" => "audio/opus",
+            ".webm" => "audio/webm",
+            _ => "application/octet-stream"
+        };
+
+        var fi = new FileInfo(filePath);
+        long totalLen = fi.Length;
+        string? rangeHeader = context.Request.Headers["Range"];
+        long start = 0;
+        long end = totalLen - 1;
+        bool isPartial = false;
+
+        if (!string.IsNullOrWhiteSpace(rangeHeader) && rangeHeader.StartsWith("bytes=", StringComparison.OrdinalIgnoreCase))
+        {
+            string[] parts = rangeHeader[6..].Split('-');
+            if (long.TryParse(parts[0], out long parsedStart) && parsedStart >= 0 && parsedStart < totalLen)
+            {
+                start = parsedStart;
+                if (parts.Length > 1 && long.TryParse(parts[1], out long parsedEnd) && parsedEnd >= start && parsedEnd < totalLen)
+                {
+                    end = parsedEnd;
+                }
+                isPartial = true;
+            }
+        }
+
+        long contentLen = Math.Max(0, end - start + 1);
+        HttpListenerResponse resp = context.Response;
+        resp.ContentType = mime;
+        resp.AddHeader("Accept-Ranges", "bytes");
+        resp.ContentLength64 = contentLen;
+        if (isPartial)
+        {
+            resp.StatusCode = 206;
+            resp.AddHeader("Content-Range", $"bytes {start}-{end}/{totalLen}");
+        }
+        else
+        {
+            resp.StatusCode = 200;
+        }
+
+        if (isHead || contentLen == 0)
+        {
+            resp.OutputStream.Close();
+            return;
+        }
+
+        using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite, 65536, useAsync: true);
+        fs.Seek(start, SeekOrigin.Begin);
+        byte[] buffer = new byte[65536];
+        long remaining = contentLen;
+        while (remaining > 0 && !ct.IsCancellationRequested)
+        {
+            int toRead = (int)Math.Min(buffer.Length, remaining);
+            int read = await fs.ReadAsync(buffer.AsMemory(0, toRead), ct).ConfigureAwait(false);
+            if (read <= 0) break;
+            await resp.OutputStream.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+            remaining -= read;
+        }
+        resp.OutputStream.Close();
     }
 
     private static void TryDeleteTempFile(string path)

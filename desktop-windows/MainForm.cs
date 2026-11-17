@@ -1153,6 +1153,48 @@ public sealed class MainForm : Form
                         break;
                     }
 
+                    case "GET_LOCAL_AUDIO_TRACKS":
+                    {
+                        object[] tracks = _engine.GetRegisteredLocalAudioTracks();
+                        responseObj = new { success = true, tracks };
+                        break;
+                    }
+
+                    case "PICK_LOCAL_AUDIO_FILES":
+                    {
+                        var tcs = new TaskCompletionSource<string[]>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        BeginInvoke(() =>
+                        {
+                            try
+                            {
+                                using var dlg = new OpenFileDialog
+                                {
+                                    Title = "Bilgisayardan Müzik Seç",
+                                    Filter = "Ses Dosyaları|*.mp3;*.m4a;*.wav;*.flac;*.ogg;*.aac;*.opus;*.webm|Tüm Dosyalar|*.*",
+                                    Multiselect = true,
+                                    CheckFileExists = true
+                                };
+                                if (dlg.ShowDialog(this) == DialogResult.OK && dlg.FileNames.Length > 0)
+                                {
+                                    tcs.TrySetResult(dlg.FileNames);
+                                }
+                                else
+                                {
+                                    tcs.TrySetResult([]);
+                                }
+                            }
+                            catch
+                            {
+                                tcs.TrySetResult([]);
+                            }
+                        });
+                        string[] picked = await tcs.Task.ConfigureAwait(false);
+                        object[] addedTracks = picked.Length > 0 ? _engine.RegisterLocalAudioFiles(picked) : [];
+                        object[] allTracks = _engine.GetRegisteredLocalAudioTracks();
+                        responseObj = new { success = true, addedCount = addedTracks.Length, tracks = allTracks };
+                        break;
+                    }
+
                     default:
                         responseObj = new { success = false, error = "Unsupported action" };
                         break;
