@@ -157,6 +157,9 @@ public sealed class MainForm : Form
     [DllImport("user32.dll")]
     private static extern bool DestroyIcon(IntPtr hIcon);
 
+    [DllImport("shell32.dll", SetLastError = true)]
+    private static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string appId);
+
     private static Icon? CreateCroppedTrayIcon()
     {
         try
@@ -169,7 +172,7 @@ public sealed class MainForm : Form
             {
                 for (int x = 0; x < src.Width; x++)
                 {
-                    if (src.GetPixel(x, y).A > 20)
+                    if (src.GetPixel(x, y).A > 85)
                     {
                         if (x < minX) minX = x;
                         if (y < minY) minY = y;
@@ -193,7 +196,7 @@ public sealed class MainForm : Form
             {
                 g.SmoothingMode = SmoothingMode.AntiAlias;
                 g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                g.DrawImage(src, new Rectangle(2, 2, 44, 44), crop, GraphicsUnit.Pixel);
+                g.DrawImage(src, new Rectangle(0, 0, 48, 48), crop, GraphicsUnit.Pixel);
             }
             IntPtr hIcon = dest.GetHicon();
             using Icon temp = Icon.FromHandle(hIcon);
@@ -229,6 +232,7 @@ public sealed class MainForm : Form
     {
         try
         {
+            _ = SetCurrentProcessExplicitAppUserModelID("KurfaCore.Kurfamuzik");
             ApplyTitleBarDarkMode(true);
             _engine.Start();
             InitializeTrayIcon();
@@ -1668,6 +1672,11 @@ public sealed class MainForm : Form
             }
         }
         catch { /* ignore tray hide races */ }
+    }
+
+    public void BringExistingWindowToFront()
+    {
+        RestoreWindow();
     }
 
     private void RestoreWindow()

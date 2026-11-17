@@ -159,6 +159,14 @@ public class KurfaPlaybackService extends Service {
             }
 
             @Override
+            public void onSeekTo(long posMs) {
+                long targetSec = Math.max(0L, posMs / 1000L);
+                currentPositionMs = targetSec * 1000L;
+                updateSessionAndNotification(isPlaying);
+                dispatchToJsArg("kurfaNativeSeekToSeconds", targetSec);
+            }
+
+            @Override
             public void onStop() {
                 if (isPlaying) dispatchToJs("kurfaNativeTogglePlay");
                 releaseLocks();
@@ -232,6 +240,7 @@ public class KurfaPlaybackService extends Service {
                             PlaybackState.ACTION_PLAY_PAUSE |
                             PlaybackState.ACTION_SKIP_TO_NEXT |
                             PlaybackState.ACTION_SKIP_TO_PREVIOUS |
+                            PlaybackState.ACTION_SEEK_TO |
                             PlaybackState.ACTION_STOP
                     )
                     .setState(
@@ -285,6 +294,7 @@ public class KurfaPlaybackService extends Service {
         PendingIntent prevPi = serviceActionPendingIntent(ACTION_PREV, 1, pFlags);
         PendingIntent togglePi = serviceActionPendingIntent(ACTION_TOGGLE, 2, pFlags);
         PendingIntent nextPi = serviceActionPendingIntent(ACTION_NEXT, 3, pFlags);
+        PendingIntent stopPi = serviceActionPendingIntent(ACTION_STOP, 4, pFlags);
 
         Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
                 ? new Notification.Builder(this, CHANNEL_ID)
@@ -313,6 +323,8 @@ public class KurfaPlaybackService extends Service {
                         isPlaying ? "Duraklat" : "Oynat", togglePi).build())
                 .addAction(new Notification.Action.Builder(
                         android.R.drawable.ic_media_next, "Sonraki", nextPi).build())
+                .addAction(new Notification.Action.Builder(
+                        android.R.drawable.ic_menu_close_clear_cancel, "Kapat", stopPi).build())
                 .setStyle(style);
 
         return builder.build();
@@ -360,6 +372,16 @@ public class KurfaPlaybackService extends Service {
         wv.post(() -> {
             try {
                 wv.evaluateJavascript("if(typeof " + fnName + "==='function'){" + fnName + "();}", null);
+            } catch (Throwable ignored) {}
+        });
+    }
+
+    private void dispatchToJsArg(String fnName, long arg) {
+        WebView wv = activeWebView.get();
+        if (wv == null) return;
+        wv.post(() -> {
+            try {
+                wv.evaluateJavascript("if(typeof " + fnName + "==='function'){" + fnName + "(" + arg + ");}", null);
             } catch (Throwable ignored) {}
         });
     }

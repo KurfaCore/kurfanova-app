@@ -1,7 +1,12 @@
+using System.IO.Pipes;
+
 namespace KurfanovaMuzik;
 
 internal static class Program
 {
+    private const string SingleInstanceMutexName = "Local\\KurfamuzikDesktopSingleInstanceMutex";
+    private const string ActivatePipeName = "KurfamuzikDesktopActivatePipe";
+
     [STAThread]
     private static void Main(string[] args)
     {
@@ -38,16 +43,24 @@ internal static class Program
                                         string.Equals(a, "--reinstall", StringComparison.OrdinalIgnoreCase));
         bool isFromInstallDir = AppPaths.IsProcessRunningFromInstallDir(Environment.ProcessPath, activePaths);
 
-        if (isPortable)
+        if (isPortable || (isFromInstallDir && !forceSetup))
         {
+            using var singleInstanceMutex = new Mutex(true, SingleInstanceMutexName, out bool isFirstInstance);
+            if (!isFirstInstance)
+            {
+                SignalExistingInstance();
+                return;
+            }
+
             var config = AppPaths.LoadOrDefaultConfig(activePaths, AppPaths.GetNormalizedCurrentVersion());
-            Application.Run(new MainForm(activePaths, config));
-        }
-        else if (isFromInstallDir && !forceSetup)
-        {
-            var config = AppPaths.LoadOrDefaultConfig(activePaths, AppPaths.GetNormalizedCurrentVersion());
-            InstallerService.SyncMetadataOnLaunch(activePaths, config, AppPaths.GetNormalizedCurrentVersion());
-            Application.Run(new MainForm(activePaths, config));
+            if (!isPortable)
+            {
+                InstallerService.SyncMetadataOnLaunch(activePaths, config, AppPaths.GetNormalizedCurrentVersion());
+            }
+
+            var mainForm = new MainForm(activePaths, config);
+            StartActivationPipeListener(mainForm);
+            Application.Run(mainForm);
         }
         else
         {
@@ -58,5 +71,50 @@ internal static class Program
                 // Installation completed and target EXE was launched
             }
         }
+    }
+
+    private static void SignalExistingInstance()
+    {
+        try
+        {
+            using var client = new NamedPipeClientStream(".", ActivatePipeName, PipeDirection.Out);
+            client.Connect(1200);
+            using var writer = new StreamWriter(client) { AutoFlush = true };
+            writer.WriteLine("ACTIVATE");
+        }
+        catch
+        {
+            // Existing instance might be closing or elevating
+        }
+    }
+
+    private static void StartActivationPipeListener(MainForm form)
+    {
+        var thread = new Thread(() =>
+        {
+            while (!form.IsDisposed)
+            {
+                try
+                {
+                    using var server = new NamedPipeServerStream(ActivatePipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                    server.WaitForConnection();
+                    using var reader = new StreamReader(server);
+                    string? msg = reader.ReadLine();
+                    if (string.Equals(msg, "ACTIVATE", StringComparison.OrdinalIgnoreCase) && !form.IsDisposed && form.IsHandleCreated)
+                    {
+                        form.BeginInvoke(form.BringExistingWindowToFront);
+                    }
+                }
+                catch
+                {
+                    Thread.Sleep(250);
+                }
+            }
+        })
+        {
+            IsBackground = true,
+            Name = "KurfamuzikActivatePipe"
+        };
+        thread.Start();
     }
 }

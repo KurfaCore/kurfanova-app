@@ -6,10 +6,13 @@ import android.app.Activity;
 import android.app.DownloadManager;
 import android.content.ActivityNotFoundException;
 import android.content.ContentResolver;
+import android.content.ContentUris;
 import android.content.ContentValues;
 import android.content.Intent;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
+import android.content.res.AssetFileDescriptor;
+import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Color;
 import android.media.MediaScannerConnection;
@@ -158,6 +161,9 @@ public class MainActivity extends Activity {
     private WebChromeClient.CustomViewCallback customViewCallback;
     private ValueCallback<Uri[]> fileUploadCallback;
     private PendingDownload pendingDownload;
+    private volatile String pendingAudioScanRequestId = null;
+    private static final int REQUEST_READ_AUDIO = 1002;
+    private static final String LOCAL_AUDIO_PATH_PREFIX = "/__kurfa_local_audio/";
     private String lastFailedUrl = TARGET_URL;
     private int originalSystemUiVisibility;
     private final ExecutorService nativeExecutor = Executors.newCachedThreadPool();
@@ -306,6 +312,23 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void scanLocalDeviceAudioAsync(String requestId) {
+            final String safeId = requestId == null ? "" : requestId.replaceAll("[^A-Za-z0-9_-]", "");
+            if (safeId.isEmpty()) return;
+
+            String perm = Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
+                    ? Manifest.permission.READ_MEDIA_AUDIO
+                    : Manifest.permission.READ_EXTERNAL_STORAGE;
+
+            if (checkSelfPermission(perm) != PackageManager.PERMISSION_GRANTED) {
+                pendingAudioScanRequestId = safeId;
+                runOnUiThread(() -> requestPermissions(new String[]{perm}, REQUEST_READ_AUDIO));
+                return;
+            }
+            executeLocalDeviceAudioScan(safeId);
+        }
+
+        @JavascriptInterface
         public void downloadMediaAsync(String videoId, String format, String title, String requestId) {
             final String safeId = requestId == null ? "" : requestId.replaceAll("[^A-Za-z0-9_-]", "");
             if (safeId.isEmpty()) return;
@@ -367,6 +390,141 @@ public class MainActivity extends Activity {
                 }
                 dispatchJsCallback("__kurfaNativeDownloadCallback", safeId, res.toString());
             });
+        }
+    }
+
+    private void executeLocalDeviceAudioScan(String safeId) {
+        nativeExecutor.execute(() -> {
+            JSONObject res = new JSONObject();
+            org.json.JSONArray tracks = new org.json.JSONArray();
+            try {
+                ContentResolver resolver = getContentResolver();
+                Uri uri = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI;
+                String[] projection = new String[]{
+                        MediaStore.Audio.Media._ID,
+                        MediaStore.Audio.Media.TITLE,
+                        MediaStore.Audio.Media.ARTIST,
+                        MediaStore.Audio.Media.ALBUM,
+                        MediaStore.Audio.Media.DURATION,
+                        MediaStore.Audio.Media.MIME_TYPE,
+                        MediaStore.Audio.Media.SIZE
+                };
+                String selection = MediaStore.Audio.Media.DURATION + " >= 5000 AND " + MediaStore.Audio.Media.SIZE + " > 16384";
+                try (Cursor cursor = resolver.query(uri, projection, selection, null, MediaStore.Audio.Media.DATE_ADDED + " DESC")) {
+                    if (cursor != null) {
+                        int idCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media._ID);
+                        int titleCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.TITLE);
+                        int artistCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ARTIST);
+                        int albumCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM);
+                        int durCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION);
+                        int mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE);
+                        while (cursor.moveToNext() && tracks.length() < 400) {
+                            long mediaId = cursor.getLong(idCol);
+                            String title = cursor.getString(titleCol);
+                            String artist = cursor.getString(artistCol);
+                            String album = cursor.getString(albumCol);
+                            long durMs = cursor.getLong(durCol);
+                            String mime = cursor.getString(mimeCol);
+                            if (TextUtils.isEmpty(title)) title = "Bilinmeyen Parça";
+                            if (TextUtils.isEmpty(artist) || "<unknown>".equalsIgnoreCase(artist)) artist = "Cihaz Müziği";
+                            long sec = Math.max(0L, durMs / 1000L);
+                            String durStr = String.format(Locale.US, "%d:%02d", sec / 60L, sec % 60L);
+
+                            JSONObject item = new JSONObject();
+                            item.put("id", "local_" + mediaId);
+                            item.put("mediaId", mediaId);
+                            item.put("isLocal", true);
+                            item.put("title", title);
+                            item.put("artist", artist);
+                            item.put("album", album != null ? album : "");
+                            item.put("duration", durStr);
+                            item.put("durationSec", sec);
+                            item.put("mimeType", !TextUtils.isEmpty(mime) ? mime : "audio/mpeg");
+                            item.put("streamUrl", "https://kurfanova.github.io" + LOCAL_AUDIO_PATH_PREFIX + mediaId);
+                            item.put("thumbnail", "./kurfamuzik_logo.png");
+                            tracks.put(item);
+                        }
+                    }
+                }
+                res.put("success", true);
+                res.put("tracks", tracks);
+            } catch (Throwable t) {
+                try {
+                    res.put("success", false);
+                    res.put("error", t.getMessage() != null ? t.getMessage() : "Cihaz müzikleri taranamadı");
+                    res.put("tracks", tracks);
+                } catch (Exception ignored) {}
+            }
+            dispatchJsCallback("__kurfaNativeLocalAudioCallback", safeId, res.toString());
+        });
+    }
+
+    private String extractLocalAudioMediaId(Uri uri) {
+        if (uri == null) return null;
+        String path = uri.getPath();
+        if (path == null || !path.startsWith(LOCAL_AUDIO_PATH_PREFIX)) return null;
+        String tail = path.substring(LOCAL_AUDIO_PATH_PREFIX.length()).replaceAll("[^0-9]", "");
+        return tail.isEmpty() ? null : tail;
+    }
+
+    private WebResourceResponse handleLocalDeviceAudioIntercept(String mediaIdStr, Map<String, String> headers) {
+        try {
+            long mediaId = Long.parseLong(mediaIdStr);
+            Uri contentUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, mediaId);
+            ContentResolver resolver = getContentResolver();
+            String mime = resolver.getType(contentUri);
+            if (TextUtils.isEmpty(mime)) mime = "audio/mpeg";
+
+            AssetFileDescriptor afd = resolver.openAssetFileDescriptor(contentUri, "r");
+            if (afd == null) {
+                return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", null, null);
+            }
+            long totalLen = afd.getLength();
+            long start = 0L;
+            long end = totalLen > 0 ? totalLen - 1L : -1L;
+            boolean isRange = false;
+
+            if (headers != null) {
+                String rangeHeader = headers.get("Range");
+                if (rangeHeader == null) rangeHeader = headers.get("range");
+                if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+                    isRange = true;
+                    String spec = rangeHeader.substring(6).trim();
+                    int dash = spec.indexOf('-');
+                    if (dash >= 0) {
+                        String sPart = spec.substring(0, dash).trim();
+                        String ePart = spec.substring(dash + 1).trim();
+                        if (!sPart.isEmpty()) start = Math.max(0L, Long.parseLong(sPart));
+                        if (!ePart.isEmpty() && totalLen > 0) end = Math.min(totalLen - 1L, Long.parseLong(ePart));
+                    }
+                }
+            }
+
+            java.io.InputStream is = afd.createInputStream();
+            if (start > 0) {
+                long skipped = 0;
+                while (skipped < start) {
+                    long s = is.skip(start - skipped);
+                    if (s <= 0) break;
+                    skipped += s;
+                }
+            }
+
+            Map<String, String> respHeaders = new HashMap<>();
+            respHeaders.put("Accept-Ranges", "bytes");
+            respHeaders.put("Access-Control-Allow-Origin", "*");
+            if (totalLen > 0) {
+                long contentLen = Math.max(0L, end - start + 1L);
+                respHeaders.put("Content-Length", String.valueOf(contentLen));
+                if (isRange) {
+                    respHeaders.put("Content-Range", "bytes " + start + "-" + end + "/" + totalLen);
+                }
+            }
+            int status = (isRange && totalLen > 0) ? 206 : 200;
+            String reason = status == 206 ? "Partial Content" : "OK";
+            return new WebResourceResponse(mime, null, status, reason, respHeaders, is);
+        } catch (Throwable t) {
+            return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", null, null);
         }
     }
 
@@ -1207,6 +1365,10 @@ public class MainActivity extends Activity {
         @Override
         public WebResourceResponse shouldInterceptRequest(WebView view, WebResourceRequest request) {
             if (request != null && request.getUrl() != null) {
+                String localMediaId = extractLocalAudioMediaId(request.getUrl());
+                if (localMediaId != null) {
+                    return handleLocalDeviceAudioIntercept(localMediaId, request.getRequestHeaders());
+                }
                 String nativeVid = KurfaNativeEngine.extractVideoIdFromNativeAudioUri(request.getUrl());
                 if (nativeVid != null) {
                     return KurfaNativeEngine.handleNativeAudioIntercept(
@@ -1273,6 +1435,24 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQUEST_READ_AUDIO) {
+            String scanId = pendingAudioScanRequestId;
+            pendingAudioScanRequestId = null;
+            if (scanId != null) {
+                if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                    executeLocalDeviceAudioScan(scanId);
+                } else {
+                    JSONObject denied = new JSONObject();
+                    try {
+                        denied.put("success", false);
+                        denied.put("permissionDenied", true);
+                        denied.put("tracks", new org.json.JSONArray());
+                    } catch (Exception ignored) {}
+                    dispatchJsCallback("__kurfaNativeLocalAudioCallback", scanId, denied.toString());
+                }
+            }
+            return;
+        }
         if (requestCode == REQUEST_WRITE_STORAGE && pendingDownload != null) {
             PendingDownload queued = pendingDownload;
             pendingDownload = null;
