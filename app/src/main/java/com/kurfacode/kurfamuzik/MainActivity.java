@@ -51,6 +51,8 @@ import androidx.webkit.WebViewCompat;
 import androidx.webkit.WebViewFeature;
 
 import org.json.JSONObject;
+import java.util.HashMap;
+import java.util.Map;
 
 import java.io.ByteArrayInputStream;
 import java.io.File;
