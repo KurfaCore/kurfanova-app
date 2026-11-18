@@ -1,4 +1,5 @@
 using System.IO.Pipes;
+using System.Runtime.InteropServices;
 
 namespace KurfanovaMuzik;
 
@@ -7,10 +8,27 @@ internal static class Program
     private const string SingleInstanceMutexName = "Local\\KurfamuzikDesktopSingleInstanceMutex";
     private const string ActivatePipeName = "KurfamuzikDesktopActivatePipe";
 
+    [DllImport("shell32.dll", SetLastError = true)]
+    private static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string appId);
+
     [STAThread]
     private static void Main(string[] args)
     {
-        // 0. Preview screenshot helper for visual verification
+        // Register AppUserModelID before creating any Win32 window (required for Windows 10 taskbar/tray/toast identity)
+        try { _ = SetCurrentProcessExplicitAppUserModelID("KurfaCore.Kurfamuzik"); } catch { }
+
+        // 0. Preview screenshot helpers for visual verification
+        int previewTrayIdx = Array.FindIndex(args, a => string.Equals(a, "--preview-tray", StringComparison.OrdinalIgnoreCase));
+        if (previewTrayIdx >= 0 && previewTrayIdx + 1 < args.Length)
+        {
+            ApplicationConfiguration.Initialize();
+            using var previewTray = new TrayMenuForm(
+                $"v{AppPaths.GetNormalizedCurrentVersion().ToString(3)}",
+                () => { }, () => { }, () => { });
+            previewTray.SavePreviewPng(args[previewTrayIdx + 1]);
+            return;
+        }
+
         int previewIdx = Array.FindIndex(args, a => string.Equals(a, "--preview-setup", StringComparison.OrdinalIgnoreCase));
         if (previewIdx >= 0 && previewIdx + 1 < args.Length)
         {
@@ -19,7 +37,7 @@ internal static class Program
                 Found: true,
                 PreviousInstallDir: AppPaths.DefaultInstallDir,
                 ExistingExePath: Path.Combine(AppPaths.DefaultInstallDir, "KurfanovaMuzik.exe"),
-                ExistingVersion: "1.1.2",
+                ExistingVersion: "1.1.16",
                 ExtraOldCopyPaths: [],
                 RunningOtherProcesses: 0);
             using var previewForm = new SetupForm(sampleExisting);

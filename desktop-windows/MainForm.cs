@@ -83,6 +83,7 @@ public sealed class MainForm : Form
     private AutoUpdater.UpdateProgressInfo? _latestUpdateProgress;
     private MiniPlayerForm? _miniPlayer;
     private Icon? _trayCroppedIcon;
+    private TrayMenuForm? _trayMenu;
     private bool _darkTitleBar = true;
 
     public MainForm() : this(null, null)
@@ -155,54 +156,21 @@ public sealed class MainForm : Form
     private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
 
     [DllImport("user32.dll")]
-    private static extern bool DestroyIcon(IntPtr hIcon);
+    private static extern int GetSystemMetrics(int nIndex);
 
     [DllImport("shell32.dll", SetLastError = true)]
     private static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string appId);
 
-    private static Icon? CreateCroppedTrayIcon()
+    private static Icon? LoadTrayIconForCurrentDpi()
     {
         try
         {
-            using Icon? baseIco = LoadEmbeddedIcon(128) ?? LoadEmbeddedIcon(64);
-            if (baseIco is null) return null;
-            using Bitmap src = baseIco.ToBitmap();
-            int minX = src.Width, minY = src.Height, maxX = -1, maxY = -1;
-            for (int y = 0; y < src.Height; y++)
-            {
-                for (int x = 0; x < src.Width; x++)
-                {
-                    if (src.GetPixel(x, y).A > 85)
-                    {
-                        if (x < minX) minX = x;
-                        if (y < minY) minY = y;
-                        if (x > maxX) maxX = x;
-                        if (y > maxY) maxY = y;
-                    }
-                }
-            }
-            if (maxX <= minX || maxY <= minY) return null;
-            int side = Math.Max(maxX - minX + 1, maxY - minY + 1);
-            int cx = (minX + maxX) / 2;
-            int cy = (minY + maxY) / 2;
-            var crop = new Rectangle(
-                Math.Max(0, cx - side / 2),
-                Math.Max(0, cy - side / 2),
-                Math.Min(src.Width, side),
-                Math.Min(src.Height, side));
-
-            using var dest = new Bitmap(48, 48);
-            using (Graphics g = Graphics.FromImage(dest))
-            {
-                g.SmoothingMode = SmoothingMode.AntiAlias;
-                g.InterpolationMode = InterpolationMode.HighQualityBicubic;
-                g.DrawImage(src, new Rectangle(0, 0, 48, 48), crop, GraphicsUnit.Pixel);
-            }
-            IntPtr hIcon = dest.GetHicon();
-            using Icon temp = Icon.FromHandle(hIcon);
-            var cloned = (Icon)temp.Clone();
-            DestroyIcon(hIcon);
-            return cloned;
+            int smCx = GetSystemMetrics(49); // SM_CXSMICON (DPI-aware small tray icon size)
+            int size = smCx >= 16 && smCx <= 64 ? smCx : 16;
+            using Stream? stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("KurfanovaMuzik.tray.ico")
+                ?? Assembly.GetExecutingAssembly().GetManifestResourceStream("KurfanovaMuzik.app.ico");
+            if (stream is null) return null;
+            return new Icon(stream, size, size);
         }
         catch
         {
@@ -217,9 +185,15 @@ public sealed class MainForm : Form
         {
             if (IsDisposed || !IsHandleCreated) return;
             int val = dark ? 1 : 0;
+            // Attribute 20 works on Win10 20H1+ & Win11; fallback 19 supports Win10 1809–1909
             if (DwmSetWindowAttribute(Handle, 20, ref val, sizeof(int)) != 0)
             {
                 _ = DwmSetWindowAttribute(Handle, 19, ref val, sizeof(int));
+            }
+            if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000))
+            {
+                int round = 2; // DWMWCP_ROUND
+                _ = DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int));
             }
         }
         catch
@@ -236,6 +210,22 @@ public sealed class MainForm : Form
             ApplyTitleBarDarkMode(true);
             _engine.Start();
             InitializeTrayIcon();
+
+            // Pre-check WebView2 Evergreen Runtime (critical on clean Windows 10 PCs)
+            try
+            {
+                string ver = CoreWebView2Environment.GetAvailableBrowserVersionString();
+                if (string.IsNullOrWhiteSpace(ver))
+                    throw new WebView2RuntimeNotFoundException();
+            }
+            catch (WebView2RuntimeNotFoundException)
+            {
+                throw;
+            }
+            catch
+            {
+                // Continue to CreateAsync if probe failed ambiguously
+            }
 
             Directory.CreateDirectory(_paths.WebView2DataDir);
 
@@ -293,7 +283,7 @@ public sealed class MainForm : Form
 
             if (choice == DialogResult.Yes)
             {
-                OpenExternalBrowser(new Uri("https://developer.microsoft.com/en-us/microsoft-edge/webview2/"));
+                OpenExternalBrowser(new Uri("https://go.microsoft.com/fwlink/p/?LinkId=2124703"));
             }
             Close();
         }
@@ -1579,90 +1569,48 @@ public sealed class MainForm : Form
     {
         try
         {
-            _trayCroppedIcon = CreateCroppedTrayIcon();
+            string verTag = _updater.CurrentVersion.ToString(3);
+            _trayCroppedIcon = LoadTrayIconForCurrentDpi();
             _trayIcon = new NotifyIcon
             {
-                Text = $"Kurfamüzik v{_updater.CurrentVersion.ToString(3)}",
-                Icon = _trayCroppedIcon ?? LoadEmbeddedIcon(48) ?? _embeddedIcon ?? SystemIcons.Application,
+                Text = $"Kurfamüzik v{verTag}",
+                Icon = _trayCroppedIcon ?? LoadEmbeddedIcon(32) ?? _embeddedIcon ?? SystemIcons.Application,
                 Visible = true
             };
 
-            Color darkBg = Color.FromArgb(24, 24, 27);
-            Color textLight = Color.FromArgb(244, 244, 245);
-            Color textMuted = Color.FromArgb(161, 161, 170);
-            Color dangerRed = Color.FromArgb(251, 113, 133);
-
-            var menu = new ContextMenuStrip
-            {
-                ShowImageMargin = false,
-                ShowCheckMargin = false,
-                Font = new Font("Segoe UI", 9.5F, FontStyle.Regular),
-                BackColor = darkBg,
-                ForeColor = textLight,
-                Padding = new Padding(6, 6, 6, 6)
-            };
-            menu.Renderer = new ToolStripProfessionalRenderer(new DarkTrayColorTable());
-
-            var itemHeader = new ToolStripMenuItem($"Kurfamüzik v{_updater.CurrentVersion.ToString(3)}")
-            {
-                Enabled = false,
-                ForeColor = textMuted,
-                Font = new Font("Segoe UI", 8.5F, FontStyle.Bold),
-                Padding = new Padding(10, 5, 16, 5)
-            };
-
-            var itemToggleWindow = new ToolStripMenuItem("Pencereyi Aç", null, (_, _) =>
-            {
-                if (Visible && WindowState != FormWindowState.Minimized)
-                    HideToTray();
-                else
-                    RestoreWindow();
-            })
-            {
-                ForeColor = textLight,
-                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
-                Padding = new Padding(10, 7, 16, 7)
-            };
-
-            var itemCheckUpdate = new ToolStripMenuItem("Güncelleme Denetle", null, async (_, _) =>
-            {
-                _trayIcon.ShowBalloonTip(1500, "Kurfamüzik", "Güncellemeler denetleniyor...", ToolTipIcon.Info);
-                await _updater.CheckAndStageAsync(_shutdownCts.Token, force: true);
-                if (!_updater.HasStagedUpdate)
+            _trayMenu = new TrayMenuForm(
+                $"v{verTag}",
+                () =>
                 {
-                    _trayIcon.ShowBalloonTip(2000, "Kurfamüzik", "Uygulamanız güncel.", ToolTipIcon.Info);
+                    if (Visible && WindowState != FormWindowState.Minimized)
+                        HideToTray();
+                    else
+                        RestoreWindow();
+                },
+                async () =>
+                {
+                    _trayIcon?.ShowBalloonTip(1500, "Kurfamüzik", "Güncellemeler denetleniyor...", ToolTipIcon.Info);
+                    await _updater.CheckAndStageAsync(_shutdownCts.Token, force: true);
+                    if (!_updater.HasStagedUpdate)
+                    {
+                        _trayIcon?.ShowBalloonTip(2000, "Kurfamüzik", "Uygulamanız güncel.", ToolTipIcon.Info);
+                    }
+                },
+                () =>
+                {
+                    _allowExit = true;
+                    Close();
+                });
+
+            _trayIcon.MouseUp += (_, e) =>
+            {
+                if (e.Button == MouseButtons.Right && _trayMenu is not null && !_trayMenu.IsDisposed)
+                {
+                    bool isVisible = Visible && WindowState != FormWindowState.Minimized;
+                    _trayMenu.ShowAtCursor(isVisible);
                 }
-            })
-            {
-                ForeColor = textLight,
-                Padding = new Padding(10, 6, 16, 6)
             };
 
-            var itemExit = new ToolStripMenuItem("Çıkış", null, (_, _) =>
-            {
-                _allowExit = true;
-                Close();
-            })
-            {
-                ForeColor = dangerRed,
-                Font = new Font("Segoe UI", 9.5F, FontStyle.Bold),
-                Padding = new Padding(10, 7, 16, 7)
-            };
-
-            menu.Opening += (_, _) =>
-            {
-                bool isVisible = Visible && WindowState != FormWindowState.Minimized;
-                itemToggleWindow.Text = isVisible ? "Küçült" : "Pencereyi Aç";
-            };
-
-            menu.Items.Add(itemHeader);
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(itemToggleWindow);
-            menu.Items.Add(itemCheckUpdate);
-            menu.Items.Add(new ToolStripSeparator());
-            menu.Items.Add(itemExit);
-
-            _trayIcon.ContextMenuStrip = menu;
             _trayIcon.DoubleClick += (_, _) =>
             {
                 if (Visible && WindowState != FormWindowState.Minimized)
@@ -1757,32 +1705,14 @@ public sealed class MainForm : Form
         {
             _updater.TryApplyPendingUpdate(relaunch: _restartForUpdate);
         }
+        _trayMenu?.Dispose();
         _trayIcon?.Dispose();
+        _trayCroppedIcon?.Dispose();
+        _miniPlayer?.Dispose();
         _updater.Dispose();
         _engine.Dispose();
         _webView.Dispose();
         _embeddedIcon?.Dispose();
         _shutdownCts.Dispose();
-    }
-
-    private sealed class DarkTrayColorTable : ProfessionalColorTable
-    {
-        private readonly Color _bg = Color.FromArgb(24, 24, 27);
-        private readonly Color _selected = Color.FromArgb(39, 39, 42);
-        private readonly Color _border = Color.FromArgb(46, 46, 52);
-
-        public override Color ToolStripDropDownBackground => _bg;
-        public override Color ImageMarginGradientBegin => _bg;
-        public override Color ImageMarginGradientMiddle => _bg;
-        public override Color ImageMarginGradientEnd => _bg;
-        public override Color MenuBorder => _border;
-        public override Color MenuItemBorder => _selected;
-        public override Color MenuItemSelected => _selected;
-        public override Color MenuItemSelectedGradientBegin => _selected;
-        public override Color MenuItemSelectedGradientEnd => _selected;
-        public override Color MenuItemPressedGradientBegin => _selected;
-        public override Color MenuItemPressedGradientEnd => _selected;
-        public override Color SeparatorDark => _border;
-        public override Color SeparatorLight => _bg;
     }
 }

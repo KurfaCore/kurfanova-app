@@ -25,6 +25,7 @@ public sealed class MiniPlayerForm : Form
     private double _durSec;
     private string? _lastThumbUrl;
     private Bitmap? _coverBitmap;
+    private float _scale = 1f;
 
     private readonly Rectangle _coverRect = new(14, 14, 68, 68);
     private readonly Rectangle _closeRect = new(298, 10, 22, 22);
@@ -59,12 +60,12 @@ public sealed class MiniPlayerForm : Form
         ShowInTaskbar = false;
         TopMost = true;
         DoubleBuffered = true;
-        Size = new Size(332, 104);
         BackColor = Color.FromArgb(20, 23, 32);
 
-        Rectangle wa = Screen.PrimaryScreen?.WorkingArea ?? new Rectangle(0, 0, 1280, 720);
-        Location = new Point(wa.Right - Width - 20, wa.Bottom - Height - 20);
-        ApplyRoundedRegion();
+        UpdateScaleForDpi(DeviceDpi);
+        Rectangle wa = Screen.FromPoint(Cursor.Position).WorkingArea;
+        Location = new Point(wa.Right - Width - (int)Math.Round(20 * _scale), wa.Bottom - Height - (int)Math.Round(20 * _scale));
+        ApplyRoundedCorners();
 
         MouseDown += OnCardMouseDown;
         MouseMove += OnCardMouseMove;
@@ -80,26 +81,44 @@ public sealed class MiniPlayerForm : Form
         };
         DoubleClick += (_, e) =>
         {
-            if (_coverRect.Contains(((MouseEventArgs)e).Location)) _onRestoreMain();
+            if (_coverRect.Contains(ToLogical(((MouseEventArgs)e).Location))) _onRestoreMain();
         };
     }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        UpdateScaleForDpi(e.DeviceDpiNew);
+        ApplyRoundedCorners();
+        Invalidate();
+    }
+
+    private void UpdateScaleForDpi(int dpi)
+    {
+        _scale = Math.Clamp((dpi > 0 ? dpi : 96) / 96f, 1f, 2.5f);
+        Size = new Size((int)Math.Round(332 * _scale), (int)Math.Round(104 * _scale));
+    }
+
+    private Point ToLogical(Point physical) =>
+        new((int)Math.Round(physical.X / _scale), (int)Math.Round(physical.Y / _scale));
 
     private void OnCardMouseDown(object? sender, MouseEventArgs e)
     {
         if (e.Button != MouseButtons.Left) return;
-        if (_trackHitRect.Contains(e.Location) && _durSec > 0)
+        Point lp = ToLogical(e.Location);
+        if (_trackHitRect.Contains(lp) && _durSec > 0)
         {
             _scrubbingSeek = true;
-            double frac = Math.Clamp((e.X - _trackHitRect.X) / (double)_trackHitRect.Width, 0.0, 1.0);
+            double frac = Math.Clamp((lp.X - _trackHitRect.X) / (double)_trackHitRect.Width, 0.0, 1.0);
             _curSec = frac * _durSec;
             Invalidate();
             return;
         }
-        if (_closeRect.Contains(e.Location)) { Hide(); return; }
-        if (_prevRect.Contains(e.Location)) { _onPrev(); return; }
-        if (_playRect.Contains(e.Location)) { _onTogglePlay(); return; }
-        if (_nextRect.Contains(e.Location)) { _onNext(); return; }
-        if (_muteRect.Contains(e.Location)) { _onToggleMute(); return; }
+        if (_closeRect.Contains(lp)) { Hide(); return; }
+        if (_prevRect.Contains(lp)) { _onPrev(); return; }
+        if (_playRect.Contains(lp)) { _onTogglePlay(); return; }
+        if (_nextRect.Contains(lp)) { _onNext(); return; }
+        if (_muteRect.Contains(lp)) { _onToggleMute(); return; }
 
         _draggingWindow = true;
         _dragStart = e.Location;
@@ -107,9 +126,10 @@ public sealed class MiniPlayerForm : Form
 
     private void OnCardMouseMove(object? sender, MouseEventArgs e)
     {
+        Point lp = ToLogical(e.Location);
         if (_scrubbingSeek && _durSec > 0)
         {
-            double frac = Math.Clamp((e.X - _trackHitRect.X) / (double)_trackHitRect.Width, 0.0, 1.0);
+            double frac = Math.Clamp((lp.X - _trackHitRect.X) / (double)_trackHitRect.Width, 0.0, 1.0);
             _curSec = frac * _durSec;
             Invalidate();
             return;
@@ -122,12 +142,12 @@ public sealed class MiniPlayerForm : Form
             return;
         }
 
-        int nextHover = _prevRect.Contains(e.Location) ? 1
-            : _playRect.Contains(e.Location) ? 2
-            : _nextRect.Contains(e.Location) ? 3
-            : _closeRect.Contains(e.Location) ? 4
-            : _muteRect.Contains(e.Location) ? 5
-            : _trackHitRect.Contains(e.Location) ? 6
+        int nextHover = _prevRect.Contains(lp) ? 1
+            : _playRect.Contains(lp) ? 2
+            : _nextRect.Contains(lp) ? 3
+            : _closeRect.Contains(lp) ? 4
+            : _muteRect.Contains(lp) ? 5
+            : _trackHitRect.Contains(lp) ? 6
             : 0;
         if (nextHover != _hoverBtn)
         {
@@ -142,17 +162,35 @@ public sealed class MiniPlayerForm : Form
         if (_scrubbingSeek)
         {
             _scrubbingSeek = false;
-            double frac = Math.Clamp((e.X - _trackHitRect.X) / (double)_trackHitRect.Width, 0.0, 1.0);
+            Point lp = ToLogical(e.Location);
+            double frac = Math.Clamp((lp.X - _trackHitRect.X) / (double)_trackHitRect.Width, 0.0, 1.0);
             _onSeekFraction(frac);
             Invalidate();
         }
         _draggingWindow = false;
     }
 
-    private void ApplyRoundedRegion()
+    [System.Runtime.InteropServices.DllImport("dwmapi.dll")]
+    private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+
+    private void ApplyRoundedCorners()
     {
-        using var path = CreateRoundedPath(new Rectangle(0, 0, Width, Height), 16);
+        if (OperatingSystem.IsWindowsVersionAtLeast(10, 0, 22000) && IsHandleCreated)
+        {
+            int round = 2; // DWMWCP_ROUND
+            _ = DwmSetWindowAttribute(Handle, 33, ref round, sizeof(int));
+            Region = null;
+            return;
+        }
+        int r = (int)Math.Round(16 * _scale);
+        using var path = CreateRoundedPath(new Rectangle(0, 0, Width, Height), r);
         Region = new Region(path);
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        ApplyRoundedCorners();
     }
 
     private static GraphicsPath CreateRoundedPath(Rectangle bounds, int radius)
@@ -179,7 +217,11 @@ public sealed class MiniPlayerForm : Form
         {
             g.FillRectangle(bgBrush, ClientRectangle);
         }
-        using (var borderPath = CreateRoundedPath(new Rectangle(0, 0, Width - 1, Height - 1), 16))
+        if (_scale != 1f)
+        {
+            g.ScaleTransform(_scale, _scale);
+        }
+        using (var borderPath = CreateRoundedPath(new Rectangle(0, 0, 331, 103), 16))
         using (var borderPen = new Pen(Color.FromArgb(46, 255, 255, 255), 1f))
         {
             g.DrawPath(borderPen, borderPath);
@@ -267,8 +309,8 @@ public sealed class MiniPlayerForm : Form
 
         // Bottom interactive rounded progress bar (grows slightly on hover/scrub)
         int barH = (_hoverBtn == 6 || _scrubbingSeek) ? 5 : 3;
-        int barY = Height - 9 - (barH - 3) / 2;
-        var trackRect = new Rectangle(14, barY, Width - 28, barH);
+        int barY = 104 - 9 - (barH - 3) / 2;
+        var trackRect = new Rectangle(14, barY, 332 - 28, barH);
         using (var trackPath = CreateRoundedPath(trackRect, barH / 2))
         using (var trackBrush = new SolidBrush(Color.FromArgb(46, 52, 68)))
         {

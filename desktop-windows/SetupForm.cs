@@ -19,6 +19,7 @@ internal sealed class SetupForm : Form
     private readonly LightButton _btnInstall;
     private readonly Icon? _appIcon;
     private readonly Bitmap? _iconBitmap;
+    private readonly float _scale;
 
     private string _statusText;
     private int _progressPercent;
@@ -49,9 +50,11 @@ internal sealed class SetupForm : Form
 
         Text = "Kurfamüzik Kurulumu";
         FormBorderStyle = FormBorderStyle.FixedDialog;
+        AutoScaleMode = AutoScaleMode.None;
         MaximizeBox = false;
         MinimizeBox = true;
         StartPosition = FormStartPosition.CenterScreen;
+        _scale = Math.Clamp((DeviceDpi > 0 ? DeviceDpi : 96) / 96f, 1f, 2f);
         ClientSize = new Size(580, 520);
         BackColor = BgWindow;
         ForeColor = TextPrimary;
@@ -62,16 +65,8 @@ internal sealed class SetupForm : Form
         if (_appIcon is not null)
         {
             Icon = _appIcon;
-            try
-            {
-                using var ico48 = new Icon(_appIcon, new Size(48, 48));
-                _iconBitmap = ico48.ToBitmap();
-            }
-            catch
-            {
-                _iconBitmap = _appIcon.ToBitmap();
-            }
         }
+        _iconBitmap = LoadEmbeddedLogoBitmap();
 
         string initialTarget = !string.IsNullOrWhiteSpace(_existing.PreviousInstallDir)
             ? _existing.PreviousInstallDir!
@@ -169,6 +164,12 @@ internal sealed class SetupForm : Form
 
         AcceptButton = _btnInstall;
         CancelButton = _btnCancel;
+
+        if (_scale != 1f)
+        {
+            Scale(new SizeF(_scale, _scale));
+            ClientSize = new Size((int)Math.Round(580 * _scale), (int)Math.Round(520 * _scale));
+        }
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -177,8 +178,12 @@ internal sealed class SetupForm : Form
         Graphics g = e.Graphics;
         g.SmoothingMode = SmoothingMode.AntiAlias;
         g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+        if (_scale != 1f)
+        {
+            g.ScaleTransform(_scale, _scale);
+        }
 
-        int contentW = ClientSize.Width - MarginX * 2;
+        int contentW = 580 - MarginX * 2;
         string appVersion = AppPaths.GetNormalizedCurrentVersion().ToString(3);
 
         // 1. Header Card
@@ -470,6 +475,21 @@ internal sealed class SetupForm : Form
         {
             return null;
         }
+    }
+
+    private static Bitmap? LoadEmbeddedLogoBitmap()
+    {
+        try
+        {
+            using Stream? stream = Assembly.GetExecutingAssembly().GetManifestResourceStream("KurfanovaMuzik.tray-logo.png");
+            if (stream is not null)
+            {
+                using var tmp = new Bitmap(stream);
+                return new Bitmap(tmp);
+            }
+        }
+        catch { }
+        return null;
     }
 
     private interface IDrawablePreview
