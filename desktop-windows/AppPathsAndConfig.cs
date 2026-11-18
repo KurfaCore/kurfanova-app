@@ -16,6 +16,7 @@ public sealed class DesktopAppConfig
     public bool StartMenuShortcut { get; set; } = true;
     public bool RunOnStartup { get; set; } = false;
     public bool MinimizeToTray { get; set; } = true;
+    public string Language { get; set; } = "tr";
     public string InstalledVersion { get; set; } = "1.1.0";
     public DateTimeOffset UpdatedAt { get; set; } = DateTimeOffset.UtcNow;
     public DateTimeOffset? LastUpdateCheckUtc { get; set; }
@@ -23,6 +24,8 @@ public sealed class DesktopAppConfig
 
 public sealed class AppPaths
 {
+    private static readonly object UserDataLock = new();
+
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
         WriteIndented = true,
@@ -33,6 +36,7 @@ public sealed class AppPaths
     public string InstalledExePath => Path.Combine(InstallDir, "KurfanovaMuzik.exe");
     public string IconPath => Path.Combine(InstallDir, "kurfanova.ico");
     public string ConfigPath => Path.Combine(InstallDir, "config.json");
+    public string UserDataPath => Path.Combine(InstallDir, "user-data.json");
     public string DataDir => Path.Combine(InstallDir, "Data");
     public string WebView2DataDir => Path.Combine(DataDir, "WebView2");
     public string UpdatesDir => Path.Combine(InstallDir, "Updates");
@@ -134,6 +138,7 @@ public sealed class AppPaths
                     {
                         cfg.InstallDir = paths.InstallDir;
                     }
+                    cfg.Language = string.Equals(cfg.Language, "en", StringComparison.OrdinalIgnoreCase) ? "en" : "tr";
                     return cfg;
                 }
             }
@@ -149,6 +154,7 @@ public sealed class AppPaths
             DesktopShortcut = true,
             StartMenuShortcut = true,
             RunOnStartup = false,
+            Language = "tr",
             InstalledVersion = currentVersion.ToString(3),
             UpdatedAt = DateTimeOffset.UtcNow
         };
@@ -160,6 +166,7 @@ public sealed class AppPaths
         {
             Directory.CreateDirectory(paths.InstallDir);
             cfg.InstallDir = paths.InstallDir;
+            cfg.Language = string.Equals(cfg.Language, "en", StringComparison.OrdinalIgnoreCase) ? "en" : "tr";
             cfg.UpdatedAt = DateTimeOffset.UtcNow;
             string json = JsonSerializer.Serialize(cfg, JsonOptions);
             File.WriteAllText(paths.ConfigPath, json);
@@ -167,6 +174,50 @@ public sealed class AppPaths
         catch
         {
             // Ignore config write errors
+        }
+    }
+
+    public static string LoadUserDataJson(AppPaths paths)
+    {
+        lock (UserDataLock)
+        {
+            try
+            {
+                if (File.Exists(paths.UserDataPath))
+                {
+                    string json = File.ReadAllText(paths.UserDataPath, System.Text.Encoding.UTF8);
+                    if (!string.IsNullOrWhiteSpace(json))
+                    {
+                        return json;
+                    }
+                }
+            }
+            catch
+            {
+                // Fall back to empty JSON object on read/corruption failure
+            }
+
+            return "{}";
+        }
+    }
+
+    public static bool SaveUserDataJson(AppPaths paths, string rawJson)
+    {
+        lock (UserDataLock)
+        {
+            try
+            {
+                Directory.CreateDirectory(paths.InstallDir);
+                string payload = string.IsNullOrWhiteSpace(rawJson) ? "{}" : rawJson;
+                string tmpPath = paths.UserDataPath + ".tmp";
+                File.WriteAllText(tmpPath, payload, System.Text.Encoding.UTF8);
+                File.Move(tmpPath, paths.UserDataPath, overwrite: true);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
         }
     }
 

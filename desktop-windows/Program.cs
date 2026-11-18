@@ -18,6 +18,16 @@ internal static class Program
         try { _ = SetCurrentProcessExplicitAppUserModelID("KurfaCore.Kurfamuzik"); } catch { }
 
         // 0. Preview screenshot helpers for visual verification
+        int previewMiniIdx = Array.FindIndex(args, a => string.Equals(a, "--preview-miniplayer", StringComparison.OrdinalIgnoreCase));
+        if (previewMiniIdx >= 0 && previewMiniIdx + 1 < args.Length)
+        {
+            ApplicationConfiguration.Initialize();
+            using var previewMini = new MiniPlayerForm(
+                () => { }, () => { }, () => { }, () => { }, _ => { }, () => { });
+            previewMini.SavePreviewPng(args[previewMiniIdx + 1]);
+            return;
+        }
+
         int previewTrayIdx = Array.FindIndex(args, a => string.Equals(a, "--preview-tray", StringComparison.OrdinalIgnoreCase));
         if (previewTrayIdx >= 0 && previewTrayIdx + 1 < args.Length)
         {

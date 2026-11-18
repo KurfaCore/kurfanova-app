@@ -27,7 +27,8 @@ jobs:
       - name: Publish Single-File Windows Executable
         shell: pwsh
         run: |
-          $appVersion = "1.1.$($env:GITHUB_RUN_NUMBER)"
+          $patch = [Math]::Max(0, [int]$env:GITHUB_RUN_NUMBER - 21)
+          $appVersion = "1.2.$patch"
           Write-Host "Building Kurfanova Windows Desktop v$appVersion"
           dotnet publish desktop-windows/KurfanovaMuzik.csproj `
             -c Release `
@@ -44,7 +45,8 @@ jobs:
       - name: Verify Built Executable & Generate Update Manifest
         shell: pwsh
         run: |
-          $appVersion = "1.1.$($env:GITHUB_RUN_NUMBER)"
+          $patch = [Math]::Max(0, [int]$env:GITHUB_RUN_NUMBER - 21)
+          $appVersion = "1.2.$patch"
           $exe = Get-Item "dist-win/Kurfanova-Muzik-Windows.exe"
           $sha256 = (Get-FileHash $exe.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
           $manifest = @{

@@ -11,7 +11,7 @@
     <ApplicationIcon>app.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
-    <Version>1.1.17</Version>
+    <Version>1.2.0</Version>
     <Product>Kurfanova Müzik</Product>
     <Company>KurfaCore</Company>
     <Authors>KurfaCode</Authors>

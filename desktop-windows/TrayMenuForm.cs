@@ -31,6 +31,7 @@ internal sealed class TrayMenuForm : Form
     private readonly Bitmap? _logoBitmap;
 
     private bool _windowVisible;
+    private string _lang = "tr";
     private int _hoverIndex = -1; // 0: toggle, 1: update, 2: exit
     private float _scale = 1f;
     private Rectangle[] _itemRects = new Rectangle[3];
@@ -125,6 +126,17 @@ internal sealed class TrayMenuForm : Form
             Show();
         }
         Activate();
+    }
+
+    public void SetLanguage(string? lang)
+    {
+        string normalized = string.Equals(lang, "en", StringComparison.OrdinalIgnoreCase) ? "en" : "tr";
+        if (_lang == normalized) return;
+        _lang = normalized;
+        if (Visible && IsHandleCreated && !IsDisposed)
+        {
+            RenderLayered();
+        }
     }
 
     public void SavePreviewPng(string outputPath)
@@ -339,11 +351,16 @@ internal sealed class TrayMenuForm : Form
             g.DrawLine(sepPen, cardRect.X + S(10), sep1Y, cardRect.Right - S(10), sep1Y);
         }
 
-        // Item 0: Pencereyi Aç / Küçült
-        DrawMenuItem(g, 0, _itemRects[0], _windowVisible ? "Küçült" : "Pencereyi Aç", false, IconKind.Window);
+        bool isEn = string.Equals(_lang, "en", StringComparison.OrdinalIgnoreCase);
 
-        // Item 1: Güncelleme Denetle
-        DrawMenuItem(g, 1, _itemRects[1], "Güncelleme Denetle", false, IconKind.Update);
+        // Item 0: Pencereyi Gizle / Pencereyi Aç (Hide Window / Open Window)
+        string toggleLabel = isEn
+            ? (_windowVisible ? "Hide Window" : "Open Window")
+            : (_windowVisible ? "Pencereyi Gizle" : "Pencereyi Aç");
+        DrawMenuItem(g, 0, _itemRects[0], toggleLabel, false, IconKind.Window);
+
+        // Item 1: Güncelleme Denetle / Check Updates
+        DrawMenuItem(g, 1, _itemRects[1], isEn ? "Check Updates" : "Güncelleme Denetle", false, IconKind.Update);
 
         // Second separator
         int sep2Y = _itemRects[1].Bottom + S(4);
@@ -352,8 +369,8 @@ internal sealed class TrayMenuForm : Form
             g.DrawLine(sepPen2, cardRect.X + S(10), sep2Y, cardRect.Right - S(10), sep2Y);
         }
 
-        // Item 2: Çıkış
-        DrawMenuItem(g, 2, _itemRects[2], "Çıkış", true, IconKind.Exit);
+        // Item 2: Çıkış / Exit
+        DrawMenuItem(g, 2, _itemRects[2], isEn ? "Exit" : "Çıkış", true, IconKind.Exit);
 
         return bmp;
     }

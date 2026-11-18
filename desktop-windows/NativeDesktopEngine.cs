@@ -1,9 +1,11 @@
 using System.Buffers;
+using System.Buffers.Binary;
 using System.Collections.Concurrent;
 using System.Globalization;
 using System.Net;
 using System.Net.Http.Headers;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -1972,7 +1974,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
         public string path { get; set; } = string.Empty;
         public string title { get; set; } = string.Empty;
         public string artist { get; set; } = string.Empty;
-        public string duration { get; set; } = "3:30";
+        public string duration { get; set; } = "0:00";
         public string fileName { get; set; } = string.Empty;
         public long fileSize { get; set; }
     }
@@ -2016,6 +2018,454 @@ public sealed partial class NativeDesktopEngine : IDisposable
         thumbnail = "./kurfamuzik_logo.png"
     };
 
+    public static (string Title, string Artist) CleanLocalAudioMetadata(string fileNameWithoutExt)
+    {
+        if (string.IsNullOrWhiteSpace(fileNameWithoutExt))
+        {
+            return ("Bilinmeyen Parça", "Yerel Dosya");
+        }
+
+        string s = fileNameWithoutExt.Trim();
+
+        // Strip trailing yt-dlp YouTube IDs such as (_-_9gKhZ5XTmA_), (_JsHbUjOsrCE_), (_62VJm0UGfv8_), ([A-Za-z0-9_-]{11})
+        for (int i = 0; i < 3; i++)
+        {
+            string next = Regex.Replace(
+                s,
+                @"\s*[\(\[]\s*[_-]{0,4}[A-Za-z0-9_-]{10,14}[_-]{0,4}\s*[\)\]]\s*$",
+                string.Empty,
+                RegexOptions.CultureInvariant);
+            if (next.Length == s.Length) break;
+            s = next.Trim();
+        }
+
+        // Replace underscores with spaces and clean common yt-dlp quality/video suffixes
+        s = s.Replace('_', ' ');
+        s = Regex.Replace(
+            s,
+            @"\s*[\(\[]\s*(?:HIGH QUALITY AUDIO|Official\s+Music\s+Video|Official\s+Video|Official\s+Audio|Video\s+Klip|Lyric\s+Video|Lyrics|Visualizer|Audio|4K|HD)\s*[\)\]]",
+            string.Empty,
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        s = Regex.Replace(
+            s,
+            @"(?:\s*[\|\-–—]\s*|\s+)(?:HIGH QUALITY AUDIO|Official\s+Music\s+Video|Official\s+Video|Official\s+Audio|Video\s+Klip|Lyric\s+Video|Visualizer)\b.*$",
+            string.Empty,
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+        s = Regex.Replace(s, @"\s{2,}", " ", RegexOptions.CultureInvariant).Trim(' ', '-', '_', '–', '—', '|');
+
+        string[] parts = s.Split([" - ", " – ", " — "], 2, StringSplitOptions.None);
+        static string CleanPart(string p) =>
+            Regex.Replace(p, @"\s{2,}", " ", RegexOptions.CultureInvariant)
+                 .Trim(' ', '-', '_', '–', '—', '|');
+
+        string artist;
+        string title;
+        if (parts.Length == 2)
+        {
+            artist = CleanPart(parts[0]);
+            title = CleanPart(parts[1]);
+        }
+        else
+        {
+            title = CleanPart(s);
+            artist = "Yerel Dosya";
+        }
+
+        if (string.IsNullOrWhiteSpace(title))
+        {
+            title = CleanPart(fileNameWithoutExt.Replace('_', ' '));
+            if (string.IsNullOrWhiteSpace(title)) title = "Bilinmeyen Parça";
+        }
+        if (string.IsNullOrWhiteSpace(artist))
+        {
+            artist = "Yerel Dosya";
+        }
+
+        return (title, artist);
+    }
+
+    public static string ReadLocalAudioDurationFormatted(string filePath)
+    {
+        if (string.IsNullOrWhiteSpace(filePath) || !File.Exists(filePath))
+        {
+            return "0:00";
+        }
+
+        double seconds = 0;
+        try
+        {
+            string ext = Path.GetExtension(filePath).ToLowerInvariant();
+            using var fs = new FileStream(filePath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            seconds = ext switch
+            {
+                ".wav" => TryReadWavDurationSeconds(fs),
+                ".flac" => TryReadFlacDurationSeconds(fs),
+                ".mp3" => TryReadMp3DurationSeconds(fs),
+                ".m4a" or ".mp4" or ".aac" => TryReadMp4DurationSeconds(fs),
+                _ => 0
+            };
+        }
+        catch
+        {
+            seconds = 0;
+        }
+
+        if (seconds <= 0.1 || double.IsNaN(seconds) || double.IsInfinity(seconds))
+        {
+            seconds = TryReadShellComDurationSeconds(filePath);
+        }
+
+        if (seconds <= 0.1 || double.IsNaN(seconds) || double.IsInfinity(seconds))
+        {
+            return "0:00";
+        }
+
+        long totalSec = (long)Math.Round(seconds);
+        return $"{totalSec / 60}:{totalSec % 60:D2}";
+    }
+
+    private static double TryReadWavDurationSeconds(FileStream fs)
+    {
+        if (fs.Length < 44) return 0;
+        Span<byte> header = stackalloc byte[12];
+        if (fs.Read(header) != 12) return 0;
+        if (header[0] != 'R' || header[1] != 'I' || header[2] != 'F' || header[3] != 'F') return 0;
+        if (header[8] != 'W' || header[9] != 'A' || header[10] != 'V' || header[11] != 'E') return 0;
+
+        uint byteRate = 0;
+        Span<byte> chunkHdr = stackalloc byte[8];
+        Span<byte> fmtBuf = stackalloc byte[16];
+        while (fs.Position + 8 <= fs.Length)
+        {
+            if (fs.Read(chunkHdr) != 8) break;
+            uint chunkSize = BinaryPrimitives.ReadUInt32LittleEndian(chunkHdr[4..8]);
+            long dataStart = fs.Position;
+
+            if (chunkHdr[0] == 'f' && chunkHdr[1] == 'm' && chunkHdr[2] == 't' && chunkHdr[3] == ' ' && chunkSize >= 16)
+            {
+                if (fs.Read(fmtBuf) == 16)
+                {
+                    byteRate = BinaryPrimitives.ReadUInt32LittleEndian(fmtBuf[8..12]);
+                }
+            }
+            else if (chunkHdr[0] == 'd' && chunkHdr[1] == 'a' && chunkHdr[2] == 't' && chunkHdr[3] == 'a' && byteRate > 0)
+            {
+                return chunkSize / (double)byteRate;
+            }
+
+            long nextPos = dataStart + chunkSize + (chunkSize & 1);
+            if (nextPos <= dataStart || nextPos > fs.Length) break;
+            fs.Position = nextPos;
+        }
+        return 0;
+    }
+
+    private static double TryReadFlacDurationSeconds(FileStream fs)
+    {
+        if (fs.Length < 42) return 0;
+        Span<byte> magic = stackalloc byte[4];
+        if (fs.Read(magic) != 4) return 0;
+        if (magic[0] != 'f' || magic[1] != 'L' || magic[2] != 'a' || magic[3] != 'C') return 0;
+
+        Span<byte> blkHdr = stackalloc byte[4];
+        Span<byte> streamInfo = stackalloc byte[34];
+        while (fs.Position + 4 <= fs.Length)
+        {
+            if (fs.Read(blkHdr) != 4) break;
+            bool isLast = (blkHdr[0] & 0x80) != 0;
+            int blkType = blkHdr[0] & 0x7F;
+            int blkLen = (blkHdr[1] << 16) | (blkHdr[2] << 8) | blkHdr[3];
+            if (blkType == 0 && blkLen >= 18)
+            {
+                if (fs.Read(streamInfo[..18]) != 18) return 0;
+                int sampleRate = (streamInfo[10] << 12) | (streamInfo[11] << 4) | (streamInfo[12] >> 4);
+                long totalSamples = ((long)(streamInfo[13] & 0x0F) << 32)
+                                  | ((long)streamInfo[14] << 24)
+                                  | ((long)streamInfo[15] << 16)
+                                  | ((long)streamInfo[16] << 8)
+                                  | streamInfo[17];
+                if (sampleRate > 0 && totalSamples > 0)
+                {
+                    return totalSamples / (double)sampleRate;
+                }
+                return 0;
+            }
+            if (isLast || fs.Position + blkLen > fs.Length) break;
+            fs.Position += blkLen;
+        }
+        return 0;
+    }
+
+    private static double TryReadMp4DurationSeconds(FileStream fs)
+    {
+        return ScanMp4BoxesForMvhd(fs, fs.Length);
+    }
+
+    private static double ScanMp4BoxesForMvhd(FileStream fs, long endPos)
+    {
+        Span<byte> hdr = stackalloc byte[8];
+        Span<byte> extSize = stackalloc byte[8];
+        Span<byte> mvhd = stackalloc byte[32];
+
+        while (fs.Position + 8 <= endPos)
+        {
+            long boxStart = fs.Position;
+            if (fs.Read(hdr) != 8) break;
+            uint size32 = BinaryPrimitives.ReadUInt32BigEndian(hdr[..4]);
+            int headerLen = 8;
+            long boxSize = size32;
+            if (size32 == 1)
+            {
+                if (fs.Read(extSize) != 8) break;
+                boxSize = (long)BinaryPrimitives.ReadUInt64BigEndian(extSize);
+                headerLen = 16;
+            }
+            else if (size32 == 0)
+            {
+                boxSize = endPos - boxStart;
+            }
+
+            if (boxSize < headerLen) break;
+            long boxEnd = Math.Min(endPos, boxStart + boxSize);
+
+            if (hdr[4] == 'm' && hdr[5] == 'o' && hdr[6] == 'o' && hdr[7] == 'v')
+            {
+                double inner = ScanMp4BoxesForMvhd(fs, boxEnd);
+                if (inner > 0) return inner;
+            }
+            else if (hdr[4] == 'm' && hdr[5] == 'v' && hdr[6] == 'h' && hdr[7] == 'd')
+            {
+                int toRead = (int)Math.Min(32, boxEnd - fs.Position);
+                if (toRead >= 20 && fs.Read(mvhd[..toRead]) == toRead)
+                {
+                    byte ver = mvhd[0];
+                    if (ver == 0 && toRead >= 20)
+                    {
+                        uint timescale = BinaryPrimitives.ReadUInt32BigEndian(mvhd[12..16]);
+                        uint duration = BinaryPrimitives.ReadUInt32BigEndian(mvhd[16..20]);
+                        if (timescale > 0 && duration > 0) return duration / (double)timescale;
+                    }
+                    else if (ver == 1 && toRead >= 32)
+                    {
+                        uint timescale = BinaryPrimitives.ReadUInt32BigEndian(mvhd[20..24]);
+                        ulong duration = BinaryPrimitives.ReadUInt64BigEndian(mvhd[24..32]);
+                        if (timescale > 0 && duration > 0) return duration / (double)timescale;
+                    }
+                }
+            }
+
+            fs.Position = boxEnd;
+        }
+        return 0;
+    }
+
+    private static double TryReadMp3DurationSeconds(FileStream fs)
+    {
+        if (fs.Length < 16) return 0;
+        long offset = 0;
+        Span<byte> id3 = stackalloc byte[10];
+        if (fs.Read(id3) == 10 && id3[0] == 'I' && id3[1] == 'D' && id3[2] == '3')
+        {
+            int tagSize = ((id3[6] & 0x7F) << 21)
+                        | ((id3[7] & 0x7F) << 14)
+                        | ((id3[8] & 0x7F) << 7)
+                        | (id3[9] & 0x7F);
+            int footer = (id3[5] & 0x10) != 0 ? 10 : 0;
+            offset = Math.Min(fs.Length, 10L + tagSize + footer);
+        }
+
+        fs.Position = offset;
+        int scanLen = (int)Math.Min(131072, fs.Length - offset);
+        if (scanLen < 4) return 0;
+
+        byte[] buf = ArrayPool<byte>.Shared.Rent(scanLen);
+        try
+        {
+            int read = fs.Read(buf, 0, scanLen);
+            for (int i = 0; i <= read - 4; i++)
+            {
+                if (buf[i] != 0xFF || (buf[i + 1] & 0xE0) != 0xE0) continue;
+                if (!TryParseMpegFrameHeader(buf, i, out int samplesPerFrame, out int sampleRate, out int bitrateBps, out int frameLen, out int sideInfoSize))
+                {
+                    continue;
+                }
+
+                // Check Xing / Info VBR header inside first frame
+                int xingPos = i + 4 + sideInfoSize;
+                if (xingPos + 12 <= read)
+                {
+                    bool isXing = (buf[xingPos] == 'X' && buf[xingPos + 1] == 'i' && buf[xingPos + 2] == 'n' && buf[xingPos + 3] == 'g')
+                               || (buf[xingPos] == 'I' && buf[xingPos + 1] == 'n' && buf[xingPos + 2] == 'f' && buf[xingPos + 3] == 'o');
+                    if (isXing)
+                    {
+                        uint flags = BinaryPrimitives.ReadUInt32BigEndian(buf.AsSpan(xingPos + 4, 4));
+                        if ((flags & 0x01) != 0)
+                        {
+                            uint frames = BinaryPrimitives.ReadUInt32BigEndian(buf.AsSpan(xingPos + 8, 4));
+                            if (frames > 0) return frames * (double)samplesPerFrame / sampleRate;
+                        }
+                    }
+                }
+
+                // Check VBRI header
+                int vbriPos = i + 4 + 32;
+                if (vbriPos + 18 <= read &&
+                    buf[vbriPos] == 'V' && buf[vbriPos + 1] == 'B' && buf[vbriPos + 2] == 'R' && buf[vbriPos + 3] == 'I')
+                {
+                    uint frames = BinaryPrimitives.ReadUInt32BigEndian(buf.AsSpan(vbriPos + 14, 4));
+                    if (frames > 0) return frames * (double)samplesPerFrame / sampleRate;
+                }
+
+                // Verify second consecutive MPEG frame sync to avoid false sync matches
+                int nextFrameIdx = i + frameLen;
+                if (nextFrameIdx + 4 <= read &&
+                    buf[nextFrameIdx] == 0xFF &&
+                    (buf[nextFrameIdx + 1] & 0xE0) == 0xE0 &&
+                    TryParseMpegFrameHeader(buf, nextFrameIdx, out _, out _, out _, out _, out _))
+                {
+                    long audioBytes = Math.Max(0, fs.Length - (offset + i));
+                    return audioBytes * 8.0 / bitrateBps;
+                }
+            }
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(buf);
+        }
+        return 0;
+    }
+
+    private static bool TryParseMpegFrameHeader(
+        byte[] buf,
+        int idx,
+        out int samplesPerFrame,
+        out int sampleRate,
+        out int bitrateBps,
+        out int frameLength,
+        out int sideInfoSize)
+    {
+        samplesPerFrame = 0;
+        sampleRate = 0;
+        bitrateBps = 0;
+        frameLength = 0;
+        sideInfoSize = 0;
+
+        byte b1 = buf[idx + 1];
+        byte b2 = buf[idx + 2];
+        byte b3 = buf[idx + 3];
+
+        int versionBits = (b1 >> 3) & 0x03; // 0=2.5, 1=reserved, 2=2, 3=1
+        int layerBits = (b1 >> 1) & 0x03;   // 0=reserved, 1=L3, 2=L2, 3=L1
+        int bitrateIdx = (b2 >> 4) & 0x0F;
+        int srIdx = (b2 >> 2) & 0x03;
+        int padding = (b2 >> 1) & 0x01;
+        int channelMode = (b3 >> 6) & 0x03;
+
+        if (versionBits == 1 || layerBits == 0 || bitrateIdx == 0 || bitrateIdx == 15 || srIdx == 3)
+        {
+            return false;
+        }
+
+        int[] srBase = [44100, 48000, 32000];
+        sampleRate = versionBits switch
+        {
+            3 => srBase[srIdx],
+            2 => srBase[srIdx] / 2,
+            _ => srBase[srIdx] / 4
+        };
+
+        int kbps;
+        if (versionBits == 3) // MPEG 1
+        {
+            kbps = layerBits switch
+            {
+                3 => new[] { 0, 32, 64, 96, 128, 160, 192, 224, 256, 288, 320, 352, 384, 416, 448 }[bitrateIdx],
+                2 => new[] { 0, 32, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320, 384 }[bitrateIdx],
+                _ => new[] { 0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 224, 256, 320 }[bitrateIdx]
+            };
+            samplesPerFrame = layerBits == 3 ? 384 : 1152;
+            sideInfoSize = channelMode == 3 ? 17 : 32;
+        }
+        else // MPEG 2 / 2.5
+        {
+            kbps = layerBits == 3
+                ? new[] { 0, 32, 48, 56, 64, 80, 96, 112, 128, 144, 160, 176, 192, 224, 256 }[bitrateIdx]
+                : new[] { 0, 8, 16, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128, 144, 160 }[bitrateIdx];
+            samplesPerFrame = layerBits == 3 ? 384 : (layerBits == 2 ? 1152 : 576);
+            sideInfoSize = channelMode == 3 ? 9 : 17;
+        }
+
+        if (kbps <= 0 || sampleRate <= 0) return false;
+        bitrateBps = kbps * 1000;
+
+        frameLength = layerBits == 3
+            ? (12 * bitrateBps / sampleRate + padding) * 4
+            : (samplesPerFrame / 8) * bitrateBps / sampleRate + padding;
+
+        return frameLength >= 24;
+    }
+
+    private static double TryReadShellComDurationSeconds(string filePath)
+    {
+        double result = 0;
+        var thread = new Thread(() =>
+        {
+            object? shell = null;
+            object? folder = null;
+            object? item = null;
+            try
+            {
+                Type? shellType = Type.GetTypeFromProgID("Shell.Application");
+                if (shellType is null) return;
+                shell = Activator.CreateInstance(shellType);
+                if (shell is null) return;
+
+                string? dir = Path.GetDirectoryName(filePath);
+                string fileName = Path.GetFileName(filePath);
+                if (string.IsNullOrWhiteSpace(dir) || string.IsNullOrWhiteSpace(fileName)) return;
+
+                dynamic dynShell = shell;
+                folder = dynShell.NameSpace(dir);
+                if (folder is null) return;
+
+                dynamic dynFolder = folder;
+                item = dynFolder.ParseName(fileName);
+                if (item is null) return;
+
+                string? rawDuration = dynFolder.GetDetailsOf(item, 27) as string;
+                if (string.IsNullOrWhiteSpace(rawDuration)) return;
+
+                string trimmed = rawDuration.Trim();
+                if (TimeSpan.TryParseExact(
+                        trimmed,
+                        [@"hh\:mm\:ss", @"h\:mm\:ss", @"mm\:ss", @"m\:ss"],
+                        CultureInfo.InvariantCulture,
+                        out TimeSpan ts) ||
+                    TimeSpan.TryParse(trimmed, CultureInfo.InvariantCulture, out ts))
+                {
+                    result = ts.TotalSeconds;
+                }
+            }
+            catch
+            {
+                result = 0;
+            }
+            finally
+            {
+                if (item is not null && Marshal.IsComObject(item)) try { Marshal.FinalReleaseComObject(item); } catch { }
+                if (folder is not null && Marshal.IsComObject(folder)) try { Marshal.FinalReleaseComObject(folder); } catch { }
+                if (shell is not null && Marshal.IsComObject(shell)) try { Marshal.FinalReleaseComObject(shell); } catch { }
+            }
+        })
+        {
+            IsBackground = true
+        };
+        thread.SetApartmentState(ApartmentState.STA);
+        thread.Start();
+        thread.Join(2500);
+        return result;
+    }
+
     public object[] GetRegisteredLocalAudioTracks()
     {
         lock (_localAudioLock)
@@ -2030,6 +2480,33 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     changed = true;
                     continue;
                 }
+
+                // Migrate legacy hardcoded "3:30" durations or raw yt-dlp filenames
+                if (string.IsNullOrWhiteSpace(item.duration) || item.duration == "3:30" || item.duration == "0:00")
+                {
+                    string realDur = ReadLocalAudioDurationFormatted(item.path);
+                    if (realDur != item.duration)
+                    {
+                        item.duration = realDur;
+                        changed = true;
+                    }
+                }
+
+                bool looksRaw = item.title.Contains('_') ||
+                                item.artist.Contains('_') ||
+                                item.title.Contains("HIGH QUALITY AUDIO", StringComparison.OrdinalIgnoreCase) ||
+                                Regex.IsMatch(item.title, @"\([_-]{0,4}[A-Za-z0-9_-]{10,14}[_-]{0,4}\)\s*$", RegexOptions.CultureInvariant);
+                if (looksRaw)
+                {
+                    (string cleanTitle, string cleanArtist) = CleanLocalAudioMetadata(Path.GetFileNameWithoutExtension(item.path));
+                    if (item.title != cleanTitle || item.artist != cleanArtist)
+                    {
+                        item.title = cleanTitle;
+                        item.artist = cleanArtist;
+                        changed = true;
+                    }
+                }
+
                 _localFileRegistry[item.id] = item.path;
                 valid.Add(item);
             }
@@ -2055,10 +2532,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 existingPaths.Add(fullPath);
 
                 string fileName = Path.GetFileName(fullPath);
-                string cleanName = Path.GetFileNameWithoutExtension(fullPath);
-                string[] parts = cleanName.Split([" - ", " – ", " — "], 2, StringSplitOptions.None);
-                string title = parts.Length == 2 ? parts[1].Trim() : cleanName;
-                string artist = parts.Length == 2 ? parts[0].Trim() : "Yerel Dosya";
+                (string title, string artist) = CleanLocalAudioMetadata(Path.GetFileNameWithoutExtension(fullPath));
+                string duration = ReadLocalAudioDurationFormatted(fullPath);
                 long size = 0;
                 try { size = new FileInfo(fullPath).Length; } catch { /* ignore */ }
 
@@ -2067,9 +2542,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 {
                     id = id,
                     path = fullPath,
-                    title = string.IsNullOrWhiteSpace(title) ? cleanName : title,
-                    artist = string.IsNullOrWhiteSpace(artist) ? "Yerel Dosya" : artist,
-                    duration = "3:30",
+                    title = title,
+                    artist = artist,
+                    duration = duration,
                     fileName = fileName,
                     fileSize = size
                 };

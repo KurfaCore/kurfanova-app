@@ -430,13 +430,25 @@ public class MainActivity extends Activity {
                         int mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE);
                         while (cursor.moveToNext() && tracks.length() < 400) {
                             long mediaId = cursor.getLong(idCol);
-                            String title = cursor.getString(titleCol);
-                            String artist = cursor.getString(artistCol);
+                            String rawTitle = cursor.getString(titleCol);
+                            String rawArtist = cursor.getString(artistCol);
                             String album = cursor.getString(albumCol);
                             long durMs = cursor.getLong(durCol);
                             String mime = cursor.getString(mimeCol);
+                            String title = cleanLocalAudioField(rawTitle);
+                            boolean artistUnknown = TextUtils.isEmpty(rawArtist) || "<unknown>".equalsIgnoreCase(rawArtist.trim());
+                            String artist = artistUnknown ? "" : cleanLocalAudioField(rawArtist);
+                            if (artist.isEmpty() && title.contains(" - ")) {
+                                int sep = title.indexOf(" - ");
+                                String left = title.substring(0, sep).trim();
+                                String right = title.substring(sep + 3).trim();
+                                if (!left.isEmpty() && !right.isEmpty()) {
+                                    artist = left;
+                                    title = right;
+                                }
+                            }
                             if (TextUtils.isEmpty(title)) title = "Bilinmeyen Parça";
-                            if (TextUtils.isEmpty(artist) || "<unknown>".equalsIgnoreCase(artist)) artist = "Cihaz Müziği";
+                            if (TextUtils.isEmpty(artist)) artist = "Cihaz Müziği";
                             long sec = Math.max(0L, durMs / 1000L);
                             String durStr = String.format(Locale.US, "%d:%02d", sec / 60L, sec % 60L);
 
@@ -467,6 +479,22 @@ public class MainActivity extends Activity {
             }
             dispatchJsCallback("__kurfaNativeLocalAudioCallback", safeId, res.toString());
         });
+    }
+
+    private static String cleanLocalAudioField(String raw) {
+        if (raw == null) return "";
+        String s = raw.trim();
+        if (s.isEmpty()) return "";
+        for (int i = 0; i < 3; i++) {
+            String next = s.replaceAll("\\s*[\\(\\[]\\s*[_-]{0,4}[A-Za-z0-9_-]{10,14}[_-]{0,4}\\s*[\\)\\]]\\s*$", "").trim();
+            if (next.length() == s.length()) break;
+            s = next;
+        }
+        s = s.replace('_', ' ');
+        s = s.replaceAll("(?i)\\s*[\\(\\[]\\s*(?:HIGH QUALITY AUDIO|Official\\s+Music\\s+Video|Official\\s+Video|Official\\s+Audio|Video\\s+Klip|Lyric\\s+Video|Lyrics|Visualizer|Audio|4K|HD)\\s*[\\)\\]]", "");
+        s = s.replaceAll("(?i)(?:\\s*[\\|\\-–—]\\s*|\\s+)(?:HIGH QUALITY AUDIO|Official\\s+Music\\s+Video|Official\\s+Video|Official\\s+Audio|Video\\s+Klip|Lyric\\s+Video|Visualizer)\\b.*$", "");
+        s = s.replaceAll("\\s{2,}", " ").replaceAll("^[\\s\\-_–—|]+|[\\s\\-_–—|]+$", "");
+        return s;
     }
 
     private String extractLocalAudioMediaId(Uri uri) {

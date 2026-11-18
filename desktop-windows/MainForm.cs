@@ -88,6 +88,7 @@ public sealed class MainForm : Form
     private TrayMenuForm? _trayMenu;
     private bool _darkTitleBar = true;
     private bool _triedFallbackOrigin;
+    private bool _isAudioPlaying;
 
     public MainForm() : this(null, null)
     {
@@ -101,7 +102,7 @@ public sealed class MainForm : Form
 
         Color darkBg = Color.FromArgb(11, 11, 20); // #0B0B14
 
-        Text = "Kurfamüzik — Masaüstü";
+        Text = NormalizeLanguage(_config.Language) == "en" ? "Kurfamüzik — Desktop" : "Kurfamüzik — Masaüstü";
         BackColor = darkBg;
         ForeColor = Color.White;
         Size = new Size(1280, 820);
@@ -126,6 +127,17 @@ public sealed class MainForm : Form
         FormClosed += OnFormClosed;
     }
 
+    private static string NormalizeLanguage(string? lang) =>
+        string.Equals(lang, "en", StringComparison.OrdinalIgnoreCase) ? "en" : "tr";
+
+    private void ApplyLanguage(string? lang)
+    {
+        string normalized = NormalizeLanguage(lang);
+        Text = normalized == "en" ? "Kurfamüzik — Desktop" : "Kurfamüzik — Masaüstü";
+        _trayMenu?.SetLanguage(normalized);
+        _miniPlayer?.SetLanguage(normalized);
+    }
+
     private void UpdateWebViewMemoryMode()
     {
         try
@@ -133,7 +145,8 @@ public sealed class MainForm : Form
             CoreWebView2? core = _webView.CoreWebView2;
             if (core is null) return;
             bool isBackground = WindowState == FormWindowState.Minimized || !Visible;
-            core.MemoryUsageTargetLevel = isBackground
+            bool keepActiveForPlayback = _isAudioPlaying || (_miniPlayer is { Visible: true });
+            core.MemoryUsageTargetLevel = (isBackground && !keepActiveForPlayback)
                 ? CoreWebView2MemoryUsageTargetLevel.Low
                 : CoreWebView2MemoryUsageTargetLevel.Normal;
         }
@@ -866,6 +879,7 @@ public sealed class MainForm : Form
         string? miniArtist = null;
         string? miniThumb = null;
         bool miniPlaying = false;
+        bool hasMiniPlaying = false;
         bool miniMuted = false;
         double miniCur = 0;
         double miniDur = 0;
@@ -876,6 +890,8 @@ public sealed class MainForm : Form
         bool? settingMinimizeToTray = null;
         string? settingDownloadDir = null;
         bool hasSettingDownloadDir = false;
+        string? settingLanguage = null;
+        string? saveUserDataJson = null;
 
         try
         {
@@ -934,6 +950,7 @@ public sealed class MainForm : Form
                     (mpEl.ValueKind == JsonValueKind.True || mpEl.ValueKind == JsonValueKind.False))
                 {
                     miniPlaying = mpEl.GetBoolean();
+                    hasMiniPlaying = true;
                 }
                 if (payload.TryGetProperty("isMuted", out JsonElement mmEl) &&
                     (mmEl.ValueKind == JsonValueKind.True || mmEl.ValueKind == JsonValueKind.False))
@@ -978,6 +995,28 @@ public sealed class MainForm : Form
                 {
                     settingDownloadDir = dlDirEl.GetString();
                     hasSettingDownloadDir = true;
+                }
+                if (payload.TryGetProperty("lang", out JsonElement langEl) && langEl.ValueKind == JsonValueKind.String)
+                {
+                    settingLanguage = langEl.GetString();
+                }
+                else if (payload.TryGetProperty("language", out JsonElement langAltEl) && langAltEl.ValueKind == JsonValueKind.String)
+                {
+                    settingLanguage = langAltEl.GetString();
+                }
+                if (payload.TryGetProperty("dataJson", out JsonElement udEl))
+                {
+                    saveUserDataJson = udEl.ValueKind == JsonValueKind.String
+                        ? udEl.GetString()
+                        : udEl.GetRawText();
+                }
+                else if (payload.TryGetProperty("data", out JsonElement udObjEl) && udObjEl.ValueKind == JsonValueKind.Object)
+                {
+                    saveUserDataJson = udObjEl.GetRawText();
+                }
+                else if (string.Equals(action, "SAVE_USER_DATA", StringComparison.OrdinalIgnoreCase))
+                {
+                    saveUserDataJson = payload.GetRawText();
                 }
                 if (payload.TryGetProperty("key", out JsonElement keyEl) &&
                     keyEl.ValueKind == JsonValueKind.String &&
@@ -1165,7 +1204,8 @@ public sealed class MainForm : Form
                                 desktopShortcut = _config.DesktopShortcut,
                                 startMenuShortcut = _config.StartMenuShortcut,
                                 runOnStartup = _config.RunOnStartup,
-                                minimizeToTray = _config.MinimizeToTray
+                                minimizeToTray = _config.MinimizeToTray,
+                                language = NormalizeLanguage(_config.Language)
                             };
                         }
                         break;
@@ -1209,10 +1249,43 @@ public sealed class MainForm : Form
                                 desktopShortcut = _config.DesktopShortcut,
                                 startMenuShortcut = _config.StartMenuShortcut,
                                 runOnStartup = _config.RunOnStartup,
-                                minimizeToTray = _config.MinimizeToTray
+                                minimizeToTray = _config.MinimizeToTray,
+                                language = NormalizeLanguage(_config.Language)
                             };
                         }
                         break;
+
+                    case "SET_LANGUAGE":
+                    {
+                        string normalizedLang = NormalizeLanguage(settingLanguage);
+                        lock (_config)
+                        {
+                            _config.Language = normalizedLang;
+                            AppPaths.SaveConfig(_paths, _config);
+                        }
+                        if (!IsDisposed && IsHandleCreated)
+                        {
+                            BeginInvoke(() => ApplyLanguage(normalizedLang));
+                        }
+                        responseObj = new { success = true, language = normalizedLang };
+                        break;
+                    }
+
+                    case "SAVE_USER_DATA":
+                    {
+                        bool ok = saveUserDataJson is not null && AppPaths.SaveUserDataJson(_paths, saveUserDataJson);
+                        responseObj = ok
+                            ? new { success = true }
+                            : new { success = false, error = "Invalid or unwritable user data" };
+                        break;
+                    }
+
+                    case "LOAD_USER_DATA":
+                    {
+                        string rawUserJson = AppPaths.LoadUserDataJson(_paths);
+                        responseObj = new { success = true, dataJson = rawUserJson };
+                        break;
+                    }
 
                     case "PICK_DOWNLOAD_FOLDER":
                     {
@@ -1287,6 +1360,10 @@ public sealed class MainForm : Form
 
                     case "TOGGLE_MINI_PLAYER":
                     {
+                        if (hasMiniPlaying)
+                        {
+                            _isAudioPlaying = miniPlaying;
+                        }
                         bool nowVisible = ToggleOrUpdateMiniPlayer(true, downloadTitle, miniArtist, miniThumb, miniPlaying, miniMuted, miniCur, miniDur);
                         responseObj = new { success = true, visible = nowVisible };
                         break;
@@ -1294,8 +1371,26 @@ public sealed class MainForm : Form
 
                     case "UPDATE_MINI_PLAYER":
                     {
+                        if (hasMiniPlaying)
+                        {
+                            _isAudioPlaying = miniPlaying;
+                        }
                         ToggleOrUpdateMiniPlayer(false, downloadTitle, miniArtist, miniThumb, miniPlaying, miniMuted, miniCur, miniDur);
                         responseObj = new { success = true };
+                        break;
+                    }
+
+                    case "SET_PLAYBACK_STATE":
+                    {
+                        if (hasMiniPlaying)
+                        {
+                            _isAudioPlaying = miniPlaying;
+                            if (!IsDisposed && IsHandleCreated)
+                            {
+                                BeginInvoke(UpdateWebViewMemoryMode);
+                            }
+                        }
+                        responseObj = new { success = true, isPlaying = _isAudioPlaying };
                         break;
                     }
 
@@ -1395,6 +1490,13 @@ public sealed class MainForm : Form
                         WindowState = FormWindowState.Normal;
                         Activate();
                     });
+                string lang;
+                lock (_config)
+                {
+                    lang = NormalizeLanguage(_config.Language);
+                }
+                _miniPlayer.SetLanguage(lang);
+                _miniPlayer.VisibleChanged += (_, _) => UpdateWebViewMemoryMode();
             }
 
             _miniPlayer.UpdateState(title, artist, thumbUrl, isPlaying, isMuted, curSec, durSec);
@@ -1409,6 +1511,7 @@ public sealed class MainForm : Form
                     _miniPlayer.Show();
                 }
             }
+            UpdateWebViewMemoryMode();
             visible = _miniPlayer.Visible;
         }
 
@@ -1808,6 +1911,11 @@ public sealed class MainForm : Form
                     Close();
                 });
 
+            lock (_config)
+            {
+                _trayMenu.SetLanguage(NormalizeLanguage(_config.Language));
+            }
+
             _trayIcon.MouseUp += (_, e) =>
             {
                 if (e.Button == MouseButtons.Right && _trayMenu is not null && !_trayMenu.IsDisposed)
@@ -1860,10 +1968,17 @@ public sealed class MainForm : Form
             if (!_trayHintShown && _trayIcon is not null)
             {
                 _trayHintShown = true;
+                bool isEn;
+                lock (_config)
+                {
+                    isEn = NormalizeLanguage(_config.Language) == "en";
+                }
                 _trayIcon.ShowBalloonTip(
                     2200,
                     "Kurfamüzik",
-                    "Arka planda çalışmaya devam ediyor. Geri açmak için tepsi simgesine çift tıklayın.",
+                    isEn
+                        ? "Still running in background. Double-click the tray icon to reopen."
+                        : "Arka planda çalışmaya devam ediyor. Geri açmak için tepsi simgesine çift tıklayın.",
                     ToolTipIcon.Info);
             }
         }
