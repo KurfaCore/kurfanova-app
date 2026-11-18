@@ -11,8 +11,8 @@ public sealed class AutoUpdater : IDisposable
     private const string ManifestUrl =
         "https://github.com/KurfaCore/kurfanova-app/releases/latest/download/win-update.json";
 
-    private static readonly TimeSpan AutoCheckCooldown = TimeSpan.FromHours(4);
-    private static readonly TimeSpan ManualCheckCooldown = TimeSpan.FromSeconds(25);
+    private static readonly TimeSpan AutoCheckCooldown = TimeSpan.FromHours(2);
+    private static readonly TimeSpan ManualCheckCooldown = TimeSpan.FromSeconds(2);
     private static readonly HttpClient Http = CreateHttpClient();
 
     private readonly AppPaths _paths;
@@ -21,21 +21,38 @@ public sealed class AutoUpdater : IDisposable
     private readonly Version _currentVersion;
     private readonly SemaphoreSlim _checkGate = new(1, 1);
     private DateTimeOffset _lastInMemoryCheckAt = DateTimeOffset.MinValue;
+    private PendingRemoteManifest? _pendingRemote;
     private string? _stagedSha256;
     private int _applyTriggered;
+
+    private sealed record PendingRemoteManifest(
+        Version Version,
+        string DownloadUrl,
+        string Sha256,
+        long ExpectedSize,
+        string? Notes);
 
     public string? StagedExePath { get; private set; }
     public Version? StagedVersion { get; private set; }
     public string? ReleaseNotes { get; private set; }
     public bool HasStagedUpdate => !string.IsNullOrWhiteSpace(StagedExePath) && File.Exists(StagedExePath);
 
+    public sealed record UpdateCheckResult(
+        string Status, // "up-to-date" | "available" | "staged" | "error" | "skipped"
+        Version CurrentVersion,
+        Version? RemoteVersion,
+        long SizeBytes,
+        string? Notes,
+        string? ErrorMessage = null);
+
     public sealed record UpdateProgressInfo(
-        string Phase,
+        string Phase, // "available" | "downloading" | "verifying" | "ready" | "error" | "up-to-date" | "hide"
         Version Version,
         string? Notes,
         long BytesDownloaded,
         long TotalBytes,
-        int Percent);
+        int Percent,
+        string? ErrorMessage = null);
 
     public event Action<Version, string?>? UpdateReady;
     public event Action<UpdateProgressInfo>? UpdateProgressChanged;
@@ -65,24 +82,28 @@ public sealed class AutoUpdater : IDisposable
         };
         var client = new HttpClient(handler)
         {
-            Timeout = TimeSpan.FromMinutes(3)
+            Timeout = TimeSpan.FromMinutes(4)
         };
-        client.DefaultRequestHeaders.UserAgent.ParseAdd("KurfanovaMuzik-Updater/1.2");
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("KurfanovaMuzik-Updater/2.0");
         return client;
     }
 
-    public async Task CheckAndStageAsync(CancellationToken ct, bool force = false)
+    /// <summary>
+    /// Fast manifest check (< 2s) without silently downloading ~70 MB behind the user's back.
+    /// Reports whether an update is available and waits for user confirmation before downloading.
+    /// </summary>
+    public async Task<UpdateCheckResult> CheckManifestAsync(CancellationToken ct, bool force = false, bool emitProgressEvents = true)
     {
         if (!await _checkGate.WaitAsync(0, ct).ConfigureAwait(false))
         {
-            return;
+            return new UpdateCheckResult("skipped", _currentVersion, StagedVersion, 0, ReleaseNotes);
         }
 
-        bool downloadStarted = false;
         try
         {
             CleanupOldTempFiles();
 
+            // 1. If a verified update is already staged on disk and newer than running exe, surface it right away
             if (TryLoadExistingStaged(out Version? existingVer, out string? existingPath, out string? existingSha, out string? existingNotes) &&
                 existingVer is not null && existingPath is not null &&
                 existingVer > _currentVersion)
@@ -93,30 +114,33 @@ public sealed class AutoUpdater : IDisposable
                 StagedExePath = existingPath;
                 _stagedSha256 = existingSha;
                 ReleaseNotes = existingNotes;
-                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", existingVer, existingNotes, stagedLen, stagedLen, 100));
-                UpdateReady?.Invoke(existingVer, existingNotes);
-                return;
+                if (emitProgressEvents)
+                {
+                    UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", existingVer, existingNotes, stagedLen, stagedLen, 100));
+                    UpdateReady?.Invoke(existingVer, existingNotes);
+                }
+                return new UpdateCheckResult("staged", _currentVersion, existingVer, stagedLen, existingNotes);
             }
 
             DateTimeOffset now = DateTimeOffset.UtcNow;
             if (force)
             {
-                if ((now - _lastInMemoryCheckAt) < ManualCheckCooldown)
+                if ((now - _lastInMemoryCheckAt) < ManualCheckCooldown && _pendingRemote is not null)
                 {
-                    return;
+                    return new UpdateCheckResult("available", _currentVersion, _pendingRemote.Version, _pendingRemote.ExpectedSize, _pendingRemote.Notes);
                 }
             }
             else
             {
                 if ((now - _lastInMemoryCheckAt) < AutoCheckCooldown)
                 {
-                    return;
+                    return new UpdateCheckResult("skipped", _currentVersion, null, 0, null);
                 }
                 DesktopAppConfig cfg = AppPaths.LoadOrDefaultConfig(_paths, _currentVersion);
                 if (cfg.LastUpdateCheckUtc.HasValue && (now - cfg.LastUpdateCheckUtc.Value) < AutoCheckCooldown)
                 {
                     _lastInMemoryCheckAt = cfg.LastUpdateCheckUtc.Value;
-                    return;
+                    return new UpdateCheckResult("skipped", _currentVersion, null, 0, null);
                 }
             }
 
@@ -132,13 +156,16 @@ public sealed class AutoUpdater : IDisposable
             Directory.CreateDirectory(_updatesDir);
 
             using var manifestCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            manifestCts.CancelAfter(TimeSpan.FromSeconds(18));
+            manifestCts.CancelAfter(TimeSpan.FromSeconds(15));
             string manifestUrl = $"{ManifestUrl}?t={now.ToUnixTimeSeconds()}";
             string manifestJson = await Http.GetStringAsync(manifestUrl, manifestCts.Token).ConfigureAwait(false);
 
             using JsonDocument doc = JsonDocument.Parse(manifestJson);
             JsonElement root = doc.RootElement;
-            if (root.ValueKind != JsonValueKind.Object) return;
+            if (root.ValueKind != JsonValueKind.Object)
+            {
+                return new UpdateCheckResult("error", _currentVersion, null, 0, null, "Geçersiz güncelleme bildirimi.");
+            }
 
             string? rawVersion = root.TryGetProperty("version", out JsonElement vEl) && vEl.ValueKind == JsonValueKind.String
                 ? vEl.GetString()
@@ -161,20 +188,27 @@ public sealed class AutoUpdater : IDisposable
                 string.IsNullOrWhiteSpace(expectedSha256) ||
                 expectedSha256.Length != 64 ||
                 !TryParseNormalizedVersion(rawVersion, out Version? remoteVersion) ||
-                remoteVersion is null ||
-                remoteVersion <= _currentVersion)
+                remoteVersion is null)
             {
-                return;
+                return new UpdateCheckResult("error", _currentVersion, null, 0, null, "Sürüm verisi eksik veya bozuk.");
+            }
+
+            if (remoteVersion <= _currentVersion)
+            {
+                _pendingRemote = null;
+                if (emitProgressEvents && force)
+                {
+                    UpdateProgressChanged?.Invoke(new UpdateProgressInfo("up-to-date", remoteVersion, null, 0, 0, 100));
+                }
+                return new UpdateCheckResult("up-to-date", _currentVersion, remoteVersion, 0, notes);
             }
 
             if (!IsTrustedReleaseUri(downloadUrl))
             {
-                return;
+                return new UpdateCheckResult("error", _currentVersion, null, 0, null, "Güvenilmeyen güncelleme kaynağı.");
             }
 
             string targetExePath = Path.Combine(_updatesDir, $"Kurfanova-Muzik-Windows-{remoteVersion}.exe");
-            string partPath = targetExePath + ".part";
-
             if (File.Exists(targetExePath) && VerifyFileIntegrity(targetExePath, expectedSize, expectedSha256))
             {
                 long existingFileLen = 0;
@@ -184,28 +218,107 @@ public sealed class AutoUpdater : IDisposable
                 StagedExePath = targetExePath;
                 _stagedSha256 = expectedSha256;
                 ReleaseNotes = notes;
-                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", remoteVersion, notes, existingFileLen, existingFileLen, 100));
-                UpdateReady?.Invoke(remoteVersion, notes);
-                return;
+                if (emitProgressEvents)
+                {
+                    UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", remoteVersion, notes, existingFileLen, existingFileLen, 100));
+                    UpdateReady?.Invoke(remoteVersion, notes);
+                }
+                return new UpdateCheckResult("staged", _currentVersion, remoteVersion, existingFileLen, notes);
             }
 
-            downloadStarted = true;
-            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("downloading", remoteVersion, notes, 0, expectedSize, 0));
+            _pendingRemote = new PendingRemoteManifest(remoteVersion, downloadUrl, expectedSha256, expectedSize, notes);
+            if (emitProgressEvents)
+            {
+                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("available", remoteVersion, notes, 0, expectedSize, 0));
+            }
+            return new UpdateCheckResult("available", _currentVersion, remoteVersion, expectedSize, notes);
+        }
+        catch (OperationCanceledException)
+        {
+            return new UpdateCheckResult("error", _currentVersion, null, 0, null, "Bağlantı zaman aşımına uğradı.");
+        }
+        catch (Exception ex)
+        {
+            LogUpdater($"Manifest check error: {ex.Message}");
+            if (emitProgressEvents && force)
+            {
+                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("error", _currentVersion, null, 0, 0, 0, "Sunucuya erişilemedi."));
+            }
+            return new UpdateCheckResult("error", _currentVersion, null, 0, null, ex.Message);
+        }
+        finally
+        {
+            _checkGate.Release();
+        }
+    }
+
+    /// <summary>
+    /// Downloads and SHA-256 verifies the approved pending update, reporting live progress to WebView UI.
+    /// </summary>
+    public async Task<bool> DownloadAndStageAsync(CancellationToken ct)
+    {
+        if (HasStagedUpdate && StagedVersion is not null && StagedVersion > _currentVersion)
+        {
+            long len = 0;
+            try { len = new FileInfo(StagedExePath!).Length; } catch { }
+            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", StagedVersion, ReleaseNotes, len, len, 100));
+            UpdateReady?.Invoke(StagedVersion, ReleaseNotes);
+            return true;
+        }
+
+        if (_pendingRemote is null)
+        {
+            UpdateCheckResult check = await CheckManifestAsync(ct, force: true, emitProgressEvents: false).ConfigureAwait(false);
+            if (check.Status == "staged")
+            {
+                if (StagedVersion is not null)
+                {
+                    UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", StagedVersion, ReleaseNotes, check.SizeBytes, check.SizeBytes, 100));
+                    UpdateReady?.Invoke(StagedVersion, ReleaseNotes);
+                }
+                return true;
+            }
+            if (check.Status != "available" || _pendingRemote is null)
+            {
+                if (check.Status == "error")
+                {
+                    UpdateProgressChanged?.Invoke(new UpdateProgressInfo("error", _currentVersion, null, 0, 0, 0, check.ErrorMessage ?? "Güncelleme indirilemedi."));
+                }
+                return false;
+            }
+        }
+
+        if (!await _checkGate.WaitAsync(0, ct).ConfigureAwait(false))
+        {
+            return false;
+        }
+
+        PendingRemoteManifest manifest = _pendingRemote!;
+        string targetExePath = Path.Combine(_updatesDir, $"Kurfanova-Muzik-Windows-{manifest.Version}.exe");
+        string partPath = targetExePath + ".part";
+
+        try
+        {
+            Directory.CreateDirectory(_updatesDir);
+            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("downloading", manifest.Version, manifest.Notes, 0, manifest.ExpectedSize, 0));
 
             long downloadedBytes = 0;
-            long totalBytes = expectedSize;
+            long totalBytes = manifest.ExpectedSize;
 
             using (var dlCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
             {
-                dlCts.CancelAfter(TimeSpan.FromMinutes(3));
+                dlCts.CancelAfter(TimeSpan.FromMinutes(4));
                 using HttpResponseMessage response = await Http.GetAsync(
-                    downloadUrl,
+                    manifest.DownloadUrl,
                     HttpCompletionOption.ResponseHeadersRead,
                     dlCts.Token).ConfigureAwait(false);
+
                 if (!response.IsSuccessStatusCode)
                 {
-                    UpdateProgressChanged?.Invoke(new UpdateProgressInfo("hide", remoteVersion, null, 0, 0, 0));
-                    return;
+                    UpdateProgressChanged?.Invoke(new UpdateProgressInfo(
+                        "error", manifest.Version, manifest.Notes, 0, totalBytes, 0,
+                        $"İndirme başarısız (HTTP {(int)response.StatusCode})"));
+                    return false;
                 }
 
                 if (response.Content.Headers.ContentLength is long cl && cl > 0)
@@ -217,7 +330,7 @@ public sealed class AutoUpdater : IDisposable
                 await using (var fs = new FileStream(partPath, FileMode.Create, FileAccess.Write, FileShare.None, 81920, useAsync: true))
                 {
                     byte[] buffer = new byte[81920];
-                    long lastEmitMs = Environment.TickCount64;
+                    long lastEmitMs = 0;
                     int read;
                     while ((read = await netStream.ReadAsync(buffer.AsMemory(0, buffer.Length), dlCts.Token).ConfigureAwait(false)) > 0)
                     {
@@ -225,48 +338,68 @@ public sealed class AutoUpdater : IDisposable
                         downloadedBytes += read;
 
                         long nowMs = Environment.TickCount64;
-                        if (nowMs - lastEmitMs >= 110)
+                        if (nowMs - lastEmitMs >= 100)
                         {
                             lastEmitMs = nowMs;
                             int pct = totalBytes > 0 ? Math.Clamp((int)((downloadedBytes * 100L) / totalBytes), 0, 99) : 0;
-                            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("downloading", remoteVersion, notes, downloadedBytes, totalBytes, pct));
+                            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("downloading", manifest.Version, manifest.Notes, downloadedBytes, totalBytes, pct));
                         }
                     }
                 }
             }
 
             long finalSize = totalBytes > 0 ? totalBytes : downloadedBytes;
-            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("verifying", remoteVersion, notes, downloadedBytes, finalSize, 100));
+            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("verifying", manifest.Version, manifest.Notes, downloadedBytes, finalSize, 100));
 
-            if (!VerifyFileIntegrity(partPath, expectedSize, expectedSha256))
+            if (!VerifyFileIntegrity(partPath, manifest.ExpectedSize, manifest.Sha256))
             {
                 TryDeleteFile(partPath);
-                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("hide", remoteVersion, null, 0, 0, 0));
-                return;
+                LogUpdater($"SHA-256 verification failed for v{manifest.Version}");
+                UpdateProgressChanged?.Invoke(new UpdateProgressInfo(
+                    "error", manifest.Version, manifest.Notes, 0, finalSize, 0,
+                    "İndirilen dosya doğrulamadan geçemedi (SHA-256 uyuşmazlığı)."));
+                return false;
             }
 
             File.Move(partPath, targetExePath, overwrite: true);
-            SaveStagedMeta(remoteVersion.ToString(), targetExePath, expectedSha256, notes);
-            LogUpdater($"Update staged: v{remoteVersion} at {targetExePath}");
+            SaveStagedMeta(manifest.Version.ToString(), targetExePath, manifest.Sha256, manifest.Notes);
+            LogUpdater($"Update staged & verified: v{manifest.Version} at {targetExePath}");
 
-            StagedVersion = remoteVersion;
+            StagedVersion = manifest.Version;
             StagedExePath = targetExePath;
-            _stagedSha256 = expectedSha256;
-            ReleaseNotes = notes;
-            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", remoteVersion, notes, finalSize, finalSize, 100));
-            UpdateReady?.Invoke(remoteVersion, notes);
+            _stagedSha256 = manifest.Sha256;
+            ReleaseNotes = manifest.Notes;
+            _pendingRemote = null;
+
+            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("ready", manifest.Version, manifest.Notes, finalSize, finalSize, 100));
+            UpdateReady?.Invoke(manifest.Version, manifest.Notes);
+            return true;
         }
-        catch
+        catch (OperationCanceledException)
         {
-            if (downloadStarted)
-            {
-                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("hide", _currentVersion, null, 0, 0, 0));
-            }
-            // Never interrupt playback or startup if offline/unreachable
+            TryDeleteFile(partPath);
+            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("error", manifest.Version, manifest.Notes, 0, 0, 0, "İndirme iptal edildi veya zaman aşımına uğradı."));
+            return false;
+        }
+        catch (Exception ex)
+        {
+            TryDeleteFile(partPath);
+            LogUpdater($"DownloadAndStage error: {ex.Message}");
+            UpdateProgressChanged?.Invoke(new UpdateProgressInfo("error", manifest.Version, manifest.Notes, 0, 0, 0, $"İndirme hatası: {ex.Message}"));
+            return false;
         }
         finally
         {
             _checkGate.Release();
+        }
+    }
+
+    public async Task CheckAndStageAsync(CancellationToken ct, bool force = false)
+    {
+        UpdateCheckResult check = await CheckManifestAsync(ct, force, emitProgressEvents: true).ConfigureAwait(false);
+        if (check.Status == "available")
+        {
+            // Keep UI on approval phase; user confirmation calls DownloadAndStageAsync
         }
     }
 
@@ -282,8 +415,8 @@ public sealed class AutoUpdater : IDisposable
     }
 
     /// <summary>
-    /// Applies the verified staged update in-place using Windows NTFS native live executable rename
-    /// (100% in-process file operations, zero external scripts, zero AV behavioral false positives).
+    /// Applies the verified staged update cleanly after MainForm and SingleInstanceMutex are released.
+    /// Uses retry-guarded NTFS rename + cross-volume File.Copy fallback and passes --post-update-pid to the new instance.
     /// </summary>
     public bool TryApplyPendingUpdate(bool relaunch)
     {
@@ -303,6 +436,7 @@ public sealed class AutoUpdater : IDisposable
             {
                 TryDeleteFile(_stagedMetaPath);
                 Interlocked.Exchange(ref _applyTriggered, 0);
+                LogUpdater("TryApplyPendingUpdate aborted: staged file integrity check failed.");
                 return false;
             }
 
@@ -316,6 +450,7 @@ public sealed class AutoUpdater : IDisposable
                 else
                 {
                     Interlocked.Exchange(ref _applyTriggered, 0);
+                    LogUpdater($"TryApplyPendingUpdate aborted: non-updatable exe path '{currentExe}'.");
                     return false;
                 }
             }
@@ -323,14 +458,58 @@ public sealed class AutoUpdater : IDisposable
             string oldExePath = currentExe! + ".old";
             TryDeleteFile(oldExePath);
 
-            // NTFS allows renaming a running executable within the same directory
-            File.Move(currentExe!, oldExePath, overwrite: true);
+            // Retry move briefly to tolerate Defender scan or slow WebView2 handle teardown
+            bool movedOld = false;
+            for (int attempt = 0; attempt < 6; attempt++)
+            {
+                try
+                {
+                    File.Move(currentExe!, oldExePath, overwrite: true);
+                    movedOld = true;
+                    break;
+                }
+                catch when (attempt < 5)
+                {
+                    Thread.Sleep(150);
+                }
+            }
+
+            if (!movedOld)
+            {
+                Interlocked.Exchange(ref _applyTriggered, 0);
+                LogUpdater($"Failed to rename running exe '{currentExe}' to .old");
+                return false;
+            }
+
             try
             {
-                File.Move(StagedExePath, currentExe!, overwrite: true);
+                bool movedNew = false;
+                for (int attempt = 0; attempt < 5; attempt++)
+                {
+                    try
+                    {
+                        File.Move(StagedExePath, currentExe!, overwrite: true);
+                        movedNew = true;
+                        break;
+                    }
+                    catch (IOException) when (attempt >= 2)
+                    {
+                        // Cross-volume or transient lock fallback: copy then delete staged
+                        File.Copy(StagedExePath, currentExe!, overwrite: true);
+                        TryDeleteFile(StagedExePath);
+                        movedNew = true;
+                        break;
+                    }
+                    catch when (attempt < 4)
+                    {
+                        Thread.Sleep(150);
+                    }
+                }
+                if (!movedNew) throw new IOException("Could not place staged exe.");
             }
-            catch
+            catch (Exception ex)
             {
+                LogUpdater($"Failed placing staged exe: {ex.Message}. Rolling back.");
                 if (!File.Exists(currentExe!) && File.Exists(oldExePath))
                 {
                     try { File.Move(oldExePath, currentExe!, overwrite: true); } catch { }
@@ -340,12 +519,14 @@ public sealed class AutoUpdater : IDisposable
             }
 
             TryDeleteFile(_stagedMetaPath);
-            LogUpdater($"Update applied natively in-place to {currentExe} (v{StagedVersion})");
+            LogUpdater($"Update applied successfully to {currentExe} (v{StagedVersion})");
 
             if (relaunch && File.Exists(currentExe!))
             {
+                int currentPid = Environment.ProcessId;
                 Process.Start(new ProcessStartInfo(currentExe!)
                 {
+                    Arguments = $"--post-update-pid {currentPid}",
                     WorkingDirectory = Path.GetDirectoryName(currentExe!) ?? _paths.InstallDir,
                     UseShellExecute = true
                 });
@@ -353,8 +534,9 @@ public sealed class AutoUpdater : IDisposable
 
             return true;
         }
-        catch
+        catch (Exception ex)
         {
+            LogUpdater($"TryApplyPendingUpdate fatal error: {ex.Message}");
             Interlocked.Exchange(ref _applyTriggered, 0);
             return false;
         }
@@ -411,10 +593,7 @@ public sealed class AutoUpdater : IDisposable
             });
             File.WriteAllText(_stagedMetaPath, json, Encoding.UTF8);
         }
-        catch
-        {
-            // Ignore metadata write failure
-        }
+        catch { }
     }
 
     private void CleanupOldTempFiles()
@@ -446,10 +625,7 @@ public sealed class AutoUpdater : IDisposable
                 }
             }
         }
-        catch
-        {
-            // Ignore cleanup errors
-        }
+        catch { }
     }
 
     private static bool VerifyFileIntegrity(string path, long expectedSize, string expectedSha256)
@@ -506,10 +682,7 @@ public sealed class AutoUpdater : IDisposable
         {
             if (File.Exists(path)) File.Delete(path);
         }
-        catch
-        {
-            // Ignore cleanup errors
-        }
+        catch { }
     }
 
     private static bool TryParseNormalizedVersion(string raw, out Version? normalized)

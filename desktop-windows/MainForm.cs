@@ -80,6 +80,7 @@ public sealed class MainForm : Form
     private bool _trayHintShown;
     private int _updatePromptShown;
     private volatile bool _webContentLoaded;
+    private bool _detachedUpdaterForApply;
     private AutoUpdater.UpdateProgressInfo? _latestUpdateProgress;
     private MiniPlayerForm? _miniPlayer;
     private Icon? _trayCroppedIcon;
@@ -266,8 +267,8 @@ public sealed class MainForm : Form
             {
                 try
                 {
-                    await Task.Delay(4500, _shutdownCts.Token).ConfigureAwait(false);
-                    await _updater.CheckAndStageAsync(_shutdownCts.Token, force: false).ConfigureAwait(false);
+                    await Task.Delay(3500, _shutdownCts.Token).ConfigureAwait(false);
+                    await _updater.CheckManifestAsync(_shutdownCts.Token, force: false, emitProgressEvents: true).ConfigureAwait(false);
                 }
                 catch (OperationCanceledException) { }
             });
@@ -957,15 +958,29 @@ public sealed class MainForm : Form
                         break;
 
                     case "CHECK_UPDATE":
-                        await _updater.CheckAndStageAsync(ct, force: true).ConfigureAwait(false);
+                    {
+                        AutoUpdater.UpdateCheckResult check = await _updater.CheckManifestAsync(ct, force: true, emitProgressEvents: true).ConfigureAwait(false);
                         responseObj = new
                         {
-                            success = true,
-                            version = _updater.CurrentVersion.ToString(),
-                            hasUpdate = _updater.HasStagedUpdate,
-                            stagedVersion = _updater.StagedVersion?.ToString()
+                            success = check.Status != "error",
+                            status = check.Status,
+                            currentVersion = check.CurrentVersion.ToString(3),
+                            remoteVersion = check.RemoteVersion?.ToString(3),
+                            sizeBytes = check.SizeBytes,
+                            notes = check.Notes ?? string.Empty,
+                            errorMessage = check.ErrorMessage,
+                            hasUpdate = check.Status == "available" || check.Status == "staged",
+                            stagedVersion = _updater.StagedVersion?.ToString(3)
                         };
                         break;
+                    }
+
+                    case "START_UPDATE_DOWNLOAD":
+                    {
+                        _ = Task.Run(() => _updater.DownloadAndStageAsync(_shutdownCts.Token));
+                        responseObj = new { success = true, started = true };
+                        break;
+                    }
 
                     case "APPLY_UPDATE":
                         if (_updater.HasStagedUpdate)
@@ -977,7 +992,7 @@ public sealed class MainForm : Form
                         }
                         else
                         {
-                            responseObj = new { success = false, error = "No staged update" };
+                            responseObj = new { success = false, error = "Hazır güncelleme paketi bulunamadı" };
                         }
                         break;
 
@@ -1496,11 +1511,13 @@ public sealed class MainForm : Form
             string payloadJson = JsonSerializer.Serialize(new
             {
                 phase = info.Phase,
-                version = info.Version.ToString(),
+                currentVersion = _updater.CurrentVersion.ToString(3),
+                version = info.Version.ToString(3),
                 notes = info.Notes ?? string.Empty,
                 bytesDownloaded = info.BytesDownloaded,
                 totalBytes = info.TotalBytes,
-                percent = info.Percent
+                percent = info.Percent,
+                errorMessage = info.ErrorMessage ?? string.Empty
             });
 
             BeginInvoke(() =>
@@ -1531,9 +1548,6 @@ public sealed class MainForm : Form
 
                 if (_webContentLoaded && _webView.CoreWebView2 is not null)
                 {
-                    string verJson = JsonSerializer.Serialize(version.ToString());
-                    _ = _webView.CoreWebView2.ExecuteScriptAsync(
-                        $"if (typeof window.__kurfaOnNativeUpdateReady === 'function') {{ window.__kurfaOnNativeUpdateReady({{ version: {verJson}, platform: 'windows', uiHandled: true }}); }}");
                     PushUpdateProgressToWebView(new AutoUpdater.UpdateProgressInfo(
                         "ready",
                         version,
@@ -1547,14 +1561,15 @@ public sealed class MainForm : Form
                 string noteLine = string.IsNullOrWhiteSpace(notes) ? string.Empty : $"\nYenilikler: {notes}\n";
                 DialogResult choice = MessageBox.Show(
                     this,
-                    $"Kurfamüzik v{version} arka planda indirildi ve doğrulandı.{noteLine}\nŞimdi güncellenip yeniden başlatılsın mı?\n(\"Hayır\" derseniz uygulamayı kapattığınızda otomatik güncellenecek.)",
-                    "Kurfamüzik Otomatik Güncelleme",
+                    $"Kurfamüzik v{version.ToString(3)} arka planda indirildi ve doğrulandı.{noteLine}\nŞimdi güncellenip yeniden başlatılsın mı?",
+                    "Kurfamüzik Güncelleme Onayı",
                     MessageBoxButtons.YesNo,
                     MessageBoxIcon.Information);
 
                 if (choice == DialogResult.Yes)
                 {
                     _restartForUpdate = true;
+                    _allowExit = true;
                     Close();
                 }
             });
@@ -1589,12 +1604,53 @@ public sealed class MainForm : Form
                 },
                 async () =>
                 {
-                    _trayIcon?.ShowBalloonTip(1500, "Kurfamüzik", "Güncellemeler denetleniyor...", ToolTipIcon.Info);
-                    await _updater.CheckAndStageAsync(_shutdownCts.Token, force: true);
-                    if (!_updater.HasStagedUpdate)
+                    _trayIcon?.ShowBalloonTip(1500, "Kurfamüzik", "Yeni sürüm denetleniyor...", ToolTipIcon.Info);
+                    AutoUpdater.UpdateCheckResult check = await _updater.CheckManifestAsync(_shutdownCts.Token, force: true, emitProgressEvents: true).ConfigureAwait(false);
+                    if (IsDisposed) return;
+
+                    BeginInvoke(() =>
                     {
-                        _trayIcon?.ShowBalloonTip(2000, "Kurfamüzik", "Uygulamanız güncel.", ToolTipIcon.Info);
-                    }
+                        if (IsDisposed) return;
+                        if (check.Status == "available" || check.Status == "staged")
+                        {
+                            RestoreWindow();
+                            string phase = check.Status == "staged" ? "ready" : "available";
+                            if (_webContentLoaded && _webView.CoreWebView2 is not null && check.RemoteVersion is not null)
+                            {
+                                PushUpdateProgressToWebView(new AutoUpdater.UpdateProgressInfo(
+                                    phase, check.RemoteVersion, check.Notes,
+                                    phase == "ready" ? check.SizeBytes : 0, check.SizeBytes, phase == "ready" ? 100 : 0));
+                            }
+                            else if (check.RemoteVersion is not null)
+                            {
+                                DialogResult ans = MessageBox.Show(
+                                    this,
+                                    $"Kurfamüzik v{check.RemoteVersion.ToString(3)} bulundu (Yüklü: v{check.CurrentVersion.ToString(3)}).\nŞimdi indirip güncellemek istiyor musunuz?",
+                                    "Yeni Güncelleme Mevcut",
+                                    MessageBoxButtons.YesNo,
+                                    MessageBoxIcon.Information);
+                                if (ans == DialogResult.Yes)
+                                {
+                                    _ = Task.Run(async () =>
+                                    {
+                                        bool ok = await _updater.DownloadAndStageAsync(_shutdownCts.Token).ConfigureAwait(false);
+                                        if (ok && !IsDisposed)
+                                        {
+                                            BeginInvoke(() => { _restartForUpdate = true; _allowExit = true; Close(); });
+                                        }
+                                    });
+                                }
+                            }
+                        }
+                        else if (check.Status == "up-to-date")
+                        {
+                            _trayIcon?.ShowBalloonTip(2200, "Kurfamüzik", $"Uygulamanız güncel (v{check.CurrentVersion.ToString(3)}).", ToolTipIcon.Info);
+                        }
+                        else if (check.Status == "error")
+                        {
+                            _trayIcon?.ShowBalloonTip(2200, "Kurfamüzik", check.ErrorMessage ?? "Güncelleme denetlenemedi.", ToolTipIcon.Warning);
+                        }
+                    });
                 },
                 () =>
                 {
@@ -1698,18 +1754,28 @@ public sealed class MainForm : Form
         catch { }
     }
 
+    internal AutoUpdater? DetachPendingUpdaterOnExit(out bool relaunch)
+    {
+        relaunch = _restartForUpdate;
+        if (_updater.HasStagedUpdate)
+        {
+            _detachedUpdaterForApply = true;
+            return _updater;
+        }
+        return null;
+    }
+
     private void OnFormClosed(object? sender, FormClosedEventArgs e)
     {
         try { _shutdownCts.Cancel(); } catch { /* ignore */ }
-        if (_updater.HasStagedUpdate)
-        {
-            _updater.TryApplyPendingUpdate(relaunch: _restartForUpdate);
-        }
         _trayMenu?.Dispose();
         _trayIcon?.Dispose();
         _trayCroppedIcon?.Dispose();
         _miniPlayer?.Dispose();
-        _updater.Dispose();
+        if (!_detachedUpdaterForApply && !_updater.HasStagedUpdate)
+        {
+            _updater.Dispose();
+        }
         _engine.Dispose();
         _webView.Dispose();
         _embeddedIcon?.Dispose();

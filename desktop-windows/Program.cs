@@ -63,22 +63,60 @@ internal static class Program
 
         if (isPortable || (isFromInstallDir && !forceSetup))
         {
-            using var singleInstanceMutex = new Mutex(true, SingleInstanceMutexName, out bool isFirstInstance);
+            // Wait briefly for previous process to exit cleanly during post-update relaunch
+            int postPidIdx = Array.FindIndex(args, a => string.Equals(a, "--post-update-pid", StringComparison.OrdinalIgnoreCase));
+            if (postPidIdx >= 0 && postPidIdx + 1 < args.Length && int.TryParse(args[postPidIdx + 1], out int oldPid) && oldPid > 0)
+            {
+                try
+                {
+                    using var oldProc = System.Diagnostics.Process.GetProcessById(oldPid);
+                    oldProc.WaitForExit(3500);
+                }
+                catch { /* already exited */ }
+            }
+
+            var singleInstanceMutex = new Mutex(true, SingleInstanceMutexName, out bool isFirstInstance);
             if (!isFirstInstance)
             {
+                singleInstanceMutex.Dispose();
                 SignalExistingInstance();
                 return;
             }
 
-            var config = AppPaths.LoadOrDefaultConfig(activePaths, AppPaths.GetNormalizedCurrentVersion());
-            if (!isPortable)
+            AutoUpdater? pendingUpdater = null;
+            bool relaunchAfterUpdate = false;
+
+            try
             {
-                InstallerService.SyncMetadataOnLaunch(activePaths, config, AppPaths.GetNormalizedCurrentVersion());
+                var config = AppPaths.LoadOrDefaultConfig(activePaths, AppPaths.GetNormalizedCurrentVersion());
+                if (!isPortable)
+                {
+                    InstallerService.SyncMetadataOnLaunch(activePaths, config, AppPaths.GetNormalizedCurrentVersion());
+                }
+
+                var mainForm = new MainForm(activePaths, config);
+                StartActivationPipeListener(mainForm);
+                Application.Run(mainForm);
+                pendingUpdater = mainForm.DetachPendingUpdaterOnExit(out relaunchAfterUpdate);
+            }
+            finally
+            {
+                // Always release single-instance Mutex BEFORE applying pending update & relaunching new EXE!
+                try { singleInstanceMutex.ReleaseMutex(); } catch { }
+                singleInstanceMutex.Dispose();
             }
 
-            var mainForm = new MainForm(activePaths, config);
-            StartActivationPipeListener(mainForm);
-            Application.Run(mainForm);
+            if (pendingUpdater is not null)
+            {
+                try
+                {
+                    pendingUpdater.TryApplyPendingUpdate(relaunch: relaunchAfterUpdate);
+                }
+                finally
+                {
+                    pendingUpdater.Dispose();
+                }
+            }
         }
         else
         {
