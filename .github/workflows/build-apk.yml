@@ -93,10 +93,25 @@ jobs:
         if: github.ref == 'refs/heads/main'
         with:
           tag_name: v1.0.0-apk
-          name: "Kurfamüzik v1.2.${{ github.run_number }} (Android + Windows)"
+          name: "Kurfamüzik — Windows Masaüstü & Android Sürümü"
           make_latest: true
           body: |
-            Kurfamüzik v1.2.${{ github.run_number }} — Cihaz Üstü Doğrudan Ses Çözücü ve Otomatik Güncelleme Sistemi.
+            Kurfamüzik resmi **Windows Masaüstü (x64)** ve **Android APK (`v1.2.${{ github.run_number }}`)** kurulum paketleri.
+
+            ### İndirme Dosyaları
+            - **Windows:** `Kurfanova-Muzik-Windows.exe` (Windows 10 / 11 x64, tek dosya self-contained kurulum)
+            - **Android:** `Kurfanova-Muzik.apk` (Android 8.0+)
+
+            ### Öne Çıkan Yenilikler
+            - Şeffaf arka plansız logo ve Windows 10/11 uyumlu 32-bit cam katmanlı `MiniPlayer` / tepsi menüsü
+            - Yerel ses dosyaları için gerçek süre okuma ve temiz parça/sanatçı başlığı ayrıştırma
+            - Türkçe / İngilizce (`TR` / `EN`) tam dil desteği ve özel indirme klasörü seçimi
+            - Kalıcı yerel kullanıcı verisi (`user-data.json`) ve birincil sunucuya erişilemediğinde otomatik Worker yedek geçişi
+            - `win-update.json` ve `apk-update.json` üzerinden SHA-256 doğrulamalı otomatik güncelleme
+
+            ### Doğrulama Manifestleri
+            - Windows manifest: [`win-update.json`](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/win-update.json)
+            - Android manifest: [`apk-update.json`](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/apk-update.json)
           files: |
             dist/Kurfanova-Muzik.apk
             dist/apk-update.json
