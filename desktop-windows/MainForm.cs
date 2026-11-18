@@ -164,6 +164,9 @@ public sealed class MainForm : Form
     [DllImport("shell32.dll", SetLastError = true)]
     private static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string appId);
 
+    [DllImport("shell32.dll")]
+    private static extern void SHChangeNotify(int wEventId, uint uFlags, IntPtr dwItem1, IntPtr dwItem2);
+
     private static Icon? LoadTrayIconForCurrentDpi()
     {
         try
@@ -205,11 +208,44 @@ public sealed class MainForm : Form
         }
     }
 
+    private void SyncInstalledIconAndShortcuts()
+    {
+        try
+        {
+            using Stream? iconStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("KurfanovaMuzik.app.ico");
+            if (iconStream is null) return;
+
+            using var ms = new MemoryStream();
+            iconStream.CopyTo(ms);
+            byte[] icoBytes = ms.ToArray();
+            if (icoBytes.Length == 0) return;
+
+            string? iconDir = Path.GetDirectoryName(_paths.IconPath);
+            if (!string.IsNullOrWhiteSpace(iconDir))
+            {
+                Directory.CreateDirectory(iconDir);
+            }
+
+            bool iconChanged = !File.Exists(_paths.IconPath) || !File.ReadAllBytes(_paths.IconPath).SequenceEqual(icoBytes);
+            if (iconChanged)
+            {
+                File.WriteAllBytes(_paths.IconPath, icoBytes);
+                if (File.Exists(_paths.InstalledExePath))
+                {
+                    InstallerService.ApplyShortcutsAndRegistry(_paths, _config, AppPaths.GetNormalizedCurrentVersion());
+                }
+                SHChangeNotify(0x08000000, 0x0000, IntPtr.Zero, IntPtr.Zero);
+            }
+        }
+        catch { }
+    }
+
     private async void OnFormLoad(object? sender, EventArgs e)
     {
         try
         {
             _ = SetCurrentProcessExplicitAppUserModelID("KurfaCore.Kurfamuzik");
+            SyncInstalledIconAndShortcuts();
             ApplyTitleBarDarkMode(true);
             _engine.Start();
             InitializeTrayIcon();
