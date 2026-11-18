@@ -11,6 +11,7 @@ namespace KurfanovaMuzik;
 public sealed class MainForm : Form
 {
     private const string TargetUrl = "https://kurfanova.github.io/";
+    private const string FallbackTargetUrl = "https://kurfanova.kurfa.workers.dev/";
     private const string DesktopBridgeMode = "desktop-v1";
 
     private static readonly string[] AdFilterPatterns =
@@ -86,6 +87,7 @@ public sealed class MainForm : Form
     private Icon? _trayCroppedIcon;
     private TrayMenuForm? _trayMenu;
     private bool _darkTitleBar = true;
+    private bool _triedFallbackOrigin;
 
     public MainForm() : this(null, null)
     {
@@ -118,7 +120,7 @@ public sealed class MainForm : Form
 
         Load += OnFormLoad;
         Activated += (_, _) => ApplyTitleBarDarkMode(_darkTitleBar);
-        Resize += (_, _) => { ApplyTitleBarDarkMode(_darkTitleBar); UpdateWebViewMemoryMode(); };
+        Resize += (_, _) => UpdateWebViewMemoryMode();
         VisibleChanged += (_, _) => { if (Visible) ApplyTitleBarDarkMode(_darkTitleBar); UpdateWebViewMemoryMode(); };
         FormClosing += OnMainFormClosing;
         FormClosed += OnFormClosed;
@@ -251,10 +253,30 @@ public sealed class MainForm : Form
             core.WebMessageReceived += OnWebMessageReceived;
             core.NewWindowRequested += OnNewWindowRequested;
             core.NavigationStarting += OnNavigationStarting;
-            core.NavigationCompleted += (_, _) =>
+            core.NavigationCompleted += (_, args) =>
             {
+                if (!args.IsSuccess && args.WebErrorStatus != CoreWebView2WebErrorStatus.OperationCanceled)
+                {
+                    if (!_triedFallbackOrigin && (_webView.Source?.Host.Contains("github.io", StringComparison.OrdinalIgnoreCase) ?? true))
+                    {
+                        _triedFallbackOrigin = true;
+                        core.Navigate(FallbackTargetUrl);
+                        return;
+                    }
+                }
                 _webContentLoaded = true;
                 ReplayLatestUpdateProgress();
+            };
+            core.ProcessFailed += (_, _) =>
+            {
+                try
+                {
+                    if (!IsDisposed)
+                    {
+                        BeginInvoke(() => _webView.Reload());
+                    }
+                }
+                catch { }
             };
 
             await core.AddScriptToExecuteOnDocumentCreatedAsync(BuildBridgeInjectionScript());
@@ -816,6 +838,8 @@ public sealed class MainForm : Form
         bool? settingStartMenuShortcut = null;
         bool? settingRunOnStartup = null;
         bool? settingMinimizeToTray = null;
+        string? settingDownloadDir = null;
+        bool hasSettingDownloadDir = false;
 
         try
         {
@@ -912,6 +936,12 @@ public sealed class MainForm : Form
                     (mtEl.ValueKind == JsonValueKind.True || mtEl.ValueKind == JsonValueKind.False))
                 {
                     settingMinimizeToTray = mtEl.GetBoolean();
+                }
+                if (payload.TryGetProperty("downloadDir", out JsonElement dlDirEl) &&
+                    dlDirEl.ValueKind == JsonValueKind.String)
+                {
+                    settingDownloadDir = dlDirEl.GetString();
+                    hasSettingDownloadDir = true;
                 }
                 if (payload.TryGetProperty("key", out JsonElement keyEl) &&
                     keyEl.ValueKind == JsonValueKind.String &&
@@ -1025,6 +1055,11 @@ public sealed class MainForm : Form
 
                     case "DOWNLOAD_MEDIA":
                     {
+                        string targetDownloadDir;
+                        lock (_config)
+                        {
+                            targetDownloadDir = AppPaths.ResolveDownloadDir(_config);
+                        }
                         NativeDesktopEngine.DownloadMediaResult dlRes = await _engine.DownloadMediaToDownloadsAsync(
                             videoId,
                             downloadFormat ?? "audio",
@@ -1038,6 +1073,7 @@ public sealed class MainForm : Form
                                     percent
                                 }, targetOrigin);
                             },
+                            targetDownloadDir,
                             ct).ConfigureAwait(false);
 
                         responseObj = new
@@ -1061,9 +1097,11 @@ public sealed class MainForm : Form
                             }
                             else
                             {
-                                string downloadsDir = Path.Combine(
-                                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                                    "Downloads");
+                                string downloadsDir;
+                                lock (_config)
+                                {
+                                    downloadsDir = AppPaths.ResolveDownloadDir(_config);
+                                }
                                 Process.Start(new ProcessStartInfo("explorer.exe", $"\"{downloadsDir}\"") { UseShellExecute = true });
                             }
                             responseObj = new { success = true };
@@ -1080,16 +1118,20 @@ public sealed class MainForm : Form
                         break;
 
                     case "GET_DESKTOP_SETTINGS":
-                        responseObj = new
+                        lock (_config)
                         {
-                            success = true,
-                            version = _updater.CurrentVersion.ToString(3),
-                            installDir = _paths.InstallDir,
-                            desktopShortcut = _config.DesktopShortcut,
-                            startMenuShortcut = _config.StartMenuShortcut,
-                            runOnStartup = _config.RunOnStartup,
-                            minimizeToTray = _config.MinimizeToTray
-                        };
+                            responseObj = new
+                            {
+                                success = true,
+                                version = _updater.CurrentVersion.ToString(3),
+                                installDir = _paths.InstallDir,
+                                downloadDir = AppPaths.ResolveDownloadDir(_config),
+                                desktopShortcut = _config.DesktopShortcut,
+                                startMenuShortcut = _config.StartMenuShortcut,
+                                runOnStartup = _config.RunOnStartup,
+                                minimizeToTray = _config.MinimizeToTray
+                            };
+                        }
                         break;
 
                     case "SET_DESKTOP_SETTINGS":
@@ -1099,21 +1141,91 @@ public sealed class MainForm : Form
                             if (settingStartMenuShortcut.HasValue) _config.StartMenuShortcut = settingStartMenuShortcut.Value;
                             if (settingRunOnStartup.HasValue) _config.RunOnStartup = settingRunOnStartup.Value;
                             if (settingMinimizeToTray.HasValue) _config.MinimizeToTray = settingMinimizeToTray.Value;
+                            if (hasSettingDownloadDir)
+                            {
+                                if (string.IsNullOrWhiteSpace(settingDownloadDir))
+                                {
+                                    _config.DownloadDir = string.Empty;
+                                }
+                                else
+                                {
+                                    try
+                                    {
+                                        string resolved = Path.GetFullPath(settingDownloadDir.Trim());
+                                        Directory.CreateDirectory(resolved);
+                                        _config.DownloadDir = resolved;
+                                    }
+                                    catch
+                                    {
+                                        // Keep existing DownloadDir if custom path is invalid/unwritable
+                                    }
+                                }
+                            }
 
                             AppPaths.SaveConfig(_paths, _config);
                             InstallerService.ApplyShortcutsAndRegistry(_paths, _config, _updater.CurrentVersion);
+                            responseObj = new
+                            {
+                                success = true,
+                                version = _updater.CurrentVersion.ToString(3),
+                                installDir = _paths.InstallDir,
+                                downloadDir = AppPaths.ResolveDownloadDir(_config),
+                                desktopShortcut = _config.DesktopShortcut,
+                                startMenuShortcut = _config.StartMenuShortcut,
+                                runOnStartup = _config.RunOnStartup,
+                                minimizeToTray = _config.MinimizeToTray
+                            };
                         }
-                        responseObj = new
-                        {
-                            success = true,
-                            version = _updater.CurrentVersion.ToString(3),
-                            installDir = _paths.InstallDir,
-                            desktopShortcut = _config.DesktopShortcut,
-                            startMenuShortcut = _config.StartMenuShortcut,
-                            runOnStartup = _config.RunOnStartup,
-                            minimizeToTray = _config.MinimizeToTray
-                        };
                         break;
+
+                    case "PICK_DOWNLOAD_FOLDER":
+                    {
+                        string initialDir;
+                        lock (_config)
+                        {
+                            initialDir = AppPaths.ResolveDownloadDir(_config);
+                        }
+                        var tcs = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+                        BeginInvoke(() =>
+                        {
+                            try
+                            {
+                                using var fbd = new FolderBrowserDialog
+                                {
+                                    Description = "İndirme Klasörü Seç",
+                                    UseDescriptionForTitle = true,
+                                    SelectedPath = initialDir,
+                                    ShowNewFolderButton = true
+                                };
+                                if (fbd.ShowDialog(this) == DialogResult.OK && !string.IsNullOrWhiteSpace(fbd.SelectedPath))
+                                {
+                                    tcs.TrySetResult(fbd.SelectedPath);
+                                }
+                                else
+                                {
+                                    tcs.TrySetResult(null);
+                                }
+                            }
+                            catch
+                            {
+                                tcs.TrySetResult(null);
+                            }
+                        });
+                        string? selectedPath = await tcs.Task.ConfigureAwait(false);
+                        bool picked = !string.IsNullOrWhiteSpace(selectedPath);
+                        string effectiveDir;
+                        lock (_config)
+                        {
+                            if (picked)
+                            {
+                                _config.DownloadDir = selectedPath!;
+                                AppPaths.SaveConfig(_paths, _config);
+                            }
+                            effectiveDir = AppPaths.ResolveDownloadDir(_config);
+                        }
+                        responseObj = new { success = true, canceled = !picked, downloadDir = effectiveDir };
+                        break;
+                    }
 
                     case "OPEN_INSTALL_FOLDER":
                         try
@@ -1369,7 +1481,9 @@ public sealed class MainForm : Form
             return;
         }
 
-        if (MatchesHostOrSubdomain(host, "kurfanova.github.io") && _webView.CoreWebView2 is not null)
+        if ((MatchesHostOrSubdomain(host, "kurfanova.github.io") ||
+             MatchesHostOrSubdomain(host, "kurfanova.kurfa.workers.dev")) &&
+            _webView.CoreWebView2 is not null)
         {
             e.Handled = true;
             _webView.CoreWebView2.Navigate(uri.AbsoluteUri);
@@ -1705,7 +1819,6 @@ public sealed class MainForm : Form
     {
         try
         {
-            ShowInTaskbar = false;
             Hide();
             UpdateWebViewMemoryMode();
             if (!_trayHintShown && _trayIcon is not null)
@@ -1728,7 +1841,6 @@ public sealed class MainForm : Form
 
     private void RestoreWindow()
     {
-        ShowInTaskbar = true;
         Show();
         if (WindowState == FormWindowState.Minimized)
         {

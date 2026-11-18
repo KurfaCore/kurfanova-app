@@ -1506,6 +1506,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
         string format,
         string? preferredTitle,
         Action<long, long, int>? onProgress,
+        string? customDownloadDir = null,
         CancellationToken ct = default)
     {
         if (string.IsNullOrWhiteSpace(videoId))
@@ -1540,14 +1541,31 @@ public sealed partial class NativeDesktopEngine : IDisposable
             : (!string.IsNullOrWhiteSpace(media.Title) ? media.Title : $"Kurfamuzik_{safeId}");
         string safeFileName = SanitizeDownloadFileName(baseTitle) + ext;
 
-        string downloadsDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            "Downloads");
-        if (string.IsNullOrWhiteSpace(downloadsDir) || !Directory.Exists(downloadsDir))
+        string? downloadsDir = null;
+        if (!string.IsNullOrWhiteSpace(customDownloadDir))
         {
-            downloadsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic));
+            try
+            {
+                string candidate = Path.GetFullPath(customDownloadDir.Trim());
+                Directory.CreateDirectory(candidate);
+                downloadsDir = candidate;
+            }
+            catch
+            {
+                downloadsDir = null;
+            }
         }
-        Directory.CreateDirectory(downloadsDir);
+        if (string.IsNullOrWhiteSpace(downloadsDir))
+        {
+            downloadsDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                "Downloads");
+            if (string.IsNullOrWhiteSpace(downloadsDir) || !Directory.Exists(downloadsDir))
+            {
+                downloadsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic));
+            }
+            Directory.CreateDirectory(downloadsDir);
+        }
 
         string targetPath = ResolveUniqueDownloadPath(downloadsDir, safeFileName);
         string tempPath = targetPath + ".part";

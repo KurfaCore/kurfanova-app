@@ -85,6 +85,8 @@ public sealed class MiniPlayerForm : Form
         };
     }
 
+    protected override bool ShowWithoutActivation => true;
+
     protected override void OnDpiChanged(DpiChangedEventArgs e)
     {
         base.OnDpiChanged(e);
@@ -254,14 +256,15 @@ public sealed class MiniPlayerForm : Form
         using (var whiteBrush = new SolidBrush(Color.White))
         using (var mutedBrush = new SolidBrush(Color.FromArgb(164, 174, 194)))
         {
-            var fmt = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
+            using var fmt = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
             g.DrawString(_title, titleFont, whiteBrush, new RectangleF(94, 14, 196, 20), fmt);
             g.DrawString(_artist, artistFont, mutedBrush, new RectangleF(94, 34, 196, 16), fmt);
 
             if (_durSec > 0)
             {
                 string tStr = $"{FormatSec(_curSec)} / {FormatSec(_durSec)}";
-                g.DrawString(tStr, timeFont, mutedBrush, new RectangleF(232, 60, 86, 16), new StringFormat { Alignment = StringAlignment.Far });
+                using var timeFmt = new StringFormat { Alignment = StringAlignment.Far };
+                g.DrawString(tStr, timeFont, mutedBrush, new RectangleF(232, 60, 86, 16), timeFmt);
             }
         }
 

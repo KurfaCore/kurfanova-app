@@ -71,6 +71,7 @@ import java.util.concurrent.Executors;
 public class MainActivity extends Activity {
 
     private static final String TARGET_URL = "https://kurfanova.github.io/";
+    private static final String FALLBACK_URL = "https://kurfanova.kurfa.workers.dev/";
     private static final int REQUEST_FILE_CHOOSER = 1001;
     private static final int REQUEST_WRITE_STORAGE = 1002;
     private static final int MAX_DATA_DOWNLOAD_BYTES = 25 * 1024 * 1024;
@@ -164,8 +165,10 @@ public class MainActivity extends Activity {
     private ValueCallback<Uri[]> fileUploadCallback;
     private PendingDownload pendingDownload;
     private volatile String pendingAudioScanRequestId = null;
-    private static final int REQUEST_READ_AUDIO = 1002;
+    private static final int REQUEST_READ_AUDIO = 1003;
     private static final String LOCAL_AUDIO_PATH_PREFIX = "/__kurfa_local_audio/";
+    private volatile String activeWebOrigin = "https://kurfanova.github.io";
+    private boolean triedFallbackUrl = false;
     private String lastFailedUrl = TARGET_URL;
     private int originalSystemUiVisibility;
     private final ExecutorService nativeExecutor = Executors.newCachedThreadPool();
@@ -190,7 +193,12 @@ public class MainActivity extends Activity {
         public void retryLoad() {
             runOnUiThread(() -> {
                 if (webView != null) {
+                    triedFallbackUrl = false;
+                    activeWebOrigin = "https://kurfanova.github.io";
                     String target = isHttpUrl(lastFailedUrl) ? lastFailedUrl : TARGET_URL;
+                    if (target.contains("kurfanova.kurfa.workers.dev")) {
+                        target = TARGET_URL;
+                    }
                     webView.loadUrl(target);
                 }
             });
@@ -260,7 +268,7 @@ public class MainActivity extends Activity {
                     if (resolved != null) {
                         res.put("success", true);
                         res.put("videoId", resolved.videoId);
-                        res.put("streamUrl", "https://kurfanova.github.io"
+                        res.put("streamUrl", activeWebOrigin
                                 + KurfaNativeEngine.NATIVE_AUDIO_PATH_PREFIX + resolved.videoId);
                         res.put("mimeType", resolved.mimeType);
                         res.put("title", resolved.title);
@@ -442,7 +450,7 @@ public class MainActivity extends Activity {
                             item.put("duration", durStr);
                             item.put("durationSec", sec);
                             item.put("mimeType", !TextUtils.isEmpty(mime) ? mime : "audio/mpeg");
-                            item.put("streamUrl", "https://kurfanova.github.io" + LOCAL_AUDIO_PATH_PREFIX + mediaId);
+                            item.put("streamUrl", activeWebOrigin + LOCAL_AUDIO_PATH_PREFIX + mediaId);
                             item.put("thumbnail", "./kurfamuzik_logo.png");
                             tracks.put(item);
                         }
@@ -756,7 +764,12 @@ public class MainActivity extends Activity {
         String scheme = uri.getScheme() != null ? uri.getScheme().toLowerCase(Locale.ROOT) : "";
 
         if ("kurfanova".equals(scheme) && "retry".equalsIgnoreCase(uri.getHost())) {
+            triedFallbackUrl = false;
+            activeWebOrigin = "https://kurfanova.github.io";
             String target = isHttpUrl(lastFailedUrl) ? lastFailedUrl : TARGET_URL;
+            if (target.contains("kurfanova.kurfa.workers.dev")) {
+                target = TARGET_URL;
+            }
             if (webView != null) {
                 webView.loadUrl(target);
             }
@@ -1417,10 +1430,33 @@ public class MainActivity extends Activity {
             if ("net::ERR_ABORTED".equalsIgnoreCase(desc)) {
                 return;
             }
+            if (!triedFallbackUrl && urlString.contains("kurfanova.github.io")) {
+                triedFallbackUrl = true;
+                activeWebOrigin = "https://kurfanova.kurfa.workers.dev";
+                lastFailedUrl = FALLBACK_URL;
+                view.loadUrl(FALLBACK_URL);
+                return;
+            }
             lastFailedUrl = urlString;
             hideCustomView();
             int code = error != null ? error.getErrorCode() : ERROR_UNKNOWN;
             showOfflineErrorPage(view, code, desc);
+        }
+
+        @Override
+        public void onReceivedHttpError(WebView view, WebResourceRequest request, WebResourceResponse errorResponse) {
+            if (request == null || !request.isForMainFrame() || request.getUrl() == null || errorResponse == null) {
+                return;
+            }
+            if (errorResponse.getStatusCode() >= 500) {
+                String urlString = request.getUrl().toString();
+                if (!triedFallbackUrl && urlString.contains("kurfanova.github.io")) {
+                    triedFallbackUrl = true;
+                    activeWebOrigin = "https://kurfanova.kurfa.workers.dev";
+                    lastFailedUrl = FALLBACK_URL;
+                    view.loadUrl(FALLBACK_URL);
+                }
+            }
         }
     }
 
@@ -1508,8 +1544,20 @@ public class MainActivity extends Activity {
             hideCustomView();
             return;
         }
-        if (webView != null && webView.canGoBack()) {
-            webView.goBack();
+        if (webView != null) {
+            webView.evaluateJavascript(
+                    "(function(){try{return !!(window.__kurfaHandleNativeBack&&window.__kurfaHandleNativeBack());}catch(e){return false;}})();",
+                    value -> {
+                        if ("true".equals(value)) {
+                            return;
+                        }
+                        if (webView != null && webView.canGoBack()) {
+                            webView.goBack();
+                        } else if (!isFinishing() && !isDestroyed()) {
+                            MainActivity.super.onBackPressed();
+                        }
+                    }
+            );
         } else {
             super.onBackPressed();
         }

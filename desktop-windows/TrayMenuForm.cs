@@ -90,6 +90,11 @@ internal sealed class TrayMenuForm : Form
         _hoverIndex = -1;
 
         Point cursor = Cursor.Position;
+        Location = new Point(cursor.X, cursor.Y);
+        if (!IsHandleCreated)
+        {
+            CreateHandle();
+        }
         Screen screen = Screen.FromPoint(cursor);
         int dpi = DeviceDpi > 0 ? DeviceDpi : 96;
         UpdateMetricsForDpi(dpi);
@@ -114,11 +119,11 @@ internal sealed class TrayMenuForm : Form
         Size = new Size(totalW, totalH);
         Location = new Point(x, y);
 
+        RenderLayered();
         if (!Visible)
         {
             Show();
         }
-        RenderLayered();
         Activate();
     }
 
@@ -324,7 +329,7 @@ internal sealed class TrayMenuForm : Form
             g.DrawPath(pillBorder, pillPath);
         }
         using var brushMuted = new SolidBrush(Color.FromArgb(161, 161, 178));
-        var sfCenter = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+        using var sfCenter = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
         g.DrawString(_versionLabel, fontVer, brushMuted, new RectangleF(pillRect.X, pillRect.Y + 0.5f, pillRect.Width, pillRect.Height), sfCenter);
 
         // First separator
@@ -380,7 +385,7 @@ internal sealed class TrayMenuForm : Form
 
         using var fontItem = new Font("Segoe UI", 9.25F, danger ? FontStyle.Bold : FontStyle.Regular);
         using var textBrush = new SolidBrush(fg);
-        var sf = new StringFormat { LineAlignment = StringAlignment.Center };
+        using var sf = new StringFormat { LineAlignment = StringAlignment.Center };
         var textRect = new RectangleF(ix + iconSize + S(10), rect.Y, rect.Width - (iconSize + S(24)), rect.Height);
         g.DrawString(label, fontItem, textBrush, textRect, sf);
     }

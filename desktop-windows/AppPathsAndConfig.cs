@@ -11,6 +11,7 @@ namespace KurfanovaMuzik;
 public sealed class DesktopAppConfig
 {
     public string InstallDir { get; set; } = string.Empty;
+    public string DownloadDir { get; set; } = string.Empty;
     public bool DesktopShortcut { get; set; } = true;
     public bool StartMenuShortcut { get; set; } = true;
     public bool RunOnStartup { get; set; } = false;
@@ -45,6 +46,55 @@ public sealed class AppPaths
 
     public static string DefaultInstallDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KurfanovaMuzik");
+
+    public static string ResolveDownloadDir(DesktopAppConfig? cfg)
+    {
+        if (!string.IsNullOrWhiteSpace(cfg?.DownloadDir))
+        {
+            try
+            {
+                string custom = Path.GetFullPath(cfg.DownloadDir.Trim());
+                Directory.CreateDirectory(custom);
+                return custom;
+            }
+            catch
+            {
+                // Fall back to user Downloads if configured path is invalid or inaccessible
+            }
+        }
+
+        string downloads = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "Downloads");
+        if (!string.IsNullOrWhiteSpace(downloads))
+        {
+            try
+            {
+                Directory.CreateDirectory(downloads);
+                return downloads;
+            }
+            catch
+            {
+                // Fall back to MyMusic if Downloads is unavailable
+            }
+        }
+
+        string music = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
+        if (!string.IsNullOrWhiteSpace(music))
+        {
+            try
+            {
+                Directory.CreateDirectory(music);
+            }
+            catch
+            {
+                // Ignore creation errors on fallback path
+            }
+            return music;
+        }
+
+        return Path.GetTempPath();
+    }
 
     public static string ResolveActiveInstallDir()
     {
