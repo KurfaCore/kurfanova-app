@@ -2001,6 +2001,23 @@ public sealed class MainForm : Form
         RestoreWindow();
     }
 
+    public void ForceExitForInstaller()
+    {
+        _allowExit = true;
+        Close();
+    }
+
+    protected override void WndProc(ref Message m)
+    {
+        const int WM_QUERYENDSESSION = 0x0011;
+        const int WM_ENDSESSION = 0x0016;
+        if (m.Msg == WM_QUERYENDSESSION || m.Msg == WM_ENDSESSION)
+        {
+            _allowExit = true;
+        }
+        base.WndProc(ref m);
+    }
+
     private void RestoreWindow()
     {
         Show();

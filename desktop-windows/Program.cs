@@ -46,7 +46,7 @@ internal static class Program
             var sampleExisting = new ExistingInstallInfo(
                 Found: true,
                 PreviousInstallDir: AppPaths.DefaultInstallDir,
-                ExistingExePath: Path.Combine(AppPaths.DefaultInstallDir, "KurfanovaMuzik.exe"),
+                ExistingExePath: Path.Combine(AppPaths.DefaultInstallDir, "Kurfanova-Muzik-Windows.exe"),
                 ExistingVersion: "1.1.16",
                 ExtraOldCopyPaths: [],
                 RunningOtherProcesses: 0);
@@ -55,7 +55,24 @@ internal static class Program
             return;
         }
 
-        // 1. Handle uninstallation
+        // 1. Handle temp-helper uninstallation cleanup (pure C#, no cmd/powershell)
+        int cleanupIdx = Array.FindIndex(args, a => string.Equals(a, "--uninstall-cleanup", StringComparison.OrdinalIgnoreCase));
+        if (cleanupIdx >= 0 && cleanupIdx + 1 < args.Length)
+        {
+            string targetDir = args[cleanupIdx + 1];
+            int waitPid = 0;
+            int pidIdx = Array.FindIndex(args, a => string.Equals(a, "--pid", StringComparison.OrdinalIgnoreCase));
+            if (pidIdx >= 0 && pidIdx + 1 < args.Length)
+            {
+                int.TryParse(args[pidIdx + 1], out waitPid);
+            }
+            bool purge = args.Any(a => string.Equals(a, "--purge", StringComparison.OrdinalIgnoreCase));
+            bool silentCleanup = args.Any(a => string.Equals(a, "--silent", StringComparison.OrdinalIgnoreCase));
+            InstallerService.RunUninstallCleanupHelper(targetDir, waitPid, purge, silentCleanup);
+            return;
+        }
+
+        // 2. Handle uninstallation
         if (args.Any(a => string.Equals(a, "--uninstall", StringComparison.OrdinalIgnoreCase)))
         {
             bool silent = args.Any(a => string.Equals(a, "--silent", StringComparison.OrdinalIgnoreCase));
@@ -171,6 +188,10 @@ internal static class Program
                     if (string.Equals(msg, "ACTIVATE", StringComparison.OrdinalIgnoreCase) && !form.IsDisposed && form.IsHandleCreated)
                     {
                         form.BeginInvoke(form.BringExistingWindowToFront);
+                    }
+                    else if (string.Equals(msg, "QUIT", StringComparison.OrdinalIgnoreCase) && !form.IsDisposed && form.IsHandleCreated)
+                    {
+                        form.BeginInvoke(form.ForceExitForInstaller);
                     }
                 }
                 catch

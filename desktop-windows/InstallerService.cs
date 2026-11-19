@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.IO;
+using System.IO.Pipes;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
@@ -257,6 +258,20 @@ public static class InstallerService
 
     public static void StopOtherRunningInstances()
     {
+        // Ask any active main instance to exit cleanly first so WebView2 releases file handles gracefully
+        if (CountOtherRunningInstances() > 0)
+        {
+            try
+            {
+                using var client = new NamedPipeClientStream(".", "KurfamuzikDesktopActivatePipe", PipeDirection.Out);
+                client.Connect(400);
+                using var writer = new StreamWriter(client) { AutoFlush = true };
+                writer.WriteLine("QUIT");
+                Thread.Sleep(500);
+            }
+            catch { }
+        }
+
         int myPid = Environment.ProcessId;
         foreach (string procName in KnownProcessNames)
         {
@@ -268,19 +283,22 @@ public static class InstallerService
                     {
                         if (p.Id == myPid) continue;
 
-                        try
+                        if (!p.HasExited)
                         {
-                            if (p.CloseMainWindow())
+                            try
                             {
-                                p.WaitForExit(1500);
+                                if (p.CloseMainWindow())
+                                {
+                                    p.WaitForExit(1200);
+                                }
                             }
+                            catch { }
                         }
-                        catch { }
 
                         if (!p.HasExited)
                         {
-                            p.Kill();
-                            p.WaitForExit(3000);
+                            p.Kill(entireProcessTree: true);
+                            p.WaitForExit(4000);
                         }
                     }
                     catch { }
@@ -632,15 +650,16 @@ public static class InstallerService
             }
             else
             {
-                bool hasExistingStartupVal = false;
-                using (RegistryKey? readRunKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: false))
-                {
-                    hasExistingStartupVal = readRunKey?.GetValue(StartupRegValueName) is not null;
-                }
-                if (hasExistingStartupVal)
+                string[] runNames = [StartupRegValueName, "KurfanovaMuzik", "Kurfamuzik", "Kurfanova Müzik"];
+                using RegistryKey? readRunKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: false);
+                bool anyExists = runNames.Any(n => readRunKey?.GetValue(n) is not null);
+                if (anyExists)
                 {
                     using RegistryKey? writeRunKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: true);
-                    writeRunKey?.DeleteValue(StartupRegValueName, throwOnMissingValue: false);
+                    foreach (string name in runNames)
+                    {
+                        writeRunKey?.DeleteValue(name, throwOnMissingValue: false);
+                    }
                 }
             }
         }
@@ -756,11 +775,28 @@ public static class InstallerService
 
     public static void RunUninstall(bool silent)
     {
+        string innoUninstaller = Path.Combine(AppContext.BaseDirectory, "unins000.exe");
+        if (File.Exists(innoUninstaller))
+        {
+            try
+            {
+                Process.Start(new ProcessStartInfo(innoUninstaller)
+                {
+                    Arguments = silent ? "/VERYSILENT /SUPPRESSMSGBOXES" : string.Empty,
+                    WorkingDirectory = AppContext.BaseDirectory,
+                    UseShellExecute = true
+                });
+            }
+            catch { }
+            Environment.Exit(0);
+            return;
+        }
+
         bool purgeData = false;
         if (!silent)
         {
             DialogResult confirm = MessageBox.Show(
-                "Kurfamüzik masaüstü uygulaması bilgisayardan kaldırılsın mı?",
+                "Kurfamüzik bilgisayarınızdan kaldırılsın mı?",
                 "Kurfamüzik Kaldır",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question);
@@ -768,7 +804,7 @@ public static class InstallerService
             if (confirm != DialogResult.Yes) return;
 
             DialogResult purgeChoice = MessageBox.Show(
-                "Favori ve ayar önbellek verileri de silinsin mi?\n\n('Hayır' seçerseniz gelecekte yeniden kurduğunuzda verileriniz korunur.)",
+                "Favoriler, çalma listeleri ve ayarlar (user-data.json) da silinsin mi?\n\n('Hayır' seçerseniz gelecekte yeniden kurduğunuzda verileriniz korunur.)",
                 "Veri Temizleme",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Question);
@@ -781,84 +817,59 @@ public static class InstallerService
         string activeInstallDir = AppPaths.ResolveActiveInstallDir();
         var paths = new AppPaths(activeInstallDir);
 
-        try
-        {
-            string desktopLnk = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory), DesktopShortcutFileName);
-            if (File.Exists(desktopLnk)) File.Delete(desktopLnk);
-        }
-        catch { }
+        DeleteKnownShortcutsAndRegistry();
 
-        try
-        {
-            string startMenuDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Programs), "Kurfamüzik");
-            if (Directory.Exists(startMenuDir)) Directory.Delete(startMenuDir, recursive: true);
-        }
-        catch { }
+        CleanupDirectoryArtifacts(paths, purgeData);
 
-        try
+        string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        string legacyProgramsDir = Path.Combine(localAppData, "Programs", "KurfanovaMuzik");
+        if (Directory.Exists(legacyProgramsDir) &&
+            !string.Equals(Path.GetFullPath(legacyProgramsDir), paths.InstallDir, StringComparison.OrdinalIgnoreCase))
         {
-            using RegistryKey? readRunKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: false);
-            if (readRunKey?.GetValue(StartupRegValueName) is not null)
+            try { Directory.Delete(legacyProgramsDir, recursive: true); } catch { }
+        }
+
+        // Self-delete running single-file EXE cleanly via %TEMP% pure C# helper (no cmd/powershell)
+        string? currentExe = Environment.ProcessPath;
+        bool isSingleFile = !File.Exists(Path.Combine(AppContext.BaseDirectory, "Kurfanova-Muzik-Windows.dll"));
+        if (!string.IsNullOrWhiteSpace(currentExe) && File.Exists(currentExe) && isSingleFile)
+        {
+            try
             {
-                using RegistryKey? writeRunKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: true);
-                writeRunKey?.DeleteValue(StartupRegValueName, throwOnMissingValue: false);
+                string tempHelper = Path.Combine(Path.GetTempPath(), $"kurfamuzik_uninst_{Guid.NewGuid():N}.exe");
+                File.Copy(currentExe, tempHelper, overwrite: true);
+                string args = $"--uninstall-cleanup \"{paths.InstallDir}\" --pid {Environment.ProcessId}";
+                if (purgeData) args += " --purge";
+                if (silent) args += " --silent";
+
+                Process.Start(new ProcessStartInfo(tempHelper)
+                {
+                    Arguments = args,
+                    WorkingDirectory = Path.GetTempPath(),
+                    UseShellExecute = false
+                });
+
+                Environment.Exit(0);
+                return;
+            }
+            catch
+            {
+                // Fallback below if %TEMP% execution is blocked
             }
         }
-        catch { }
 
-        try
+        TryDeleteOrScheduleExe(paths.InstalledExePath);
+        if (!string.IsNullOrWhiteSpace(currentExe) &&
+            !string.Equals(currentExe, paths.InstalledExePath, StringComparison.OrdinalIgnoreCase))
         {
-            Registry.CurrentUser.DeleteSubKeyTree(UninstallRegKey, throwOnMissingSubKey: false);
+            TryDeleteOrScheduleExe(currentExe);
         }
-        catch { }
 
         try
         {
-            Registry.CurrentUser.DeleteSubKeyTree(RegistryBrandKey, throwOnMissingSubKey: false);
-        }
-        catch { }
-
-        try
-        {
-            if (Directory.Exists(paths.InstallDir))
+            if (Directory.Exists(paths.InstallDir) && Directory.GetFileSystemEntries(paths.InstallDir).Length == 0)
             {
-                try { if (File.Exists(paths.IconPath)) File.Delete(paths.IconPath); } catch { }
-                try { if (File.Exists(paths.ConfigPath)) File.Delete(paths.ConfigPath); } catch { }
-                try { if (Directory.Exists(paths.UpdatesDir)) Directory.Delete(paths.UpdatesDir, recursive: true); } catch { }
-                try { if (Directory.Exists(paths.LogsDir)) Directory.Delete(paths.LogsDir, recursive: true); } catch { }
-
-                if (purgeData && Directory.Exists(paths.DataDir))
-                {
-                    try { Directory.Delete(paths.DataDir, recursive: true); } catch { }
-                }
-
-                if (File.Exists(paths.InstalledExePath))
-                {
-                    try
-                    {
-                        File.Delete(paths.InstalledExePath);
-                    }
-                    catch
-                    {
-                        // Running executable can be renamed into Temp and marked for OS cleanup without external scripts
-                        try
-                        {
-                            string tempOld = Path.Combine(Path.GetTempPath(), $"kurfa_uninst_{Guid.NewGuid():N}.old");
-                            File.Move(paths.InstalledExePath, tempOld, overwrite: true);
-                            MoveFileEx(tempOld, null, MOVEFILE_DELAY_UNTIL_REBOOT);
-                        }
-                        catch { }
-                    }
-                }
-
-                try
-                {
-                    if (Directory.GetFileSystemEntries(paths.InstallDir).Length == 0)
-                    {
-                        Directory.Delete(paths.InstallDir, recursive: false);
-                    }
-                }
-                catch { }
+                Directory.Delete(paths.InstallDir, recursive: false);
             }
         }
         catch { }
@@ -873,6 +884,209 @@ public static class InstallerService
         }
 
         Environment.Exit(0);
+    }
+
+    public static void RunUninstallCleanupHelper(string targetDir, int waitPid, bool purgeData, bool silent)
+    {
+        if (waitPid > 0 && waitPid != Environment.ProcessId)
+        {
+            try
+            {
+                using var parent = Process.GetProcessById(waitPid);
+                parent.WaitForExit(6000);
+            }
+            catch { }
+        }
+
+        StopOtherRunningInstances();
+
+        if (!string.IsNullOrWhiteSpace(targetDir) && Directory.Exists(targetDir))
+        {
+            var paths = new AppPaths(targetDir);
+            for (int attempt = 0; attempt < 12; attempt++)
+            {
+                CleanupDirectoryArtifacts(paths, purgeData);
+                foreach (string exeName in new[] { "Kurfanova-Muzik-Windows.exe", "KurfanovaMuzik.exe" })
+                {
+                    string exePath = Path.Combine(paths.InstallDir, exeName);
+                    if (File.Exists(exePath))
+                    {
+                        try { File.Delete(exePath); } catch { }
+                    }
+                }
+
+                try
+                {
+                    if (!Directory.Exists(paths.InstallDir)) break;
+                    if (purgeData)
+                    {
+                        Directory.Delete(paths.InstallDir, recursive: true);
+                        break;
+                    }
+                    if (Directory.GetFileSystemEntries(paths.InstallDir).Length == 0)
+                    {
+                        Directory.Delete(paths.InstallDir, recursive: false);
+                        break;
+                    }
+                }
+                catch { }
+
+                Thread.Sleep(250);
+            }
+
+            if (Directory.Exists(paths.InstallDir))
+            {
+                foreach (string exeName in new[] { "Kurfanova-Muzik-Windows.exe", "KurfanovaMuzik.exe" })
+                {
+                    TryDeleteOrScheduleExe(Path.Combine(paths.InstallDir, exeName));
+                }
+            }
+        }
+
+        string? selfPath = Environment.ProcessPath;
+        if (!string.IsNullOrWhiteSpace(selfPath) && File.Exists(selfPath))
+        {
+            try { MoveFileEx(selfPath, null, MOVEFILE_DELAY_UNTIL_REBOOT); } catch { }
+        }
+
+        if (!silent)
+        {
+            MessageBox.Show(
+                "Kurfamüzik başarıyla kaldırıldı.",
+                "Kurfamüzik Kaldırıldı",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
+        }
+
+        Environment.Exit(0);
+    }
+
+    private static void DeleteKnownShortcutsAndRegistry()
+    {
+        try
+        {
+            string desktopDir = Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory);
+            foreach (string lnkName in new[] { DesktopShortcutFileName, "Kurfanova Müzik.lnk", "KurfanovaMuzik.lnk" })
+            {
+                string lnkPath = Path.Combine(desktopDir, lnkName);
+                if (File.Exists(lnkPath))
+                {
+                    try { File.Delete(lnkPath); } catch { }
+                }
+            }
+        }
+        catch { }
+
+        try
+        {
+            string programsDir = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
+            foreach (string groupName in new[] { "Kurfamüzik", "Kurfanova Müzik", "KurfanovaMuzik" })
+            {
+                string startMenuDir = Path.Combine(programsDir, groupName);
+                if (Directory.Exists(startMenuDir))
+                {
+                    try { Directory.Delete(startMenuDir, recursive: true); } catch { }
+                }
+            }
+        }
+        catch { }
+
+        try
+        {
+            using RegistryKey? writeRunKey = Registry.CurrentUser.OpenSubKey(RunRegKey, writable: true);
+            if (writeRunKey is not null)
+            {
+                foreach (string valName in new[] { StartupRegValueName, "KurfanovaMuzik", "Kurfamuzik", "Kurfanova Müzik" })
+                {
+                    writeRunKey.DeleteValue(valName, throwOnMissingValue: false);
+                }
+            }
+        }
+        catch { }
+
+        try { Registry.CurrentUser.DeleteSubKeyTree(UninstallRegKey, throwOnMissingSubKey: false); } catch { }
+        try { Registry.CurrentUser.DeleteSubKeyTree(RegistryBrandKey, throwOnMissingSubKey: false); } catch { }
+    }
+
+    private static void CleanupDirectoryArtifacts(AppPaths paths, bool purgeData)
+    {
+        if (!Directory.Exists(paths.InstallDir)) return;
+
+        try
+        {
+            try { if (File.Exists(paths.IconPath)) File.Delete(paths.IconPath); } catch { }
+            try { if (Directory.Exists(paths.UpdatesDir)) Directory.Delete(paths.UpdatesDir, recursive: true); } catch { }
+            try { if (Directory.Exists(paths.LogsDir)) Directory.Delete(paths.LogsDir, recursive: true); } catch { }
+
+            string legacyLowerUpdates = Path.Combine(paths.InstallDir, "updates");
+            if (Directory.Exists(legacyLowerUpdates))
+            {
+                try { Directory.Delete(legacyLowerUpdates, recursive: true); } catch { }
+            }
+
+            string legacyFlatWebView2 = Path.Combine(paths.InstallDir, "WebView2");
+            if (Directory.Exists(legacyFlatWebView2))
+            {
+                try { Directory.Delete(legacyFlatWebView2, recursive: true); } catch { }
+            }
+
+            if (Directory.Exists(paths.WebView2DataDir))
+            {
+                try { Directory.Delete(paths.WebView2DataDir, recursive: true); } catch { }
+            }
+
+            if (purgeData)
+            {
+                try { if (File.Exists(paths.ConfigPath)) File.Delete(paths.ConfigPath); } catch { }
+                try { if (File.Exists(paths.UserDataPath)) File.Delete(paths.UserDataPath); } catch { }
+                try { if (Directory.Exists(paths.DataDir)) Directory.Delete(paths.DataDir, recursive: true); } catch { }
+            }
+            else
+            {
+                try { if (File.Exists(paths.ConfigPath)) File.Delete(paths.ConfigPath); } catch { }
+                if (Directory.Exists(paths.DataDir) && Directory.GetFileSystemEntries(paths.DataDir).Length == 0)
+                {
+                    try { Directory.Delete(paths.DataDir, recursive: false); } catch { }
+                }
+            }
+
+            foreach (string file in Directory.EnumerateFiles(paths.InstallDir))
+            {
+                string name = Path.GetFileName(file);
+                if (!purgeData && name.Equals("user-data.json", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+                if (name.EndsWith(".log", StringComparison.OrdinalIgnoreCase) ||
+                    name.EndsWith(".tmp", StringComparison.OrdinalIgnoreCase) ||
+                    name.EndsWith(".old", StringComparison.OrdinalIgnoreCase) ||
+                    name.EndsWith(".bak", StringComparison.OrdinalIgnoreCase) ||
+                    name.EndsWith(".part", StringComparison.OrdinalIgnoreCase))
+                {
+                    try { File.Delete(file); } catch { }
+                }
+            }
+        }
+        catch { }
+    }
+
+    private static void TryDeleteOrScheduleExe(string exePath)
+    {
+        if (string.IsNullOrWhiteSpace(exePath) || !File.Exists(exePath)) return;
+        try
+        {
+            File.Delete(exePath);
+        }
+        catch
+        {
+            try
+            {
+                string tempOld = Path.Combine(Path.GetTempPath(), $"kurfa_uninst_{Guid.NewGuid():N}.old");
+                File.Move(exePath, tempOld, overwrite: true);
+                MoveFileEx(tempOld, null, MOVEFILE_DELAY_UNTIL_REBOOT);
+            }
+            catch { }
+        }
     }
 
     private static void CopyDirectory(string sourceDir, string destinationDir)

@@ -40,12 +40,17 @@ public sealed class AppPaths
     {
         get
         {
-            string innoExe = Path.Combine(InstallDir, "Kurfanova-Muzik-Windows.exe");
-            if (IsInnoSetupInstalled && File.Exists(innoExe))
+            string primaryExe = Path.Combine(InstallDir, "Kurfanova-Muzik-Windows.exe");
+            if (File.Exists(primaryExe))
             {
-                return innoExe;
+                return primaryExe;
             }
-            return Path.Combine(InstallDir, "KurfanovaMuzik.exe");
+            string legacyExe = Path.Combine(InstallDir, "KurfanovaMuzik.exe");
+            if (File.Exists(legacyExe))
+            {
+                return legacyExe;
+            }
+            return primaryExe;
         }
     }
     public string IconPath => Path.Combine(InstallDir, "kurfanova.ico");
@@ -174,12 +179,40 @@ public sealed class AppPaths
             // Ignore corrupted config read and create default
         }
 
+        bool defaultDesktop = true;
+        bool defaultStartMenu = true;
+        bool defaultStartup = false;
+
+        if (IsInnoSetupInstalled)
+        {
+            try
+            {
+                string desktopLnk = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory),
+                    "Kurfamüzik.lnk");
+                defaultDesktop = File.Exists(desktopLnk);
+
+                string startMenuDir = Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.Programs),
+                    "Kurfamüzik");
+                defaultStartMenu = Directory.Exists(startMenuDir);
+
+                using RegistryKey? runKey = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\Run", writable: false);
+                defaultStartup = runKey?.GetValue("Kurfamüzik") is not null;
+            }
+            catch
+            {
+                // Keep sensible defaults if probing fails
+            }
+        }
+
         return new DesktopAppConfig
         {
             InstallDir = paths.InstallDir,
-            DesktopShortcut = true,
-            StartMenuShortcut = true,
-            RunOnStartup = false,
+            DesktopShortcut = defaultDesktop,
+            StartMenuShortcut = defaultStartMenu,
+            RunOnStartup = defaultStartup,
             Language = "tr",
             InstalledVersion = currentVersion.ToString(3),
             UpdatedAt = DateTimeOffset.UtcNow
