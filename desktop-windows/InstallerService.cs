@@ -592,13 +592,26 @@ public static class InstallerService
                 paths.IconPath,
                 "Kurfamüzik — Reklamsız Masaüstü Uygulaması");
 
-            CreateShortcutNative(
-                startMenuUninstallLnk,
-                paths.InstalledExePath,
-                paths.InstallDir,
-                paths.IconPath,
-                "Kurfamüzik Masaüstü Uygulamasını Kaldır",
-                "--uninstall");
+            string innoUninstaller = Path.Combine(paths.InstallDir, "unins000.exe");
+            if (AppPaths.IsInnoSetupInstalled && File.Exists(innoUninstaller))
+            {
+                CreateShortcutNative(
+                    startMenuUninstallLnk,
+                    innoUninstaller,
+                    paths.InstallDir,
+                    paths.IconPath,
+                    "Kurfamüzik Masaüstü Uygulamasını Kaldır");
+            }
+            else
+            {
+                CreateShortcutNative(
+                    startMenuUninstallLnk,
+                    paths.InstalledExePath,
+                    paths.InstallDir,
+                    paths.IconPath,
+                    "Kurfamüzik Masaüstü Uygulamasını Kaldır",
+                    "--uninstall");
+            }
         }
         else
         {
@@ -643,37 +656,57 @@ public static class InstallerService
         }
         catch { }
 
-        try
+        if (!AppPaths.IsInnoSetupInstalled)
         {
-            using RegistryKey uninstKey = Registry.CurrentUser.CreateSubKey(UninstallRegKey, writable: true);
-            uninstKey.SetValue("DisplayName", AppDisplayName);
-            uninstKey.SetValue("DisplayVersion", currentVer.ToString(3));
-            uninstKey.SetValue("Publisher", "KurfaCore");
-            uninstKey.SetValue("DisplayIcon", paths.IconPath);
-            uninstKey.SetValue("InstallLocation", paths.InstallDir);
-            uninstKey.SetValue("UninstallString", $"\"{paths.InstalledExePath}\" --uninstall");
-            uninstKey.SetValue("QuietUninstallString", $"\"{paths.InstalledExePath}\" --uninstall --silent");
-            uninstKey.SetValue("NoModify", 1, RegistryValueKind.DWord);
-            uninstKey.SetValue("NoRepair", 1, RegistryValueKind.DWord);
-
-            long sizeInKb = 0;
-            if (File.Exists(paths.InstalledExePath))
+            try
             {
-                try
+                using RegistryKey uninstKey = Registry.CurrentUser.CreateSubKey(UninstallRegKey, writable: true);
+                uninstKey.SetValue("DisplayName", AppDisplayName);
+                uninstKey.SetValue("DisplayVersion", currentVer.ToString(3));
+                uninstKey.SetValue("Publisher", "KurfaCore");
+                uninstKey.SetValue("DisplayIcon", paths.IconPath);
+                uninstKey.SetValue("InstallLocation", paths.InstallDir);
+                uninstKey.SetValue("UninstallString", $"\"{paths.InstalledExePath}\" --uninstall");
+                uninstKey.SetValue("QuietUninstallString", $"\"{paths.InstalledExePath}\" --uninstall --silent");
+                uninstKey.SetValue("NoModify", 1, RegistryValueKind.DWord);
+                uninstKey.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+
+                long sizeInKb = 0;
+                if (File.Exists(paths.InstalledExePath))
                 {
-                    sizeInKb = new FileInfo(paths.InstalledExePath).Length / 1024;
+                    try
+                    {
+                        sizeInKb = new FileInfo(paths.InstalledExePath).Length / 1024;
+                    }
+                    catch { }
                 }
-                catch { }
+                uninstKey.SetValue("EstimatedSize", (int)Math.Max(1024, sizeInKb), RegistryValueKind.DWord);
             }
-            uninstKey.SetValue("EstimatedSize", (int)Math.Max(1024, sizeInKb), RegistryValueKind.DWord);
+            catch { }
         }
-        catch { }
     }
 
     public static void SyncMetadataOnLaunch(AppPaths paths, DesktopAppConfig cfg, Version currentVer)
     {
         try
         {
+            if (AppPaths.IsInnoSetupInstalled)
+            {
+                // Migrate user-data.json from legacy %LocalAppData%\KurfanovaMuzik once if present
+                try
+                {
+                    var legacyPaths = new AppPaths(AppPaths.DefaultInstallDir);
+                    if (!string.Equals(legacyPaths.InstallDir, paths.InstallDir, StringComparison.OrdinalIgnoreCase) &&
+                        !File.Exists(paths.UserDataPath) &&
+                        File.Exists(legacyPaths.UserDataPath))
+                    {
+                        Directory.CreateDirectory(paths.InstallDir);
+                        File.Copy(legacyPaths.UserDataPath, paths.UserDataPath, overwrite: false);
+                    }
+                }
+                catch { }
+            }
+
             string verStr = currentVer.ToString(3);
             bool versionChanged = !string.Equals(cfg.InstalledVersion, verStr, StringComparison.OrdinalIgnoreCase);
 
@@ -692,26 +725,29 @@ public static class InstallerService
                 brandKey.SetValue("UpdatedAt", DateTimeOffset.UtcNow.ToString("O"));
             }
 
-            using (RegistryKey uninstKey = Registry.CurrentUser.CreateSubKey(UninstallRegKey, writable: true))
+            if (!AppPaths.IsInnoSetupInstalled)
             {
-                uninstKey.SetValue("DisplayName", AppDisplayName);
-                uninstKey.SetValue("DisplayVersion", verStr);
-                uninstKey.SetValue("Publisher", "KurfaCore");
-                uninstKey.SetValue("DisplayIcon", paths.IconPath);
-                uninstKey.SetValue("InstallLocation", paths.InstallDir);
-                uninstKey.SetValue("UninstallString", $"\"{paths.InstalledExePath}\" --uninstall");
-                uninstKey.SetValue("QuietUninstallString", $"\"{paths.InstalledExePath}\" --uninstall --silent");
-                uninstKey.SetValue("NoModify", 1, RegistryValueKind.DWord);
-                uninstKey.SetValue("NoRepair", 1, RegistryValueKind.DWord);
-
-                if (File.Exists(paths.InstalledExePath))
+                using (RegistryKey uninstKey = Registry.CurrentUser.CreateSubKey(UninstallRegKey, writable: true))
                 {
-                    try
+                    uninstKey.SetValue("DisplayName", AppDisplayName);
+                    uninstKey.SetValue("DisplayVersion", verStr);
+                    uninstKey.SetValue("Publisher", "KurfaCore");
+                    uninstKey.SetValue("DisplayIcon", paths.IconPath);
+                    uninstKey.SetValue("InstallLocation", paths.InstallDir);
+                    uninstKey.SetValue("UninstallString", $"\"{paths.InstalledExePath}\" --uninstall");
+                    uninstKey.SetValue("QuietUninstallString", $"\"{paths.InstalledExePath}\" --uninstall --silent");
+                    uninstKey.SetValue("NoModify", 1, RegistryValueKind.DWord);
+                    uninstKey.SetValue("NoRepair", 1, RegistryValueKind.DWord);
+
+                    if (File.Exists(paths.InstalledExePath))
                     {
-                        long sizeInKb = new FileInfo(paths.InstalledExePath).Length / 1024;
-                        uninstKey.SetValue("EstimatedSize", (int)Math.Max(1024, sizeInKb), RegistryValueKind.DWord);
+                        try
+                        {
+                            long sizeInKb = new FileInfo(paths.InstalledExePath).Length / 1024;
+                            uninstKey.SetValue("EstimatedSize", (int)Math.Max(1024, sizeInKb), RegistryValueKind.DWord);
+                        }
+                        catch { }
                     }
-                    catch { }
                 }
             }
         }

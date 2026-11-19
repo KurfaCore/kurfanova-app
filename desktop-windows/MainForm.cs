@@ -223,6 +223,12 @@ public sealed class MainForm : Form
 
     private void SyncInstalledIconAndShortcuts()
     {
+        if (!AppPaths.IsInnoSetupInstalled &&
+            !AppPaths.IsProcessRunningFromInstallDir(Environment.ProcessPath, _paths))
+        {
+            return;
+        }
+
         try
         {
             using Stream? iconStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("KurfanovaMuzik.app.ico");
@@ -1728,6 +1734,11 @@ public sealed class MainForm : Form
 
     private static void OpenExternalBrowser(Uri uri)
     {
+        if (uri.Scheme != Uri.UriSchemeHttps && uri.Scheme != Uri.UriSchemeHttp)
+        {
+            return;
+        }
+
         try
         {
             Process.Start(new ProcessStartInfo(uri.AbsoluteUri)

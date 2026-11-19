@@ -69,9 +69,11 @@ internal static class Program
         bool isPortable = args.Any(a => string.Equals(a, "--portable", StringComparison.OrdinalIgnoreCase));
         bool forceSetup = args.Any(a => string.Equals(a, "--setup", StringComparison.OrdinalIgnoreCase) ||
                                         string.Equals(a, "--reinstall", StringComparison.OrdinalIgnoreCase));
+        bool isInnoInstalled = AppPaths.IsInnoSetupInstalled;
         bool isFromInstallDir = AppPaths.IsProcessRunningFromInstallDir(Environment.ProcessPath, activePaths);
+        bool effectivePortable = isPortable || (!isInnoInstalled && !isFromInstallDir);
 
-        if (isPortable || (isFromInstallDir && !forceSetup))
+        if (!forceSetup)
         {
             // Wait briefly for previous process to exit cleanly during post-update relaunch
             int postPidIdx = Array.FindIndex(args, a => string.Equals(a, "--post-update-pid", StringComparison.OrdinalIgnoreCase));
@@ -99,7 +101,7 @@ internal static class Program
             try
             {
                 var config = AppPaths.LoadOrDefaultConfig(activePaths, AppPaths.GetNormalizedCurrentVersion());
-                if (!isPortable)
+                if (!effectivePortable)
                 {
                     InstallerService.SyncMetadataOnLaunch(activePaths, config, AppPaths.GetNormalizedCurrentVersion());
                 }

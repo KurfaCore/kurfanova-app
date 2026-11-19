@@ -69,6 +69,7 @@ jobs:
           VER_NAME="1.2.${GITHUB_RUN_NUMBER}"
           SHA256=$(sha256sum dist/Kurfanova-Muzik.apk | awk '{print $1}')
           SIZE=$(stat -c%s dist/Kurfanova-Muzik.apk)
+          printf '%s  Kurfanova-Muzik.apk\n' "${SHA256}" > dist/SHA256SUMS-android.txt
           cat > dist/apk-update.json <<EOF
           {
             "versionCode": ${VER_CODE},
@@ -78,7 +79,7 @@ jobs:
             "url": "https://github.com/KurfaCore/kurfanova-app/releases/latest/download/Kurfanova-Muzik.apk"
           }
           EOF
-          ls -lh dist/Kurfanova-Muzik.apk dist/apk-update.json
+          ls -lh dist/Kurfanova-Muzik.apk dist/apk-update.json dist/SHA256SUMS-android.txt
 
       - name: Upload APK as Workflow Artifact
         uses: actions/upload-artifact@v4
@@ -87,6 +88,7 @@ jobs:
           path: |
             dist/Kurfanova-Muzik.apk
             dist/apk-update.json
+            dist/SHA256SUMS-android.txt
 
       - name: Publish GitHub Release with APK
         uses: softprops/action-gh-release@v2
@@ -99,8 +101,9 @@ jobs:
             Kurfamüzik resmi **Windows Masaüstü (x64)** ve **Android APK (`v1.2.${{ github.run_number }}`)** kurulum paketleri.
 
             ### İndirme Dosyaları
-            - **Windows:** `Kurfanova-Muzik-Windows.exe` (Windows 10 / 11 x64, tek dosya self-contained kurulum)
-            - **Android:** `Kurfanova-Muzik.apk` (Android 8.0+)
+            - **Windows Kurulum (Önerilen):** `Kurfamuzik-Setup.exe` (Windows 10 / 11 x64 Inno Setup, yönetici izni gerektirmez)
+            - **Windows Taşınabilir (Portable):** `Kurfanova-Muzik-Windows.exe` (Windows 10 / 11 x64, tek dosya)
+            - **Android:** `Kurfanova-Muzik.apk` (Android 7.0+)
 
             ### Öne Çıkan Yenilikler
             - Şeffaf arka plansız logo ve Windows 10/11 uyumlu 32-bit cam katmanlı `MiniPlayer` / tepsi menüsü
@@ -109,11 +112,14 @@ jobs:
             - Kalıcı yerel kullanıcı verisi (`user-data.json`) ve birincil sunucuya erişilemediğinde otomatik Worker yedek geçişi
             - `win-update.json` ve `apk-update.json` üzerinden SHA-256 doğrulamalı otomatik güncelleme
 
-            ### Doğrulama Manifestleri
+            ### Doğrulama & SHA-256
+            - Windows SHA-256: [`SHA256SUMS-windows.txt`](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/SHA256SUMS-windows.txt)
+            - Android SHA-256: [`SHA256SUMS-android.txt`](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/SHA256SUMS-android.txt)
             - Windows manifest: [`win-update.json`](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/win-update.json)
             - Android manifest: [`apk-update.json`](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/apk-update.json)
           files: |
             dist/Kurfanova-Muzik.apk
             dist/apk-update.json
+            dist/SHA256SUMS-android.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

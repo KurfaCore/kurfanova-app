@@ -23,14 +23,17 @@ public sealed class AutoUpdater : IDisposable
     private DateTimeOffset _lastInMemoryCheckAt = DateTimeOffset.MinValue;
     private PendingRemoteManifest? _pendingRemote;
     private string? _stagedSha256;
+    private long _stagedExpectedSize;
+    private bool _stagedIsInstaller;
     private int _applyTriggered;
 
     private sealed record PendingRemoteManifest(
         Version Version,
         string DownloadUrl,
-        string Sha256,
+        string? Sha256,
         long ExpectedSize,
-        string? Notes);
+        string? Notes,
+        bool IsInstaller);
 
     public string? StagedExePath { get; private set; }
     public Version? StagedVersion { get; private set; }
@@ -104,7 +107,7 @@ public sealed class AutoUpdater : IDisposable
             CleanupOldTempFiles();
 
             // 1. If a verified update is already staged on disk and newer than running exe, surface it right away
-            if (TryLoadExistingStaged(out Version? existingVer, out string? existingPath, out string? existingSha, out string? existingNotes) &&
+            if (TryLoadExistingStaged(out Version? existingVer, out string? existingPath, out string? existingSha, out long existingSize, out bool existingIsInstaller, out string? existingNotes) &&
                 existingVer is not null && existingPath is not null &&
                 existingVer > _currentVersion)
             {
@@ -113,6 +116,8 @@ public sealed class AutoUpdater : IDisposable
                 StagedVersion = existingVer;
                 StagedExePath = existingPath;
                 _stagedSha256 = existingSha;
+                _stagedExpectedSize = existingSize;
+                _stagedIsInstaller = existingIsInstaller;
                 ReleaseNotes = existingNotes;
                 if (emitProgressEvents)
                 {
@@ -179,16 +184,35 @@ public sealed class AutoUpdater : IDisposable
             long expectedSize = root.TryGetProperty("size", out JsonElement szEl) && szEl.ValueKind == JsonValueKind.Number
                 ? szEl.GetInt64()
                 : 0;
+            string? installerUrl = root.TryGetProperty("installerUrl", out JsonElement iuEl) && iuEl.ValueKind == JsonValueKind.String
+                ? iuEl.GetString()
+                : null;
+            string? installerSha256 = root.TryGetProperty("installerSha256", out JsonElement isEl) && isEl.ValueKind == JsonValueKind.String
+                ? isEl.GetString()?.Trim().ToLowerInvariant()
+                : null;
+            long installerSize = root.TryGetProperty("installerSize", out JsonElement iszEl) && iszEl.ValueKind == JsonValueKind.Number
+                ? iszEl.GetInt64()
+                : 0;
             string? notes = root.TryGetProperty("notes", out JsonElement nEl) && nEl.ValueKind == JsonValueKind.String
                 ? nEl.GetString()
                 : null;
 
             if (string.IsNullOrWhiteSpace(rawVersion) ||
-                string.IsNullOrWhiteSpace(downloadUrl) ||
-                string.IsNullOrWhiteSpace(expectedSha256) ||
-                expectedSha256.Length != 64 ||
                 !TryParseNormalizedVersion(rawVersion, out Version? remoteVersion) ||
                 remoteVersion is null)
+            {
+                return new UpdateCheckResult("error", _currentVersion, null, 0, null, "Sürüm verisi eksik veya bozuk.");
+            }
+
+            bool isInnoInstalled = AppPaths.IsInnoSetupInstalled;
+            bool useInstaller = isInnoInstalled && !string.IsNullOrWhiteSpace(installerUrl);
+            string? effectiveUrl = useInstaller ? installerUrl : downloadUrl;
+            string? effectiveSha256 = useInstaller ? installerSha256 : expectedSha256;
+            long effectiveSize = useInstaller ? installerSize : expectedSize;
+
+            if (string.IsNullOrWhiteSpace(effectiveUrl) ||
+                (!useInstaller && (string.IsNullOrWhiteSpace(effectiveSha256) || effectiveSha256.Length != 64)) ||
+                (useInstaller && !string.IsNullOrWhiteSpace(effectiveSha256) && effectiveSha256.Length != 64))
             {
                 return new UpdateCheckResult("error", _currentVersion, null, 0, null, "Sürüm verisi eksik veya bozuk.");
             }
@@ -203,20 +227,24 @@ public sealed class AutoUpdater : IDisposable
                 return new UpdateCheckResult("up-to-date", _currentVersion, remoteVersion, 0, notes);
             }
 
-            if (!IsTrustedReleaseUri(downloadUrl))
+            if (!IsTrustedReleaseUri(effectiveUrl))
             {
                 return new UpdateCheckResult("error", _currentVersion, null, 0, null, "Güvenilmeyen güncelleme kaynağı.");
             }
 
-            string targetExePath = Path.Combine(_updatesDir, $"Kurfanova-Muzik-Windows-{remoteVersion}.exe");
-            if (File.Exists(targetExePath) && VerifyFileIntegrity(targetExePath, expectedSize, expectedSha256))
+            string targetExePath = useInstaller
+                ? Path.Combine(_updatesDir, $"Kurfamuzik-Setup-{remoteVersion}.exe")
+                : Path.Combine(_updatesDir, $"Kurfanova-Muzik-Windows-{remoteVersion}.exe");
+            if (File.Exists(targetExePath) && VerifyFileIntegrity(targetExePath, effectiveSize, effectiveSha256))
             {
                 long existingFileLen = 0;
                 try { existingFileLen = new FileInfo(targetExePath).Length; } catch { }
-                SaveStagedMeta(remoteVersion.ToString(), targetExePath, expectedSha256, notes);
+                SaveStagedMeta(remoteVersion.ToString(), targetExePath, effectiveSha256, effectiveSize, useInstaller, notes);
                 StagedVersion = remoteVersion;
                 StagedExePath = targetExePath;
-                _stagedSha256 = expectedSha256;
+                _stagedSha256 = effectiveSha256;
+                _stagedExpectedSize = effectiveSize;
+                _stagedIsInstaller = useInstaller;
                 ReleaseNotes = notes;
                 if (emitProgressEvents)
                 {
@@ -226,12 +254,12 @@ public sealed class AutoUpdater : IDisposable
                 return new UpdateCheckResult("staged", _currentVersion, remoteVersion, existingFileLen, notes);
             }
 
-            _pendingRemote = new PendingRemoteManifest(remoteVersion, downloadUrl, expectedSha256, expectedSize, notes);
+            _pendingRemote = new PendingRemoteManifest(remoteVersion, effectiveUrl, effectiveSha256, effectiveSize, notes, useInstaller);
             if (emitProgressEvents)
             {
-                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("available", remoteVersion, notes, 0, expectedSize, 0));
+                UpdateProgressChanged?.Invoke(new UpdateProgressInfo("available", remoteVersion, notes, 0, effectiveSize, 0));
             }
-            return new UpdateCheckResult("available", _currentVersion, remoteVersion, expectedSize, notes);
+            return new UpdateCheckResult("available", _currentVersion, remoteVersion, effectiveSize, notes);
         }
         catch (OperationCanceledException)
         {
@@ -294,7 +322,9 @@ public sealed class AutoUpdater : IDisposable
         }
 
         PendingRemoteManifest manifest = _pendingRemote!;
-        string targetExePath = Path.Combine(_updatesDir, $"Kurfanova-Muzik-Windows-{manifest.Version}.exe");
+        string targetExePath = manifest.IsInstaller
+            ? Path.Combine(_updatesDir, $"Kurfamuzik-Setup-{manifest.Version}.exe")
+            : Path.Combine(_updatesDir, $"Kurfanova-Muzik-Windows-{manifest.Version}.exe");
         string partPath = targetExePath + ".part";
 
         try
@@ -362,12 +392,14 @@ public sealed class AutoUpdater : IDisposable
             }
 
             File.Move(partPath, targetExePath, overwrite: true);
-            SaveStagedMeta(manifest.Version.ToString(), targetExePath, manifest.Sha256, manifest.Notes);
-            LogUpdater($"Update staged & verified: v{manifest.Version} at {targetExePath}");
+            SaveStagedMeta(manifest.Version.ToString(), targetExePath, manifest.Sha256, finalSize, manifest.IsInstaller, manifest.Notes);
+            LogUpdater($"Update staged & verified: v{manifest.Version} at {targetExePath} (installer={manifest.IsInstaller})");
 
             StagedVersion = manifest.Version;
             StagedExePath = targetExePath;
             _stagedSha256 = manifest.Sha256;
+            _stagedExpectedSize = finalSize;
+            _stagedIsInstaller = manifest.IsInstaller;
             ReleaseNotes = manifest.Notes;
             _pendingRemote = null;
 
@@ -431,13 +463,31 @@ public sealed class AutoUpdater : IDisposable
 
         try
         {
-            if (!string.IsNullOrWhiteSpace(_stagedSha256) &&
-                !VerifyFileIntegrity(StagedExePath, 0, _stagedSha256))
+            if (!VerifyFileIntegrity(StagedExePath, _stagedExpectedSize, _stagedSha256))
             {
                 TryDeleteFile(_stagedMetaPath);
                 Interlocked.Exchange(ref _applyTriggered, 0);
                 LogUpdater("TryApplyPendingUpdate aborted: staged file integrity check failed.");
                 return false;
+            }
+
+            if (_stagedIsInstaller ||
+                Path.GetFileName(StagedExePath).StartsWith("Kurfamuzik-Setup", StringComparison.OrdinalIgnoreCase))
+            {
+                TryDeleteFile(_stagedMetaPath);
+                string silentArgs = "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /RESTARTAPPLICATIONS";
+                if (relaunch)
+                {
+                    silentArgs += " /RELAUNCH=1";
+                }
+                LogUpdater($"Launching Inno Setup silent updater: {StagedExePath} {silentArgs}");
+                Process.Start(new ProcessStartInfo(StagedExePath)
+                {
+                    Arguments = silentArgs,
+                    WorkingDirectory = Path.GetDirectoryName(StagedExePath) ?? _updatesDir,
+                    UseShellExecute = true
+                });
+                return true;
             }
 
             string? currentExe = Environment.ProcessPath;
@@ -542,11 +592,13 @@ public sealed class AutoUpdater : IDisposable
         }
     }
 
-    private bool TryLoadExistingStaged(out Version? version, out string? exePath, out string? sha256, out string? notes)
+    private bool TryLoadExistingStaged(out Version? version, out string? exePath, out string? sha256, out long expectedSize, out bool isInstaller, out string? notes)
     {
         version = null;
         exePath = null;
         sha256 = null;
+        expectedSize = 0;
+        isInstaller = false;
         notes = null;
         try
         {
@@ -557,14 +609,20 @@ public sealed class AutoUpdater : IDisposable
             string? vStr = root.TryGetProperty("version", out JsonElement vEl) ? vEl.GetString() : null;
             string? path = root.TryGetProperty("filePath", out JsonElement pEl) ? pEl.GetString() : null;
             string? sha = root.TryGetProperty("sha256", out JsonElement sEl) ? sEl.GetString() : null;
+            expectedSize = root.TryGetProperty("expectedSize", out JsonElement szEl) && szEl.ValueKind == JsonValueKind.Number
+                ? szEl.GetInt64()
+                : 0;
+            isInstaller = root.TryGetProperty("isInstaller", out JsonElement insEl) &&
+                          (insEl.ValueKind == JsonValueKind.True || insEl.ValueKind == JsonValueKind.False) &&
+                          insEl.GetBoolean();
             notes = root.TryGetProperty("notes", out JsonElement nEl) ? nEl.GetString() : null;
 
             if (string.IsNullOrWhiteSpace(vStr) ||
                 string.IsNullOrWhiteSpace(path) ||
-                string.IsNullOrWhiteSpace(sha) ||
+                (!isInstaller && string.IsNullOrWhiteSpace(sha)) ||
                 !TryParseNormalizedVersion(vStr, out version) ||
                 !File.Exists(path) ||
-                !VerifyFileIntegrity(path, 0, sha))
+                !VerifyFileIntegrity(path, expectedSize, sha))
             {
                 TryDeleteFile(_stagedMetaPath);
                 return false;
@@ -580,7 +638,7 @@ public sealed class AutoUpdater : IDisposable
         }
     }
 
-    private void SaveStagedMeta(string version, string filePath, string sha256, string? notes)
+    private void SaveStagedMeta(string version, string filePath, string? sha256, long expectedSize, bool isInstaller, string? notes)
     {
         try
         {
@@ -589,6 +647,8 @@ public sealed class AutoUpdater : IDisposable
                 version,
                 filePath,
                 sha256,
+                expectedSize,
+                isInstaller,
                 notes
             });
             File.WriteAllText(_stagedMetaPath, json, Encoding.UTF8);
@@ -628,7 +688,7 @@ public sealed class AutoUpdater : IDisposable
         catch { }
     }
 
-    private static bool VerifyFileIntegrity(string path, long expectedSize, string expectedSha256)
+    private static bool VerifyFileIntegrity(string path, long expectedSize, string? expectedSha256)
     {
         try
         {
@@ -641,6 +701,11 @@ public sealed class AutoUpdater : IDisposable
             if (fs.Read(header, 0, 2) != 2 || header[0] != (byte)'M' || header[1] != (byte)'Z')
             {
                 return false;
+            }
+
+            if (string.IsNullOrWhiteSpace(expectedSha256))
+            {
+                return true;
             }
 
             fs.Position = 0;

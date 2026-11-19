@@ -10,10 +10,21 @@ En güncel kurulum dosyalarına [Releases](https://github.com/KurfaCore/kurfanov
 
 | Platform | Paket | Gereksinim | Bağlantı |
 | :--- | :--- | :--- | :--- |
-| **Windows** | `Kurfanova-Muzik-Windows.exe` | Windows 10 / 11 (x64) | [EXE İndir](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/Kurfanova-Muzik-Windows.exe) |
-| **Android** | `Kurfanova-Muzik.apk` | Android 8.0+ | [APK İndir](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/Kurfanova-Muzik.apk) |
+| **Windows (Önerilen Kurulum)** | `Kurfamuzik-Setup.exe` | Windows 10 / 11 (x64) | [Setup İndir](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/Kurfamuzik-Setup.exe) |
+| **Windows (Taşınabilir)** | `Kurfanova-Muzik-Windows.exe` | Windows 10 / 11 (x64) | [Taşınabilir İndir](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/Kurfanova-Muzik-Windows.exe) |
+| **Android** | `Kurfanova-Muzik.apk` | Android 7.0+ | [APK İndir](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/Kurfanova-Muzik.apk) |
 
-> Windows kurulum paketi `.NET 10` çalışma zamanını tek dosya içinde barındırır (`self-contained`), harici bağımlılık kurulumu gerektirmez.
+> Windows paketleri `.NET 10` çalışma zamanını içinde barındırır (`self-contained`). Kurulum sürümü kullanıcı dizinine (`%LocalAppData%\Programs\Kurfamuzik`) yönetici izni istemeden kurulur.
+
+### SHA-256 Doğrulama
+
+İndirdiğiniz dosyaların bütünlüğünü sürüm sayfasındaki hash listeleriyle doğrulayabilirsiniz:
+- Windows: [`SHA256SUMS-windows.txt`](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/SHA256SUMS-windows.txt)
+- Android: [`SHA256SUMS-android.txt`](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/SHA256SUMS-android.txt)
+
+```powershell
+Get-FileHash .\Kurfamuzik-Setup.exe -Algorithm SHA256
+```
 
 ## Özellikler
 

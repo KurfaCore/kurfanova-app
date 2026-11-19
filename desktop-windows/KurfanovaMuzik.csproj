@@ -12,11 +12,13 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
     <Version>1.2.0</Version>
-    <Product>Kurfanova Müzik</Product>
+    <AssemblyTitle>Kurfamüzik</AssemblyTitle>
+    <Product>Kurfamüzik</Product>
     <Company>KurfaCore</Company>
-    <Authors>KurfaCode</Authors>
-    <Description>Kurfamüzik Resmi Windows Masaüstü Uygulaması</Description>
+    <Authors>Ozan Sarsılmaz (KurfaCore)</Authors>
+    <Description>Kurfamüzik Windows Masaüstü Uygulaması</Description>
     <Copyright>Copyright © 2026 KurfaCore</Copyright>
+    <NeutralLanguage>tr-TR</NeutralLanguage>
     <ServerGarbageCollection>false</ServerGarbageCollection>
     <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>

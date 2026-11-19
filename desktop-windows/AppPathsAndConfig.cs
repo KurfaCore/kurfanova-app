@@ -33,7 +33,21 @@ public sealed class AppPaths
     };
 
     public string InstallDir { get; }
-    public string InstalledExePath => Path.Combine(InstallDir, "KurfanovaMuzik.exe");
+    public static bool IsInnoSetupInstalled =>
+        File.Exists(Path.Combine(AppContext.BaseDirectory, "unins000.exe"));
+
+    public string InstalledExePath
+    {
+        get
+        {
+            string innoExe = Path.Combine(InstallDir, "Kurfanova-Muzik-Windows.exe");
+            if (IsInnoSetupInstalled && File.Exists(innoExe))
+            {
+                return innoExe;
+            }
+            return Path.Combine(InstallDir, "KurfanovaMuzik.exe");
+        }
+    }
     public string IconPath => Path.Combine(InstallDir, "kurfanova.ico");
     public string ConfigPath => Path.Combine(InstallDir, "config.json");
     public string UserDataPath => Path.Combine(InstallDir, "user-data.json");
@@ -102,6 +116,18 @@ public sealed class AppPaths
 
     public static string ResolveActiveInstallDir()
     {
+        if (IsInnoSetupInstalled)
+        {
+            try
+            {
+                return Path.GetFullPath(AppContext.BaseDirectory.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            }
+            catch
+            {
+                // Fall back to registry / default dir if BaseDirectory resolution fails
+            }
+        }
+
         try
         {
             using RegistryKey? brandKey = Registry.CurrentUser.OpenSubKey(@"Software\KurfaCore\KurfanovaMuzik", writable: false);
