@@ -1124,6 +1124,7 @@ public sealed class MainForm : Form
                                 success = true,
                                 videoId = resolved.VideoId,
                                 streamUrl = _engine.GetLocalAudioUrl(resolved.VideoId),
+                                prefetchUrl = _engine.GetLocalPrefetchUrl(resolved.VideoId),
                                 mimeType = resolved.MimeType,
                                 itag = resolved.Itag,
                                 title = resolved.Title
@@ -1132,6 +1133,26 @@ public sealed class MainForm : Form
                         else
                         {
                             responseObj = new { success = false, error = "Audio stream unavailable" };
+                        }
+                        break;
+                    }
+
+                    case "PREFETCH":
+                    {
+                        if (NativeDesktopEngine.IsValidVideoId(videoId))
+                        {
+                            _engine.TriggerPrefetch(videoId);
+                            responseObj = new
+                            {
+                                success = true,
+                                status = "accepted",
+                                videoId,
+                                prefetchUrl = _engine.GetLocalPrefetchUrl(videoId!)
+                            };
+                        }
+                        else
+                        {
+                            responseObj = new { success = false, error = "Invalid video ID" };
                         }
                         break;
                     }

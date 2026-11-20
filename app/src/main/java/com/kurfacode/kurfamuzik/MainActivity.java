@@ -317,6 +317,45 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void playNativeExo(String videoId, String title, String artist, String coverUrl, double startSec) {
+            runOnUiThread(() -> updatePlaybackWakeLock(true));
+            KurfaPlaybackService.playNative(MainActivity.this, videoId, title, artist, coverUrl, startSec);
+        }
+
+        @JavascriptInterface
+        public void pauseNativeExo() {
+            runOnUiThread(() -> updatePlaybackWakeLock(false));
+            KurfaPlaybackService.pauseNative(MainActivity.this);
+        }
+
+        @JavascriptInterface
+        public void resumeNativeExo() {
+            runOnUiThread(() -> updatePlaybackWakeLock(true));
+            KurfaPlaybackService.resumeNative(MainActivity.this);
+        }
+
+        @JavascriptInterface
+        public void stopNativeExo() {
+            runOnUiThread(() -> updatePlaybackWakeLock(false));
+            KurfaPlaybackService.stopNative(MainActivity.this);
+        }
+
+        @JavascriptInterface
+        public void seekNativeExo(double sec) {
+            KurfaPlaybackService.seekNative(MainActivity.this, sec);
+        }
+
+        @JavascriptInterface
+        public void setVolumeNativeExo(float vol) {
+            KurfaPlaybackService.setVolumeNative(MainActivity.this, vol);
+        }
+
+        @JavascriptInterface
+        public void prefetchNative(String videoId) {
+            KurfaNativeEngine.prefetchAudioAsync(videoId);
+        }
+
+        @JavascriptInterface
         public void checkForUpdates() {
             ApkAutoUpdater.checkInteractive(MainActivity.this, nativeExecutor, webView);
         }
@@ -630,7 +669,10 @@ public class MainActivity extends Activity {
         webView.setScrollBarStyle(View.SCROLLBARS_INSIDE_OVERLAY);
         webView.setBackgroundColor(Color.parseColor("#07090e"));
         webView.setLayerType(View.LAYER_TYPE_HARDWARE, null);
-        webView.addJavascriptInterface(new KurfaAndroidBridge(), "KurfaAndroidBridge");
+        KurfaAndroidBridge androidBridge = new KurfaAndroidBridge();
+        webView.addJavascriptInterface(androidBridge, "KurfaAndroidBridge");
+        webView.addJavascriptInterface(androidBridge, "KurfaAndroid");
+        nativeExecutor.execute(KurfaNativeEngine::ensureLocalProxyStarted);
 
         webView.setWebChromeClient(new KurfaWebChromeClient());
         webView.setWebViewClient(new KurfaWebViewClient());
@@ -1603,6 +1645,7 @@ public class MainActivity extends Activity {
                 rootContainer.removeView(webView);
             }
             webView.removeJavascriptInterface("KurfaAndroidBridge");
+            webView.removeJavascriptInterface("KurfaAndroid");
             webView.setWebChromeClient(null);
             webView.setWebViewClient(null);
             webView.setDownloadListener(null);

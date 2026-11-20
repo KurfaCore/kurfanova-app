@@ -26,17 +26,21 @@ public sealed partial class NativeDesktopEngine : IDisposable
         "https://kurfanova.kurfa.workers.dev"
     ];
     public const string NativeAudioPathPrefix = "/__kurfa_native_audio__/";
+    public const string PrefetchPathPrefix = "/__kurfa_prefetch__/";
     public const string LocalFilePathPrefix = "/__kurfa_local_file__/";
 
     private readonly ConcurrentDictionary<string, string> _localFileRegistry = new(StringComparer.Ordinal);
     private readonly object _localAudioLock = new();
     private bool _localAudioLoadedFromDisk;
 
-    private const long MaxAdaptiveUpstreamChunkBytes = 524_288; // 512 KB bounded chunk (stays safely under YouTube CDN single-range caps)
+    private const long MaxAdaptiveUpstreamChunkBytes = 524_288; // 512 KB bounded chunk (<= 512 KiB - 1 MiB cap)
     private const long MaxProgressiveUpstreamChunkBytes = 2_097_152; // 2 MB bounded chunk for muxed progressive MP4 (itag 18/22)
     private const long HeadProbeEndByte = 1023;
     private const long TailProbeStartByte = 1_048_576; // 1 MB boundary where un-PoTokenized adaptive streams often 403
     private const long TailProbeEndByte = 1_310_719;
+    private const string PlayerFieldMask = "playabilityStatus,streamingData,videoDetails";
+    private const int MaxRecoveryAttempts = 5;
+    private static readonly TimeSpan ClientCooldownDuration = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan ApiRequestTimeout = TimeSpan.FromSeconds(4.5);
     private static readonly TimeSpan ProbeTimeout = TimeSpan.FromSeconds(4);
     private static readonly TimeSpan StreamHeaderTimeout = TimeSpan.FromSeconds(8);
@@ -44,14 +48,19 @@ public sealed partial class NativeDesktopEngine : IDisposable
     private static readonly TimeSpan VisitorDataTimeout = TimeSpan.FromSeconds(2.5);
     private static readonly TimeSpan VisitorDataTtl = TimeSpan.FromMinutes(30);
 
+    private const string VisionOs01UserAgent =
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15";
     private const string AndroidUserAgent =
         "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US; Pixel 8) gzip";
-    private const string VisionOsUserAgent =
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
-    private const string AndroidVrUserAgent =
-        "com.google.android.apps.youtube.vr.oculus/1.57.29 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+    private const string IosProducerUserAgent =
+        "com.google.ios.youtubeproducer/0.10 (iPhone16,2; U; CPU iOS 18_6_2 like Mac OS X;)";
     private const string IosUserAgent =
         "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)";
+    private const string TvHtml5SimplyUserAgent =
+        "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold (unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)";
+    private const string AndroidVrUserAgent =
+        "com.google.android.apps.youtube.vr.oculus/1.57.29 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
+    private const string WebRemixClientVersion = "1.20260707.12.00";
     private const string WebClientVersion = "2.20250101.00.00";
     private const string WebUserAgent =
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36";
@@ -62,6 +71,582 @@ public sealed partial class NativeDesktopEngine : IDisposable
 
     [GeneratedRegex("^[A-Za-z0-9_-]{11}$", RegexOptions.CultureInvariant)]
     private static partial Regex VideoIdRegex();
+
+    public sealed record PlaybackClientProfile(
+        string Id,
+        string ClientName,
+        string ClientVersion,
+        string ClientId,
+        string UserAgent,
+        string? OsName,
+        string? OsVersion,
+        string? DeviceMake,
+        string? DeviceModel,
+        string? Platform,
+        int? AndroidSdkVersion,
+        bool UseMusicPlayerEndpoint,
+        bool RequiresVisitorData,
+        bool IncludeVisitorDataIfAvailable,
+        bool IncludeContentFlags,
+        bool IncludeUserAgentInContext,
+        bool SupportsAdaptive,
+        bool SupportsProgressive
+    );
+
+    public sealed record ClientHealthSnapshot(
+        string ClientId,
+        bool IsHealthy,
+        DateTimeOffset CooldownUntilUtc,
+        int ConsecutiveFailures,
+        string? LastReason
+    );
+
+    /// <summary>
+    /// Metrolist 2026 live-tested playback client catalog in priority order:
+    /// 1) VISIONOS (0.1 + fresh visitorData)
+    /// 2) ANDROID (adaptive 1MB+ verified + progressive itag=18/22)
+    /// 3) IOS_PRODUCER / IOS + TVHTML5_SIMPLY + ANDROID_VR fallbacks.
+    /// </summary>
+    private static readonly IReadOnlyList<PlaybackClientProfile> AudioPlaybackClients =
+    [
+        new PlaybackClientProfile(
+            Id: "VISIONOS_0_1",
+            ClientName: "VISIONOS",
+            ClientVersion: "0.1",
+            ClientId: "101",
+            UserAgent: VisionOs01UserAgent,
+            OsName: "VISION_OS",
+            OsVersion: "1.3",
+            DeviceMake: "Apple",
+            DeviceModel: "RealityDevice14,1",
+            Platform: "MOBILE",
+            AndroidSdkVersion: null,
+            UseMusicPlayerEndpoint: true,
+            RequiresVisitorData: true,
+            IncludeVisitorDataIfAvailable: true,
+            IncludeContentFlags: true,
+            IncludeUserAgentInContext: false,
+            SupportsAdaptive: true,
+            SupportsProgressive: true
+        ),
+        new PlaybackClientProfile(
+            Id: "ANDROID",
+            ClientName: "ANDROID",
+            ClientVersion: "20.10.38",
+            ClientId: "3",
+            UserAgent: AndroidUserAgent,
+            OsName: "Android",
+            OsVersion: "14",
+            DeviceMake: null,
+            DeviceModel: null,
+            Platform: null,
+            AndroidSdkVersion: 34,
+            UseMusicPlayerEndpoint: false,
+            RequiresVisitorData: false,
+            IncludeVisitorDataIfAvailable: true,
+            IncludeContentFlags: true,
+            IncludeUserAgentInContext: false,
+            SupportsAdaptive: true,
+            SupportsProgressive: true
+        ),
+        new PlaybackClientProfile(
+            Id: "IOS_PRODUCER",
+            ClientName: "IOS_PRODUCER",
+            ClientVersion: "0.10",
+            ClientId: "92",
+            UserAgent: IosProducerUserAgent,
+            OsName: "iPhone",
+            OsVersion: "18.6.2.22G100",
+            DeviceMake: "Apple",
+            DeviceModel: "iPhone16,2",
+            Platform: null,
+            AndroidSdkVersion: null,
+            UseMusicPlayerEndpoint: false,
+            RequiresVisitorData: false,
+            IncludeVisitorDataIfAvailable: false,
+            IncludeContentFlags: true,
+            IncludeUserAgentInContext: false,
+            SupportsAdaptive: false,
+            SupportsProgressive: true
+        ),
+        new PlaybackClientProfile(
+            Id: "IOS",
+            ClientName: "IOS",
+            ClientVersion: "20.10.4",
+            ClientId: "5",
+            UserAgent: IosUserAgent,
+            OsName: "iPhone",
+            OsVersion: "18.3.2.22D82",
+            DeviceMake: "Apple",
+            DeviceModel: "iPhone16,2",
+            Platform: null,
+            AndroidSdkVersion: null,
+            UseMusicPlayerEndpoint: false,
+            RequiresVisitorData: false,
+            IncludeVisitorDataIfAvailable: false,
+            IncludeContentFlags: false,
+            IncludeUserAgentInContext: true,
+            SupportsAdaptive: true,
+            SupportsProgressive: true
+        ),
+        new PlaybackClientProfile(
+            Id: "TVHTML5_SIMPLY",
+            ClientName: "TVHTML5_SIMPLY",
+            ClientVersion: "1.0",
+            ClientId: "75",
+            UserAgent: TvHtml5SimplyUserAgent,
+            OsName: null,
+            OsVersion: null,
+            DeviceMake: null,
+            DeviceModel: null,
+            Platform: null,
+            AndroidSdkVersion: null,
+            UseMusicPlayerEndpoint: true,
+            RequiresVisitorData: false,
+            IncludeVisitorDataIfAvailable: true,
+            IncludeContentFlags: true,
+            IncludeUserAgentInContext: false,
+            SupportsAdaptive: true,
+            SupportsProgressive: true
+        ),
+        new PlaybackClientProfile(
+            Id: "ANDROID_VR",
+            ClientName: "ANDROID_VR",
+            ClientVersion: "1.57.29",
+            ClientId: "28",
+            UserAgent: AndroidVrUserAgent,
+            OsName: null,
+            OsVersion: null,
+            DeviceMake: null,
+            DeviceModel: null,
+            Platform: null,
+            AndroidSdkVersion: 34,
+            UseMusicPlayerEndpoint: true,
+            RequiresVisitorData: false,
+            IncludeVisitorDataIfAvailable: false,
+            IncludeContentFlags: false,
+            IncludeUserAgentInContext: true,
+            SupportsAdaptive: true,
+            SupportsProgressive: true
+        )
+    ];
+
+    /// <summary>
+    /// Tracks per-client 403 / LOGIN_REQUIRED / stream-drop health with a 5-minute temporary cooldown.
+    /// </summary>
+    private sealed class ClientHealthTracker
+    {
+        private sealed class Entry
+        {
+            public DateTimeOffset CooldownUntilUtc;
+            public int ConsecutiveFailures;
+            public string? LastReason;
+        }
+
+        private readonly ConcurrentDictionary<string, Entry> _entries = new(StringComparer.Ordinal);
+        private readonly TimeSpan _cooldown;
+
+        public ClientHealthTracker(TimeSpan cooldown)
+        {
+            _cooldown = cooldown;
+        }
+
+        public bool IsHealthy(string clientId, DateTimeOffset? nowUtc = null)
+        {
+            if (!_entries.TryGetValue(clientId, out Entry? entry))
+            {
+                return true;
+            }
+            DateTimeOffset now = nowUtc ?? DateTimeOffset.UtcNow;
+            return now >= entry.CooldownUntilUtc;
+        }
+
+        public void MarkFailure(string? clientId, string reason, TimeSpan? overrideCooldown = null)
+        {
+            if (string.IsNullOrWhiteSpace(clientId))
+            {
+                return;
+            }
+
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            DateTimeOffset until = now + (overrideCooldown ?? _cooldown);
+            _entries.AddOrUpdate(
+                clientId,
+                _ => new Entry
+                {
+                    CooldownUntilUtc = until,
+                    ConsecutiveFailures = 1,
+                    LastReason = reason
+                },
+                (_, existing) =>
+                {
+                    lock (existing)
+                    {
+                        existing.CooldownUntilUtc = until;
+                        existing.ConsecutiveFailures++;
+                        existing.LastReason = reason;
+                    }
+                    return existing;
+                });
+        }
+
+        public void MarkSuccess(string? clientId)
+        {
+            if (string.IsNullOrWhiteSpace(clientId))
+            {
+                return;
+            }
+
+            if (_entries.TryGetValue(clientId, out Entry? existing))
+            {
+                lock (existing)
+                {
+                    existing.CooldownUntilUtc = DateTimeOffset.MinValue;
+                    existing.ConsecutiveFailures = 0;
+                    existing.LastReason = null;
+                }
+            }
+        }
+
+        public List<PlaybackClientProfile> GetOrderedCandidates(
+            IReadOnlyList<PlaybackClientProfile> catalog,
+            IReadOnlySet<string>? excludedClientIds)
+        {
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            var healthy = new List<PlaybackClientProfile>(catalog.Count);
+            var cooledDown = new List<(PlaybackClientProfile Profile, DateTimeOffset Until)>(catalog.Count);
+
+            foreach (PlaybackClientProfile profile in catalog)
+            {
+                if (excludedClientIds is not null && excludedClientIds.Contains(profile.Id))
+                {
+                    continue;
+                }
+
+                if (_entries.TryGetValue(profile.Id, out Entry? entry))
+                {
+                    DateTimeOffset until;
+                    lock (entry)
+                    {
+                        until = entry.CooldownUntilUtc;
+                    }
+                    if (now < until)
+                    {
+                        cooledDown.Add((profile, until));
+                        continue;
+                    }
+                }
+
+                healthy.Add(profile);
+            }
+
+            if (cooledDown.Count > 0)
+            {
+                cooledDown.Sort((a, b) => a.Until.CompareTo(b.Until));
+                foreach (var item in cooledDown)
+                {
+                    healthy.Add(item.Profile);
+                }
+            }
+
+            return healthy;
+        }
+
+        public IReadOnlyList<ClientHealthSnapshot> Snapshot(IReadOnlyList<PlaybackClientProfile> catalog)
+        {
+            DateTimeOffset now = DateTimeOffset.UtcNow;
+            var list = new List<ClientHealthSnapshot>(catalog.Count);
+            foreach (PlaybackClientProfile profile in catalog)
+            {
+                if (_entries.TryGetValue(profile.Id, out Entry? entry))
+                {
+                    lock (entry)
+                    {
+                        list.Add(new ClientHealthSnapshot(
+                            profile.Id,
+                            now >= entry.CooldownUntilUtc,
+                            entry.CooldownUntilUtc,
+                            entry.ConsecutiveFailures,
+                            entry.LastReason));
+                    }
+                }
+                else
+                {
+                    list.Add(new ClientHealthSnapshot(profile.Id, true, DateTimeOffset.MinValue, 0, null));
+                }
+            }
+            return list;
+        }
+    }
+
+    /// <summary>
+    /// Lightweight in-memory LRU chunk and metadata cache for the last 2 active tracks (0ms seek/rewind).
+    /// </summary>
+    private sealed class ActiveTrackChunkCache
+    {
+        private const int MaxTracks = 2;
+        private const long MaxBytesPerTrack = 16 * 1024 * 1024; // 16 MiB cap per track
+
+        private sealed class Segment
+        {
+            public long Start;
+            public byte[] Data = [];
+            public long End => Start + Data.Length - 1;
+        }
+
+        private sealed class TrackEntry
+        {
+            public required string VideoId;
+            public required string MimeType;
+            public int Itag;
+            public long TotalLength;
+            public long CachedBytes;
+            public readonly List<Segment> Segments = [];
+            public LinkedListNode<string>? LruNode;
+        }
+
+        private readonly object _sync = new();
+        private readonly Dictionary<string, TrackEntry> _entries = new(StringComparer.Ordinal);
+        private readonly LinkedList<string> _lru = new();
+
+        public void SetMetadata(string videoId, string mimeType, int itag, long totalLength)
+        {
+            lock (_sync)
+            {
+                TrackEntry entry = GetOrCreateUnlocked(videoId, mimeType, itag, totalLength);
+                if (totalLength > 0 && entry.TotalLength <= 0)
+                {
+                    entry.TotalLength = totalLength;
+                }
+            }
+        }
+
+        public bool TryGetMetadata(string videoId, out string mimeType, out int itag, out long totalLength)
+        {
+            lock (_sync)
+            {
+                if (_entries.TryGetValue(videoId, out TrackEntry? entry))
+                {
+                    TouchUnlocked(entry);
+                    mimeType = entry.MimeType;
+                    itag = entry.Itag;
+                    totalLength = entry.TotalLength;
+                    return true;
+                }
+            }
+
+            mimeType = string.Empty;
+            itag = 0;
+            totalLength = 0;
+            return false;
+        }
+
+        public void StoreChunk(
+            string videoId,
+            string mimeType,
+            int itag,
+            long totalLength,
+            long startOffset,
+            ReadOnlySpan<byte> data)
+        {
+            if (data.IsEmpty || startOffset < 0)
+            {
+                return;
+            }
+
+            lock (_sync)
+            {
+                TrackEntry entry = GetOrCreateUnlocked(videoId, mimeType, itag, totalLength);
+                if (totalLength > 0 && entry.TotalLength <= 0)
+                {
+                    entry.TotalLength = totalLength;
+                }
+
+                long newStart = startOffset;
+                long newEnd = startOffset + data.Length - 1;
+
+                // Fast check if completely covered already
+                for (int i = 0; i < entry.Segments.Count; i++)
+                {
+                    Segment seg = entry.Segments[i];
+                    if (seg.Start <= newStart && seg.End >= newEnd)
+                    {
+                        return;
+                    }
+                }
+
+                if (entry.CachedBytes + data.Length > MaxBytesPerTrack)
+                {
+                    return;
+                }
+
+                int firstOverlap = -1;
+                int lastOverlap = -1;
+                long mergedStart = newStart;
+                long mergedEnd = newEnd;
+
+                for (int i = 0; i < entry.Segments.Count; i++)
+                {
+                    Segment seg = entry.Segments[i];
+                    if (seg.End + 1 >= newStart && seg.Start <= newEnd + 1)
+                    {
+                        if (firstOverlap < 0) firstOverlap = i;
+                        lastOverlap = i;
+                        if (seg.Start < mergedStart) mergedStart = seg.Start;
+                        if (seg.End > mergedEnd) mergedEnd = seg.End;
+                    }
+                }
+
+                if (firstOverlap < 0)
+                {
+                    var seg = new Segment
+                    {
+                        Start = newStart,
+                        Data = data.ToArray()
+                    };
+                    int insertIdx = 0;
+                    while (insertIdx < entry.Segments.Count && entry.Segments[insertIdx].Start < newStart)
+                    {
+                        insertIdx++;
+                    }
+                    entry.Segments.Insert(insertIdx, seg);
+                    entry.CachedBytes += seg.Data.Length;
+                }
+                else
+                {
+                    long mergedLenLong = mergedEnd - mergedStart + 1;
+                    if (mergedLenLong <= 0 || mergedLenLong > MaxBytesPerTrack)
+                    {
+                        return;
+                    }
+                    int mergedLen = (int)mergedLenLong;
+                    byte[] merged = new byte[mergedLen];
+                    long removedBytes = 0;
+                    for (int i = firstOverlap; i <= lastOverlap; i++)
+                    {
+                        Segment seg = entry.Segments[i];
+                        Buffer.BlockCopy(seg.Data, 0, merged, (int)(seg.Start - mergedStart), seg.Data.Length);
+                        removedBytes += seg.Data.Length;
+                    }
+                    data.CopyTo(merged.AsSpan((int)(newStart - mergedStart)));
+
+                    int removeCount = lastOverlap - firstOverlap + 1;
+                    entry.Segments.RemoveRange(firstOverlap, removeCount);
+                    entry.Segments.Insert(firstOverlap, new Segment
+                    {
+                        Start = mergedStart,
+                        Data = merged
+                    });
+                    entry.CachedBytes = entry.CachedBytes - removedBytes + merged.Length;
+                }
+            }
+        }
+
+        public bool TryReadRange(
+            string videoId,
+            long start,
+            long maxEnd,
+            out byte[] data,
+            out string mimeType,
+            out int itag,
+            out long totalLength)
+        {
+            if (start >= 0 && maxEnd >= start)
+            {
+                lock (_sync)
+                {
+                    if (_entries.TryGetValue(videoId, out TrackEntry? entry))
+                    {
+                        TouchUnlocked(entry);
+                        for (int i = 0; i < entry.Segments.Count; i++)
+                        {
+                            Segment seg = entry.Segments[i];
+                            if (seg.Start <= start && seg.End >= start)
+                            {
+                                long availEnd = Math.Min(maxEnd, seg.End);
+                                int count = (int)(availEnd - start + 1);
+                                if (count > 0)
+                                {
+                                    data = new byte[count];
+                                    Buffer.BlockCopy(seg.Data, (int)(start - seg.Start), data, 0, count);
+                                    mimeType = entry.MimeType;
+                                    itag = entry.Itag;
+                                    totalLength = entry.TotalLength;
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            data = [];
+            mimeType = string.Empty;
+            itag = 0;
+            totalLength = 0;
+            return false;
+        }
+
+        public (int CachedTracks, long TotalCachedBytes) GetStats()
+        {
+            lock (_sync)
+            {
+                long total = 0;
+                foreach (TrackEntry e in _entries.Values)
+                {
+                    total += e.CachedBytes;
+                }
+                return (_entries.Count, total);
+            }
+        }
+
+        private TrackEntry GetOrCreateUnlocked(string videoId, string mimeType, int itag, long totalLength)
+        {
+            if (_entries.TryGetValue(videoId, out TrackEntry? existing))
+            {
+                bool formatChanged =
+                    (!string.IsNullOrEmpty(mimeType) && !string.Equals(existing.MimeType, mimeType, StringComparison.OrdinalIgnoreCase)) ||
+                    (itag > 0 && existing.Itag > 0 && existing.Itag != itag) ||
+                    (totalLength > 0 && existing.TotalLength > 0 && existing.TotalLength != totalLength);
+                if (formatChanged)
+                {
+                    existing.Segments.Clear();
+                    existing.CachedBytes = 0;
+                    existing.MimeType = mimeType;
+                    existing.Itag = itag;
+                    existing.TotalLength = totalLength;
+                }
+                TouchUnlocked(existing);
+                return existing;
+            }
+
+            while (_entries.Count >= MaxTracks && _lru.Last is { } oldestNode)
+            {
+                _entries.Remove(oldestNode.Value);
+                _lru.RemoveLast();
+            }
+
+            var created = new TrackEntry
+            {
+                VideoId = videoId,
+                MimeType = string.IsNullOrWhiteSpace(mimeType) ? "audio/mp4" : mimeType,
+                Itag = itag,
+                TotalLength = totalLength
+            };
+            created.LruNode = _lru.AddFirst(videoId);
+            _entries[videoId] = created;
+            return created;
+        }
+
+        private void TouchUnlocked(TrackEntry entry)
+        {
+            if (entry.LruNode is not null && entry.LruNode != _lru.First)
+            {
+                _lru.Remove(entry.LruNode);
+                _lru.AddFirst(entry.LruNode);
+            }
+        }
+    }
 
     public sealed record ResolvedAudio(
         string VideoId,
@@ -94,6 +679,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
 
     private readonly ConcurrentDictionary<string, ResolvedAudio> _streamCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, Task<ResolvedAudio?>> _inflightResolutions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, byte> _inflightPrefetches = new(StringComparer.Ordinal);
+    private readonly ClientHealthTracker _healthTracker = new(ClientCooldownDuration);
+    private readonly ActiveTrackChunkCache _chunkCache = new();
     private readonly SemaphoreSlim _visitorSemaphore = new(1, 1);
     private readonly HttpClient _apiHttpClient;
     private readonly HttpClient _streamHttpClient;
@@ -152,6 +740,134 @@ public sealed partial class NativeDesktopEngine : IDisposable
             throw new InvalidOperationException("Local audio HTTP server has not been started.");
         }
         return $"http://127.0.0.1:{Port}{NativeAudioPathPrefix}{videoId}";
+    }
+
+    public string GetLocalPrefetchUrl(string videoId)
+    {
+        if (!IsValidVideoId(videoId))
+        {
+            throw new ArgumentException("Invalid YouTube video ID.", nameof(videoId));
+        }
+        if (Port <= 0)
+        {
+            throw new InvalidOperationException("Local audio HTTP server has not been started.");
+        }
+        return $"http://127.0.0.1:{Port}{PrefetchPathPrefix}{videoId}";
+    }
+
+    public IReadOnlyList<ClientHealthSnapshot> GetClientHealthSnapshot() =>
+        _healthTracker.Snapshot(AudioPlaybackClients);
+
+    public (int CachedTracks, long TotalCachedBytes) GetChunkCacheStats() =>
+        _chunkCache.GetStats();
+
+    public void TriggerPrefetch(string? videoId)
+    {
+        if (_disposed != 0 || !IsValidVideoId(videoId))
+        {
+            return;
+        }
+        string cleanId = videoId!;
+        if (_streamCache.TryGetValue(cleanId, out ResolvedAudio? cached) && cached.ExpiresAtUtc > DateTimeOffset.UtcNow)
+        {
+            if (!_chunkCache.TryGetMetadata(cleanId, out _, out _, out _))
+            {
+                _chunkCache.SetMetadata(cleanId, cached.MimeType, cached.Itag, cached.ContentLength);
+            }
+            return;
+        }
+
+        if (!_inflightPrefetches.TryAdd(cleanId, 0))
+        {
+            return;
+        }
+
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await PrefetchTrackInternalAsync(cleanId, _cts.Token).ConfigureAwait(false);
+            }
+            catch
+            {
+                // Fire-and-forget prefetch never surfaces exceptions
+            }
+            finally
+            {
+                _inflightPrefetches.TryRemove(cleanId, out _);
+            }
+        }, CancellationToken.None);
+    }
+
+    private async Task PrefetchTrackInternalAsync(string videoId, CancellationToken ct)
+    {
+        ResolvedAudio? resolved = await ResolveAudioStreamAsync(videoId, ct).ConfigureAwait(false);
+        if (resolved is null || string.IsNullOrEmpty(resolved.StreamUrl))
+        {
+            return;
+        }
+
+        _chunkCache.SetMetadata(videoId, resolved.MimeType, resolved.Itag, resolved.ContentLength);
+
+        // Pre-warm initial chunk into LRU cache only if not already cached
+        long warmEnd = Math.Min(GetUpstreamChunkCapBytes(resolved) - 1, resolved.ContentLength > 0 ? resolved.ContentLength - 1 : GetUpstreamChunkCapBytes(resolved) - 1);
+        if (warmEnd < 0 || _chunkCache.TryReadRange(videoId, 0, Math.Min(warmEnd, 1023), out _, out _, out _, out _))
+        {
+            return;
+        }
+
+        try
+        {
+            using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            reqCts.CancelAfter(StreamHeaderTimeout);
+            using var req = new HttpRequestMessage(HttpMethod.Get, resolved.StreamUrl);
+            req.Headers.TryAddWithoutValidation("User-Agent", resolved.RequestUserAgent);
+            req.Headers.TryAddWithoutValidation("Range", $"bytes=0-{warmEnd}");
+
+            using HttpResponseMessage resp = await _streamHttpClient
+                .SendAsync(req, HttpCompletionOption.ResponseHeadersRead, reqCts.Token)
+                .ConfigureAwait(false);
+            int code = (int)resp.StatusCode;
+            if (code != 200 && code != 206)
+            {
+                return;
+            }
+
+            long totalLen = resp.Content.Headers.ContentRange?.Length ?? resolved.ContentLength;
+            await using Stream s = await resp.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
+            using var ms = new MemoryStream((int)Math.Min(warmEnd + 1, MaxProgressiveUpstreamChunkBytes));
+            byte[] buf = ArrayPool<byte>.Shared.Rent(65536);
+            try
+            {
+                while (true)
+                {
+                    using var readCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                    readCts.CancelAfter(StreamReadIdleTimeout);
+                    int read = await s.ReadAsync(buf.AsMemory(0, buf.Length), readCts.Token).ConfigureAwait(false);
+                    if (read <= 0) break;
+                    ms.Write(buf, 0, read);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buf);
+            }
+
+            if (ms.Length > 0)
+            {
+                _chunkCache.StoreChunk(
+                    videoId,
+                    resolved.MimeType,
+                    resolved.Itag,
+                    totalLen,
+                    0,
+                    ms.GetBuffer().AsSpan(0, (int)ms.Length));
+            }
+        }
+        catch
+        {
+            // Keep resolved URL in _streamCache even if warm-up fails
+        }
     }
 
     public void Start()
@@ -256,6 +972,13 @@ public sealed partial class NativeDesktopEngine : IDisposable
             {
                 string localId = path[LocalFilePathPrefix.Length..].Trim();
                 await ServeLocalAudioFileAsync(context, localId, isHead: method == "HEAD", ct).ConfigureAwait(false);
+                return;
+            }
+
+            if (path.StartsWith(PrefetchPathPrefix, StringComparison.Ordinal))
+            {
+                string prefetchId = path[PrefetchPathPrefix.Length..].Trim();
+                await HandlePrefetchRequestAsync(context, prefetchId, isHead: method == "HEAD", ct).ConfigureAwait(false);
                 return;
             }
 
@@ -389,6 +1112,54 @@ public sealed partial class NativeDesktopEngine : IDisposable
         return true;
     }
 
+    private async Task HandlePrefetchRequestAsync(
+        HttpListenerContext context,
+        string videoId,
+        bool isHead,
+        CancellationToken ct)
+    {
+        ApplyCorsHeaders(context.Response, context.Request);
+        if (!IsValidVideoId(videoId))
+        {
+            await WritePlainErrorAsync(context.Response, 400, "Invalid video ID", ct).ConfigureAwait(false);
+            return;
+        }
+
+        bool alreadyCached = _streamCache.TryGetValue(videoId, out ResolvedAudio? existing) &&
+                             existing.ExpiresAtUtc > DateTimeOffset.UtcNow;
+
+        if (!alreadyCached)
+        {
+            TriggerPrefetch(videoId);
+        }
+        else if (!_chunkCache.TryGetMetadata(videoId, out _, out _, out _))
+        {
+            _chunkCache.SetMetadata(videoId, existing!.MimeType, existing.Itag, existing.ContentLength);
+        }
+
+        HttpListenerResponse resp = context.Response;
+        resp.StatusCode = alreadyCached ? 200 : 202;
+        resp.StatusDescription = alreadyCached ? "OK" : "Accepted";
+        resp.ContentType = "application/json; charset=utf-8";
+
+        if (isHead)
+        {
+            resp.ContentLength64 = 0;
+            return;
+        }
+
+        string json = JsonSerializer.Serialize(new
+        {
+            success = true,
+            status = alreadyCached ? "cached" : "accepted",
+            videoId,
+            client = alreadyCached ? existing!.ClientKind : null
+        });
+        byte[] bytes = Encoding.UTF8.GetBytes(json);
+        resp.ContentLength64 = bytes.Length;
+        await resp.OutputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
+    }
+
     private async Task ProxyAudioStreamAsync(
         HttpListenerContext context,
         string videoId,
@@ -400,28 +1171,96 @@ public sealed partial class NativeDesktopEngine : IDisposable
         string? expectedMime = null;
         long expectedLength = -1;
 
-        for (int attempt = 0; attempt < 3; attempt++)
+        // 0ms fast path from active 2-track LRU chunk/metadata cache
+        if (isHead && !hasClientRange &&
+            _streamCache.TryGetValue(videoId, out ResolvedAudio? headCached) &&
+            headCached.ExpiresAtUtc > DateTimeOffset.UtcNow &&
+            _chunkCache.TryGetMetadata(videoId, out string cachedHeadMime, out _, out long cachedHeadLen) &&
+            cachedHeadLen > 0)
+        {
+            HttpListenerResponse fastHead = context.Response;
+            ApplyCorsHeaders(fastHead, context.Request);
+            fastHead.ContentType = string.IsNullOrWhiteSpace(cachedHeadMime) ? "audio/mp4" : cachedHeadMime;
+            fastHead.Headers["Accept-Ranges"] = "bytes";
+            fastHead.StatusCode = 200;
+            fastHead.StatusDescription = "OK";
+            fastHead.ContentLength64 = cachedHeadLen;
+            return;
+        }
+
+        if (hasClientRange)
+        {
+            long maxCacheReadEnd = clientRequestedEnd.HasValue
+                ? Math.Min(clientRequestedEnd.Value, clientStart + MaxProgressiveUpstreamChunkBytes - 1)
+                : clientStart + MaxAdaptiveUpstreamChunkBytes - 1;
+
+            if (_chunkCache.TryReadRange(
+                    videoId,
+                    clientStart,
+                    maxCacheReadEnd,
+                    out byte[] cachedBytes,
+                    out string cachedMime,
+                    out _,
+                    out long cachedTotal))
+            {
+                if (cachedTotal > 0 && clientStart >= cachedTotal)
+                {
+                    HttpListenerResponse r416 = context.Response;
+                    ApplyCorsHeaders(r416, context.Request);
+                    r416.StatusCode = 416;
+                    r416.StatusDescription = "Range Not Satisfiable";
+                    r416.Headers["Content-Range"] = $"bytes */{cachedTotal}";
+                    r416.ContentLength64 = 0;
+                    return;
+                }
+
+                HttpListenerResponse cacheResp = context.Response;
+                ApplyCorsHeaders(cacheResp, context.Request);
+                cacheResp.ContentType = string.IsNullOrWhiteSpace(cachedMime) ? "audio/mp4" : cachedMime;
+                cacheResp.Headers["Accept-Ranges"] = "bytes";
+                cacheResp.Headers["X-Kurfa-Cache"] = "HIT";
+                cacheResp.StatusCode = 206;
+                cacheResp.StatusDescription = "Partial Content";
+                long cacheRangeEnd = clientStart + cachedBytes.Length - 1;
+                string totalStr = cachedTotal > 0
+                    ? cachedTotal.ToString(CultureInfo.InvariantCulture)
+                    : "*";
+                cacheResp.Headers["Content-Range"] = $"bytes {clientStart}-{cacheRangeEnd}/{totalStr}";
+                cacheResp.ContentLength64 = cachedBytes.Length;
+
+                if (!isHead)
+                {
+                    await cacheResp.OutputStream.WriteAsync(cachedBytes, ct).ConfigureAwait(false);
+                    await cacheResp.OutputStream.FlushAsync(ct).ConfigureAwait(false);
+                }
+                return;
+            }
+        }
+
+        var excludedClients = new HashSet<string>(StringComparer.Ordinal);
+
+        for (int attempt = 0; attempt < MaxRecoveryAttempts; attempt++)
         {
             bool forceRefresh = attempt > 0;
-            bool preferAlternateClient = attempt >= 2;
 
             ResolvedAudio? resolved = await ResolveAudioStreamAsync(
                 videoId,
                 ct,
                 forceRefresh: forceRefresh,
-                preferAlternateClient: preferAlternateClient).ConfigureAwait(false);
+                excludedClients: excludedClients.Count > 0 ? excludedClients : null).ConfigureAwait(false);
             if (resolved is null)
             {
                 break;
             }
 
-            if (attempt == 0)
+            if (expectedMime is null)
             {
                 expectedMime = resolved.MimeType;
                 expectedLength = resolved.ContentLength;
             }
             else if (hasClientRange && clientStart > 0 && !IsMatchingMidStream(resolved, expectedMime, expectedLength))
             {
+                excludedClients.Add(resolved.ClientKind);
                 continue;
             }
 
@@ -446,6 +1285,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     int headStatus = (int)headUpstream.StatusCode;
                     if (headStatus == 403 || headStatus == 410 || headStatus >= 500)
                     {
+                        _healthTracker.MarkFailure(resolved.ClientKind, $"HEAD_HTTP_{headStatus}");
+                        excludedClients.Add(resolved.ClientKind);
                         _streamCache.TryRemove(videoId, out _);
                         continue;
                     }
@@ -463,18 +1304,23 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     headResp.StatusCode = 200;
                     headResp.StatusDescription = "OK";
 
+                    long resolvedHeadTotal = 0;
                     if (headUpstream.Content.Headers.ContentRange?.Length is long probedTotal && probedTotal > 0)
                     {
                         headResp.ContentLength64 = probedTotal;
+                        resolvedHeadTotal = probedTotal;
                     }
                     else if (resolved.ContentLength > 0)
                     {
                         headResp.ContentLength64 = resolved.ContentLength;
+                        resolvedHeadTotal = resolved.ContentLength;
                     }
                     else if (headUpstream.Content.Headers.ContentLength is long fallbackHeadLen && fallbackHeadLen >= 0)
                     {
                         headResp.ContentLength64 = fallbackHeadLen;
+                        resolvedHeadTotal = fallbackHeadLen;
                     }
+                    _chunkCache.SetMetadata(videoId, headResp.ContentType, resolved.Itag, resolvedHeadTotal);
                     return;
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -483,6 +1329,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 }
                 catch
                 {
+                    _healthTracker.MarkFailure(resolved.ClientKind, "HEAD_EXCEPTION");
+                    excludedClients.Add(resolved.ClientKind);
                     _streamCache.TryRemove(videoId, out _);
                     continue;
                 }
@@ -537,6 +1385,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 catch
                 {
                     upstream?.Dispose();
+                    _healthTracker.MarkFailure(resolved.ClientKind, "RANGE_CONNECT_ERROR");
+                    excludedClients.Add(resolved.ClientKind);
                     _streamCache.TryRemove(videoId, out _);
                     continue;
                 }
@@ -546,6 +1396,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     int statusCode = (int)upstream.StatusCode;
                     if (statusCode == 403 || statusCode == 410 || statusCode >= 500 || (clientStart > 0 && statusCode == 200))
                     {
+                        _healthTracker.MarkFailure(resolved.ClientKind, $"RANGE_HTTP_{statusCode}");
+                        excludedClients.Add(resolved.ClientKind);
                         _streamCache.TryRemove(videoId, out _);
                         continue;
                     }
@@ -561,6 +1413,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     string contentType = upstream.Content.Headers.ContentType?.MediaType ?? resolved.MimeType;
                     resp.ContentType = string.IsNullOrWhiteSpace(contentType) ? "audio/mp4" : contentType;
                     resp.Headers["Accept-Ranges"] = "bytes";
+                    resp.Headers["X-Kurfa-Cache"] = "MISS";
+                    resp.Headers["X-Kurfa-Client"] = resolved.ClientKind;
                     resp.StatusCode = statusCode == 206 ? 206 : 200;
                     resp.StatusDescription = resp.StatusCode == 206 ? "Partial Content" : "OK";
 
@@ -593,6 +1447,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
                         resp.ContentLength64 = declaredContentLength;
                     }
 
+                    long metadataTotal = totalKnownLength ?? resolved.ContentLength;
+                    _chunkCache.SetMetadata(videoId, resp.ContentType, resolved.Itag, metadataTotal);
+
                     if (isHead)
                     {
                         return;
@@ -606,8 +1463,10 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     HttpResponseMessage? activeResponse = upstream;
                     bool detachInitial = false;
 
-                    for (int midRecovery = 0; midRecovery <= 2; midRecovery++)
+                    for (int midRecovery = 0; midRecovery < MaxRecoveryAttempts; midRecovery++)
                     {
+                        long segmentStartOffset = clientStart + bytesSentThisChunk;
+                        using var teeBuffer = new MemoryStream((int)Math.Min(Math.Max(1, remainingEnd - segmentStartOffset + 1), MaxProgressiveUpstreamChunkBytes));
                         try
                         {
                             HttpResponseMessage currentResp;
@@ -617,18 +1476,25 @@ public sealed partial class NativeDesktopEngine : IDisposable
                             }
                             else
                             {
-                                long resumeStart = clientStart + bytesSentThisChunk;
-                                if (resumeStart > remainingEnd) break;
+                                if (segmentStartOffset > remainingEnd) break;
 
+                                _healthTracker.MarkFailure(activeChunkMedia.ClientKind, "MID_CHUNK_RECOVERY");
+                                excludedClients.Add(activeChunkMedia.ClientKind);
                                 _streamCache.TryRemove(videoId, out _);
+
                                 ResolvedAudio? fresh = await ResolveAudioStreamAsync(
                                     videoId,
                                     ct,
                                     forceRefresh: true,
-                                    preferAlternateClient: midRecovery >= 2).ConfigureAwait(false);
-                                if (fresh is null || !IsMatchingMidStream(fresh, expectedMime, expectedLength))
+                                    excludedClients: excludedClients).ConfigureAwait(false);
+                                if (fresh is null)
                                 {
                                     break;
+                                }
+                                if (!IsMatchingMidStream(fresh, expectedMime, expectedLength))
+                                {
+                                    excludedClients.Add(fresh.ClientKind);
+                                    continue;
                                 }
                                 activeChunkMedia = fresh;
 
@@ -636,14 +1502,15 @@ public sealed partial class NativeDesktopEngine : IDisposable
                                 recHdrCts.CancelAfter(StreamHeaderTimeout);
                                 using var recReq = new HttpRequestMessage(HttpMethod.Get, activeChunkMedia.StreamUrl);
                                 recReq.Headers.TryAddWithoutValidation("User-Agent", activeChunkMedia.RequestUserAgent);
-                                recReq.Headers.TryAddWithoutValidation("Range", $"bytes={resumeStart}-{remainingEnd}");
+                                recReq.Headers.TryAddWithoutValidation("Range", $"bytes={segmentStartOffset}-{remainingEnd}");
                                 currentResp = await _streamHttpClient
                                     .SendAsync(recReq, HttpCompletionOption.ResponseHeadersRead, recHdrCts.Token)
                                     .ConfigureAwait(false);
                                 int recStatus = (int)currentResp.StatusCode;
-                                if (recStatus != 206 && !(resumeStart == 0 && recStatus == 200))
+                                if (recStatus != 206 && !(segmentStartOffset == 0 && recStatus == 200))
                                 {
                                     currentResp.Dispose();
+                                    _healthTracker.MarkFailure(activeChunkMedia.ClientKind, $"MID_CHUNK_HTTP_{recStatus}");
                                     continue;
                                 }
                             }
@@ -661,6 +1528,10 @@ public sealed partial class NativeDesktopEngine : IDisposable
                                         int read = await upstreamStream.ReadAsync(buffer.AsMemory(0, buffer.Length), readCts.Token).ConfigureAwait(false);
                                         if (read <= 0) break;
                                         await resp.OutputStream.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                                        if (teeBuffer.Length + read <= MaxProgressiveUpstreamChunkBytes)
+                                        {
+                                            teeBuffer.Write(buffer, 0, read);
+                                        }
                                         bytesSentThisChunk += read;
                                     }
                                 }
@@ -671,6 +1542,16 @@ public sealed partial class NativeDesktopEngine : IDisposable
                             }
                             finally
                             {
+                                if (teeBuffer.Length > 0)
+                                {
+                                    _chunkCache.StoreChunk(
+                                        videoId,
+                                        resp.ContentType ?? activeChunkMedia.MimeType,
+                                        activeChunkMedia.Itag,
+                                        metadataTotal,
+                                        segmentStartOffset,
+                                        teeBuffer.GetBuffer().AsSpan(0, (int)teeBuffer.Length));
+                                }
                                 if (midRecovery > 0)
                                 {
                                     currentResp.Dispose();
@@ -690,7 +1571,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                         }
                         catch
                         {
-                            if (midRecovery == 2)
+                            if (midRecovery == MaxRecoveryAttempts - 1)
                             {
                                 throw;
                             }
@@ -722,9 +1603,50 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     chunkEnd = Math.Min(chunkEnd, totalLength - 1);
                 }
 
+                // Serve full-GET chunk directly from LRU cache when already buffered
+                if (_chunkCache.TryReadRange(
+                        videoId,
+                        offset,
+                        chunkEnd,
+                        out byte[] cachedChunk,
+                        out string cachedChunkMime,
+                        out _,
+                        out long cachedChunkTotal))
+                {
+                    if (cachedChunkTotal > 0 && totalLength <= 0)
+                    {
+                        totalLength = cachedChunkTotal;
+                    }
+                    if (!headersSent)
+                    {
+                        HttpListenerResponse resp = context.Response;
+                        ApplyCorsHeaders(resp, context.Request);
+                        resp.ContentType = string.IsNullOrWhiteSpace(cachedChunkMime) ? "audio/mp4" : cachedChunkMime;
+                        resp.Headers["Accept-Ranges"] = "bytes";
+                        resp.Headers["X-Kurfa-Cache"] = "HIT";
+                        resp.StatusCode = 200;
+                        resp.StatusDescription = "OK";
+                        if (totalLength > 0)
+                        {
+                            resp.ContentLength64 = totalLength;
+                        }
+                        expectedMime = resp.ContentType;
+                        headersSent = true;
+                    }
+
+                    await context.Response.OutputStream.WriteAsync(cachedChunk, ct).ConfigureAwait(false);
+                    offset += cachedChunk.Length;
+                    if (totalLength > 0 && offset >= totalLength)
+                    {
+                        await context.Response.OutputStream.FlushAsync(ct).ConfigureAwait(false);
+                        return;
+                    }
+                    continue;
+                }
+
                 HttpResponseMessage? chunkUpstream = null;
                 bool chunkSuccess = false;
-                for (int chunkAttempt = 0; chunkAttempt < 3; chunkAttempt++)
+                for (int chunkAttempt = 0; chunkAttempt < MaxRecoveryAttempts; chunkAttempt++)
                 {
                     if (chunkAttempt > 0)
                     {
@@ -733,9 +1655,14 @@ public sealed partial class NativeDesktopEngine : IDisposable
                             videoId,
                             ct,
                             forceRefresh: true,
-                            preferAlternateClient: chunkAttempt >= 2).ConfigureAwait(false);
-                        if (refreshed is null || (headersSent && !IsMatchingMidStream(refreshed, expectedMime, totalLength)))
+                            excludedClients: excludedClients).ConfigureAwait(false);
+                        if (refreshed is null)
                         {
+                            break;
+                        }
+                        if (headersSent && !IsMatchingMidStream(refreshed, expectedMime, totalLength))
+                        {
+                            excludedClients.Add(refreshed.ClientKind);
                             continue;
                         }
                         activeStreamMedia = refreshed;
@@ -758,6 +1685,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                         {
                             chunkUpstream.Dispose();
                             chunkUpstream = null;
+                            _healthTracker.MarkFailure(activeStreamMedia.ClientKind, $"FULL_CHUNK_HTTP_{statusCode}");
+                            excludedClients.Add(activeStreamMedia.ClientKind);
                             _streamCache.TryRemove(videoId, out _);
                             continue;
                         }
@@ -786,6 +1715,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     {
                         chunkUpstream?.Dispose();
                         chunkUpstream = null;
+                        _healthTracker.MarkFailure(activeStreamMedia.ClientKind, "FULL_CHUNK_EXCEPTION");
+                        excludedClients.Add(activeStreamMedia.ClientKind);
                         _streamCache.TryRemove(videoId, out _);
                     }
                 }
@@ -820,11 +1751,14 @@ public sealed partial class NativeDesktopEngine : IDisposable
                         {
                             resp.ContentLength64 = totalLength;
                         }
-                        expectedMime = activeStreamMedia.MimeType;
+                        expectedMime = resp.ContentType;
+                        _chunkCache.SetMetadata(videoId, resp.ContentType, activeStreamMedia.Itag, totalLength);
                         headersSent = true;
                     }
 
                     long writtenInChunk = 0;
+                    long chunkStartOffset = offset;
+                    using var chunkTee = new MemoryStream((int)Math.Min(fullChunkCap, MaxProgressiveUpstreamChunkBytes));
                     try
                     {
                         await using Stream upstreamStream = await chunkUpstream.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
@@ -838,12 +1772,26 @@ public sealed partial class NativeDesktopEngine : IDisposable
                                 int read = await upstreamStream.ReadAsync(buffer.AsMemory(0, buffer.Length), readCts.Token).ConfigureAwait(false);
                                 if (read <= 0) break;
                                 await context.Response.OutputStream.WriteAsync(buffer.AsMemory(0, read), ct).ConfigureAwait(false);
+                                if (chunkTee.Length + read <= MaxProgressiveUpstreamChunkBytes)
+                                {
+                                    chunkTee.Write(buffer, 0, read);
+                                }
                                 writtenInChunk += read;
                             }
                         }
                         finally
                         {
                             ArrayPool<byte>.Shared.Return(buffer);
+                            if (chunkTee.Length > 0)
+                            {
+                                _chunkCache.StoreChunk(
+                                    videoId,
+                                    expectedMime ?? activeStreamMedia.MimeType,
+                                    activeStreamMedia.Itag,
+                                    totalLength,
+                                    chunkStartOffset,
+                                    chunkTee.GetBuffer().AsSpan(0, (int)chunkTee.Length));
+                            }
                         }
                         await context.Response.OutputStream.FlushAsync(ct).ConfigureAwait(false);
                     }
@@ -857,6 +1805,10 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     }
                     catch
                     {
+                        _healthTracker.MarkFailure(activeStreamMedia.ClientKind, "FULL_READ_DROP");
+                        excludedClients.Add(activeStreamMedia.ClientKind);
+                        _streamCache.TryRemove(videoId, out _);
+
                         if (writtenInChunk <= 0)
                         {
                             break;
@@ -866,6 +1818,16 @@ public sealed partial class NativeDesktopEngine : IDisposable
                         {
                             break;
                         }
+                        ResolvedAudio? recovered = await ResolveAudioStreamAsync(
+                            videoId,
+                            ct,
+                            forceRefresh: true,
+                            excludedClients: excludedClients).ConfigureAwait(false);
+                        if (recovered is null || !IsMatchingMidStream(recovered, expectedMime, totalLength))
+                        {
+                            break;
+                        }
+                        activeStreamMedia = recovered;
                         continue;
                     }
 
@@ -934,11 +1896,17 @@ public sealed partial class NativeDesktopEngine : IDisposable
         return true;
     }
 
+    private static readonly JsonSerializerOptions PlayerPayloadJsonOptions = new()
+    {
+        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+    };
+
     public async Task<ResolvedAudio?> ResolveAudioStreamAsync(
         string? videoId,
         CancellationToken ct = default,
         bool forceRefresh = false,
-        bool preferAlternateClient = false)
+        bool preferAlternateClient = false,
+        IReadOnlySet<string>? excludedClients = null)
     {
         if (!IsValidVideoId(videoId))
         {
@@ -946,20 +1914,25 @@ public sealed partial class NativeDesktopEngine : IDisposable
         }
         string cleanId = videoId!;
 
-        if (!forceRefresh && _streamCache.TryGetValue(cleanId, out ResolvedAudio? cached))
+        if (!forceRefresh &&
+            (excludedClients is null || excludedClients.Count == 0) &&
+            _streamCache.TryGetValue(cleanId, out ResolvedAudio? cached))
         {
-            if (cached.ExpiresAtUtc > DateTimeOffset.UtcNow)
+            if (cached.ExpiresAtUtc > DateTimeOffset.UtcNow && _healthTracker.IsHealthy(cached.ClientKind))
             {
                 return cached;
             }
             _streamCache.TryRemove(cleanId, out _);
         }
 
+        string excludedKey = excludedClients is { Count: > 0 }
+            ? string.Join(',', excludedClients.OrderBy(static x => x, StringComparer.Ordinal))
+            : string.Empty;
         // Coalesce concurrent resolutions for the same videoId so parallel range probes don't hit YouTube multiple times
-        string inflightKey = $"{cleanId}:{(forceRefresh ? '1' : '0')}:{(preferAlternateClient ? '1' : '0')}";
+        string inflightKey = $"{cleanId}:{(forceRefresh ? '1' : '0')}:{(preferAlternateClient ? '1' : '0')}:{excludedKey}";
         Task<ResolvedAudio?> task = _inflightResolutions.GetOrAdd(
             inflightKey,
-            _ => ResolveAudioStreamCoreAsync(cleanId, forceRefresh, preferAlternateClient, _cts.Token)
+            _ => ResolveAudioStreamCoreAsync(cleanId, forceRefresh, preferAlternateClient, excludedClients, _cts.Token)
         );
         try
         {
@@ -985,78 +1958,92 @@ public sealed partial class NativeDesktopEngine : IDisposable
         string cleanId,
         bool forceRefresh,
         bool preferAlternateClient,
+        IReadOnlySet<string>? excludedClients,
         CancellationToken ct)
     {
-        // Range-verify every candidate (including past the 1 MB PoToken boundary) before caching.
-        ResolvedAudio? resolved;
-        if (preferAlternateClient)
+        List<PlaybackClientProfile> candidates = _healthTracker.GetOrderedCandidates(AudioPlaybackClients, excludedClients);
+        if (preferAlternateClient && candidates.Count > 1)
         {
-            resolved = await ResolveViaIosAsync(cleanId, ct).ConfigureAwait(false)
-                ?? await ResolveViaAndroidAsync(cleanId, forceRefreshVisitor: true, ct).ConfigureAwait(false);
-        }
-        else
-        {
-            resolved = await ResolveViaAndroidAsync(cleanId, forceRefreshVisitor: forceRefresh, ct).ConfigureAwait(false)
-                ?? await ResolveViaIosAsync(cleanId, ct).ConfigureAwait(false);
+            // Rotate first candidate to the back when caller explicitly requests an alternate client
+            PlaybackClientProfile first = candidates[0];
+            candidates.RemoveAt(0);
+            candidates.Add(first);
         }
 
-        if (resolved is null)
+        ResolvedAudio? resolved = null;
+        foreach (PlaybackClientProfile profile in candidates)
         {
-            // Run secondary fallback clients in parallel with tight timeouts so worst-case fails fast
-            Task<ResolvedAudio?> vrTask = ResolveViaAndroidVrAsync(cleanId, ct);
-            Task<ResolvedAudio?> visionTask = ResolveViaVisionOsAsync(cleanId, forceRefreshVisitor: true, ct);
-            ResolvedAudio?[] secondary = await Task.WhenAll(vrTask, visionTask).ConfigureAwait(false);
-            resolved = secondary[0] ?? secondary[1];
+            resolved = await ResolveViaClientProfileAsync(cleanId, profile, forceRefreshVisitor: forceRefresh, ct).ConfigureAwait(false);
+            if (resolved is not null)
+            {
+                break;
+            }
         }
 
         if (resolved is not null)
         {
             PruneStreamCacheIfNeeded();
             _streamCache[cleanId] = resolved;
+            _chunkCache.SetMetadata(cleanId, resolved.MimeType, resolved.Itag, resolved.ContentLength);
         }
         return resolved;
     }
 
-    private async Task<ResolvedAudio?> ResolveViaAndroidAsync(
+    private async Task<ResolvedAudio?> ResolveViaClientProfileAsync(
         string videoId,
+        PlaybackClientProfile profile,
         bool forceRefreshVisitor,
         CancellationToken ct)
     {
-        // Only spend a round-trip on visitorData when explicitly forced; ANDROID works fast without it.
-        string? visitorData = forceRefreshVisitor
-            ? await ResolveVisitorDataAsync(forceRefresh: true, ct).ConfigureAwait(false)
-            : (_visitorDataExpiresAtUtc > DateTimeOffset.UtcNow ? _visitorData : null);
-
-        var payloadObj = new
+        string? visitorData = null;
+        if (profile.RequiresVisitorData)
         {
-            context = new
+            visitorData = await ResolveVisitorDataAsync(forceRefreshVisitor, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(visitorData))
             {
-                client = new
-                {
-                    clientName = "ANDROID",
-                    clientVersion = "20.10.38",
-                    androidSdkVersion = 34,
-                    osName = "Android",
-                    osVersion = "14",
-                    visitorData,
-                    hl = "tr",
-                    gl = "TR"
-                }
-            },
-            videoId,
-            contentCheckOk = true,
-            racyCheckOk = true
-        };
+                visitorData = await ResolveVisitorDataAsync(forceRefresh: true, ct).ConfigureAwait(false);
+            }
+            if (string.IsNullOrWhiteSpace(visitorData))
+            {
+                _healthTracker.MarkFailure(profile.Id, "NO_VISITOR_DATA");
+                return null;
+            }
+        }
+        else if (profile.IncludeVisitorDataIfAvailable)
+        {
+            visitorData = forceRefreshVisitor
+                ? await ResolveVisitorDataAsync(forceRefresh: true, ct).ConfigureAwait(false)
+                : (_visitorDataExpiresAtUtc > DateTimeOffset.UtcNow ? _visitorData : null);
+        }
 
-        return await ResolveViaPlayerClientAsync(
-            videoId,
-            payloadObj,
-            AndroidUserAgent,
-            clientNameId: "3",
-            clientVersion: "20.10.38",
-            visitorData: visitorData,
-            clientKind: "ANDROID",
-            ct).ConfigureAwait(false);
+        var clientObj = new Dictionary<string, object?>(12)
+        {
+            ["clientName"] = profile.ClientName,
+            ["clientVersion"] = profile.ClientVersion,
+            ["hl"] = "tr",
+            ["gl"] = "TR"
+        };
+        if (profile.IncludeUserAgentInContext) clientObj["userAgent"] = profile.UserAgent;
+        if (!string.IsNullOrEmpty(profile.OsName)) clientObj["osName"] = profile.OsName;
+        if (!string.IsNullOrEmpty(profile.OsVersion)) clientObj["osVersion"] = profile.OsVersion;
+        if (!string.IsNullOrEmpty(profile.DeviceMake)) clientObj["deviceMake"] = profile.DeviceMake;
+        if (!string.IsNullOrEmpty(profile.DeviceModel)) clientObj["deviceModel"] = profile.DeviceModel;
+        if (!string.IsNullOrEmpty(profile.Platform)) clientObj["platform"] = profile.Platform;
+        if (profile.AndroidSdkVersion.HasValue) clientObj["androidSdkVersion"] = profile.AndroidSdkVersion.Value;
+        if (!string.IsNullOrEmpty(visitorData)) clientObj["visitorData"] = visitorData;
+
+        var payloadObj = new Dictionary<string, object?>(4)
+        {
+            ["context"] = new Dictionary<string, object?>(1) { ["client"] = clientObj },
+            ["videoId"] = videoId
+        };
+        if (profile.IncludeContentFlags)
+        {
+            payloadObj["contentCheckOk"] = true;
+            payloadObj["racyCheckOk"] = true;
+        }
+
+        return await ResolveViaPlayerClientAsync(videoId, profile, payloadObj, visitorData, ct).ConfigureAwait(false);
     }
 
     private async Task<ResolvedAudio?> TryVerifyStreamRangeAsync(ResolvedAudio? candidate, CancellationToken ct)
@@ -1165,6 +2152,91 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 return _visitorData;
             }
 
+            // 1) Fast path: /youtubei/v1/visitor_id
+            string? vd = await FetchVisitorIdEndpointAsync(ct).ConfigureAwait(false);
+
+            // 2) Fallback: www.youtube.com/sw.js_data
+            if (string.IsNullOrWhiteSpace(vd))
+            {
+                vd = await FetchServiceWorkerVisitorDataAsync(ct).ConfigureAwait(false);
+            }
+
+            if (!string.IsNullOrWhiteSpace(vd))
+            {
+                _visitorData = vd;
+                _visitorDataExpiresAtUtc = DateTimeOffset.UtcNow + VisitorDataTtl;
+                return _visitorData;
+            }
+        }
+        catch
+        {
+            // Keep existing visitorData if network fails
+        }
+        finally
+        {
+            _visitorSemaphore.Release();
+        }
+        return _visitorData;
+    }
+
+    private async Task<string?> FetchVisitorIdEndpointAsync(CancellationToken ct)
+    {
+        try
+        {
+            var body = new
+            {
+                context = new
+                {
+                    client = new
+                    {
+                        clientName = "WEB_REMIX",
+                        clientVersion = WebRemixClientVersion,
+                        hl = "tr",
+                        gl = "TR"
+                    }
+                }
+            };
+            using var req = new HttpRequestMessage(
+                HttpMethod.Post,
+                "https://music.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")
+            {
+                Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json")
+            };
+            req.Headers.TryAddWithoutValidation("User-Agent", WebUserAgent);
+            req.Headers.TryAddWithoutValidation("Origin", "https://music.youtube.com");
+            req.Headers.TryAddWithoutValidation("Referer", "https://music.youtube.com/");
+
+            using var visitorCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            visitorCts.CancelAfter(VisitorDataTimeout);
+            using HttpResponseMessage res = await _apiHttpClient.SendAsync(req, visitorCts.Token).ConfigureAwait(false);
+            if (!res.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            await using Stream bodyStream = await res.Content.ReadAsStreamAsync(visitorCts.Token).ConfigureAwait(false);
+            using JsonDocument doc = await JsonDocument.ParseAsync(bodyStream, cancellationToken: visitorCts.Token).ConfigureAwait(false);
+            if (doc.RootElement.TryGetProperty("responseContext", out JsonElement rc) &&
+                rc.ValueKind == JsonValueKind.Object)
+            {
+                string vd = GetString(rc, "visitorData");
+                if (!string.IsNullOrWhiteSpace(vd))
+                {
+                    return vd;
+                }
+            }
+        }
+        catch
+        {
+            // Fall back to sw.js_data
+        }
+        return null;
+    }
+
+    private async Task<string?> FetchServiceWorkerVisitorDataAsync(CancellationToken ct)
+    {
+        try
+        {
             using var req = new HttpRequestMessage(HttpMethod.Get, "https://www.youtube.com/sw.js_data");
             req.Headers.TryAddWithoutValidation("User-Agent", WebUserAgent);
 
@@ -1173,10 +2245,10 @@ public sealed partial class NativeDesktopEngine : IDisposable
             using HttpResponseMessage res = await _apiHttpClient.SendAsync(req, visitorCts.Token).ConfigureAwait(false);
             if (!res.IsSuccessStatusCode)
             {
-                return _visitorData;
+                return null;
             }
 
-            string raw = await res.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            string raw = await res.Content.ReadAsStringAsync(visitorCts.Token).ConfigureAwait(false);
             if (raw.StartsWith(")]}'", StringComparison.Ordinal))
             {
                 raw = raw[4..].TrimStart();
@@ -1202,9 +2274,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                                 string? vd = n200[13].GetString();
                                 if (!string.IsNullOrWhiteSpace(vd))
                                 {
-                                    _visitorData = vd;
-                                    _visitorDataExpiresAtUtc = DateTimeOffset.UtcNow + VisitorDataTtl;
-                                    return _visitorData;
+                                    return vd;
                                 }
                             }
                         }
@@ -1214,123 +2284,16 @@ public sealed partial class NativeDesktopEngine : IDisposable
         }
         catch
         {
-            // Keep existing visitorData if network fails
+            // Ignore sw.js_data error
         }
-        finally
-        {
-            _visitorSemaphore.Release();
-        }
-        return _visitorData;
-    }
-
-    private async Task<ResolvedAudio?> ResolveViaVisionOsAsync(
-        string videoId,
-        bool forceRefreshVisitor,
-        CancellationToken ct)
-    {
-        string? visitorData = await ResolveVisitorDataAsync(forceRefreshVisitor, ct).ConfigureAwait(false);
-        var payloadObj = new
-        {
-            context = new
-            {
-                client = new
-                {
-                    clientName = "VISIONOS",
-                    clientVersion = "1.02",
-                    deviceMake = "Apple",
-                    deviceModel = "RealityDevice17,1",
-                    osName = "visionOS",
-                    osVersion = "26.5.23O471",
-                    visitorData,
-                    hl = "tr",
-                    gl = "TR"
-                }
-            },
-            videoId,
-            contentCheckOk = true,
-            racyCheckOk = true
-        };
-
-        return await ResolveViaPlayerClientAsync(
-            videoId,
-            payloadObj,
-            VisionOsUserAgent,
-            clientNameId: null,
-            clientVersion: null,
-            visitorData: visitorData,
-            clientKind: "VISIONOS",
-            ct).ConfigureAwait(false);
-    }
-
-    private Task<ResolvedAudio?> ResolveViaAndroidVrAsync(string videoId, CancellationToken ct)
-    {
-        var payloadObj = new
-        {
-            context = new
-            {
-                client = new
-                {
-                    clientName = "ANDROID_VR",
-                    clientVersion = "1.57.29",
-                    androidSdkVersion = 34,
-                    hl = "tr",
-                    gl = "TR"
-                }
-            },
-            videoId
-        };
-
-        return ResolveViaPlayerClientAsync(
-            videoId,
-            payloadObj,
-            AndroidVrUserAgent,
-            clientNameId: "28",
-            clientVersion: "1.57.29",
-            visitorData: null,
-            clientKind: "ANDROID_VR",
-            ct);
-    }
-
-    private Task<ResolvedAudio?> ResolveViaIosAsync(string videoId, CancellationToken ct)
-    {
-        var payloadObj = new
-        {
-            context = new
-            {
-                client = new
-                {
-                    clientName = "IOS",
-                    clientVersion = "20.10.4",
-                    deviceMake = "Apple",
-                    deviceModel = "iPhone16,2",
-                    osName = "iPhone",
-                    osVersion = "18.3.2.22D82",
-                    hl = "tr",
-                    gl = "TR"
-                }
-            },
-            videoId
-        };
-
-        return ResolveViaPlayerClientAsync(
-            videoId,
-            payloadObj,
-            IosUserAgent,
-            clientNameId: "5",
-            clientVersion: "20.10.4",
-            visitorData: null,
-            clientKind: "IOS",
-            ct);
+        return null;
     }
 
     private async Task<ResolvedAudio?> ResolveViaPlayerClientAsync(
         string videoId,
+        PlaybackClientProfile profile,
         object payloadObj,
-        string userAgent,
-        string? clientNameId,
-        string? clientVersion,
         string? visitorData,
-        string clientKind,
         CancellationToken ct)
     {
         try
@@ -1338,30 +2301,39 @@ public sealed partial class NativeDesktopEngine : IDisposable
             using var reqCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             reqCts.CancelAfter(ApiRequestTimeout);
 
-            string jsonBody = JsonSerializer.Serialize(payloadObj);
-            using var req = new HttpRequestMessage(
-                HttpMethod.Post,
-                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+            string endpointUrl = profile.UseMusicPlayerEndpoint
+                ? "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
+                : "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+            string jsonBody = JsonSerializer.Serialize(payloadObj, PlayerPayloadJsonOptions);
+
+            using var req = new HttpRequestMessage(HttpMethod.Post, endpointUrl)
             {
                 Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
             };
-            req.Headers.TryAddWithoutValidation("User-Agent", userAgent);
-            if (!string.IsNullOrEmpty(clientNameId))
+            req.Headers.TryAddWithoutValidation("User-Agent", profile.UserAgent);
+            req.Headers.TryAddWithoutValidation("X-Goog-FieldMask", PlayerFieldMask);
+            if (!string.IsNullOrEmpty(profile.ClientId))
             {
-                req.Headers.TryAddWithoutValidation("X-YouTube-Client-Name", clientNameId);
+                req.Headers.TryAddWithoutValidation("X-YouTube-Client-Name", profile.ClientId);
             }
-            if (!string.IsNullOrEmpty(clientVersion))
+            if (!string.IsNullOrEmpty(profile.ClientVersion))
             {
-                req.Headers.TryAddWithoutValidation("X-YouTube-Client-Version", clientVersion);
+                req.Headers.TryAddWithoutValidation("X-YouTube-Client-Version", profile.ClientVersion);
             }
             if (!string.IsNullOrEmpty(visitorData))
             {
                 req.Headers.TryAddWithoutValidation("X-Goog-Visitor-Id", visitorData);
             }
+            if (profile.UseMusicPlayerEndpoint)
+            {
+                req.Headers.TryAddWithoutValidation("Origin", "https://music.youtube.com");
+                req.Headers.TryAddWithoutValidation("Referer", "https://music.youtube.com/");
+            }
 
             using HttpResponseMessage res = await _apiHttpClient.SendAsync(req, reqCts.Token).ConfigureAwait(false);
             if (!res.IsSuccessStatusCode)
             {
+                _healthTracker.MarkFailure(profile.Id, $"PLAYER_HTTP_{(int)res.StatusCode}");
                 return null;
             }
 
@@ -1369,9 +2341,22 @@ public sealed partial class NativeDesktopEngine : IDisposable
             using JsonDocument doc = await JsonDocument.ParseAsync(bodyStream, cancellationToken: reqCts.Token).ConfigureAwait(false);
 
             JsonElement root = doc.RootElement;
+            if (root.TryGetProperty("playabilityStatus", out JsonElement playability) &&
+                playability.ValueKind == JsonValueKind.Object)
+            {
+                string status = GetString(playability, "status");
+                if (!string.IsNullOrEmpty(status) &&
+                    !string.Equals(status, "OK", StringComparison.OrdinalIgnoreCase))
+                {
+                    _healthTracker.MarkFailure(profile.Id, $"PLAYABILITY_{status}");
+                    return null;
+                }
+            }
+
             if (!root.TryGetProperty("streamingData", out JsonElement streamingData) ||
                 streamingData.ValueKind != JsonValueKind.Object)
             {
+                _healthTracker.MarkFailure(profile.Id, "NO_STREAMING_DATA");
                 return null;
             }
 
@@ -1387,7 +2372,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
             }
 
             ResolvedAudio? adaptiveCandidate = null;
-            if (streamingData.TryGetProperty("adaptiveFormats", out JsonElement adaptiveFormats) &&
+            if (profile.SupportsAdaptive &&
+                streamingData.TryGetProperty("adaptiveFormats", out JsonElement adaptiveFormats) &&
                 adaptiveFormats.ValueKind == JsonValueKind.Array)
             {
                 string? bestUrl = null;
@@ -1440,7 +2426,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 {
                     adaptiveCandidate = new ResolvedAudio(
                         videoId, bestUrl, bestMime, bestItag, bestContentLength,
-                        title, artist, durationSec, userAgent, clientKind, DateTimeOffset.UtcNow.Add(StreamCacheTtl));
+                        title, artist, durationSec, profile.UserAgent, profile.Id, DateTimeOffset.UtcNow.Add(StreamCacheTtl));
                 }
             }
 
@@ -1449,12 +2435,14 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 ResolvedAudio? verifiedAdaptive = await TryVerifyStreamRangeAsync(adaptiveCandidate, ct).ConfigureAwait(false);
                 if (verifiedAdaptive is not null)
                 {
+                    _healthTracker.MarkSuccess(profile.Id);
                     return verifiedAdaptive;
                 }
             }
 
-            // Fallback to muxed progressive MP4 (itag=18) from the same player response when adaptive audio is 1MB/PoToken-locked.
-            if (streamingData.TryGetProperty("formats", out JsonElement progressiveFormats) &&
+            // Fallback to muxed progressive MP4 (itag=18/22) from the same player response when adaptive audio is 1MB/PoToken-locked.
+            if (profile.SupportsProgressive &&
+                streamingData.TryGetProperty("formats", out JsonElement progressiveFormats) &&
                 progressiveFormats.ValueKind == JsonValueKind.Array)
             {
                 string? progUrl = null;
@@ -1485,7 +2473,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     }
 
                     // Prefer 360p itag=18 for fastest audio-only playback bandwidth, fall back to 720p itag=22
-                    int score = (mime.StartsWith("video/mp4", StringComparison.OrdinalIgnoreCase) ? 500 : 0);
+                    int score = mime.StartsWith("video/mp4", StringComparison.OrdinalIgnoreCase) ? 500 : 0;
                     if (itag == 18) score += 2000;
                     else if (itag == 22) score += 1000;
                     else score += Math.Max(0, 800 - height);
@@ -1505,11 +2493,17 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 {
                     var progCandidate = new ResolvedAudio(
                         videoId, progUrl, progMime, progItag, progContentLength,
-                        title, artist, durationSec, userAgent, clientKind, DateTimeOffset.UtcNow.Add(StreamCacheTtl));
-                    return await TryVerifyStreamRangeAsync(progCandidate, ct).ConfigureAwait(false);
+                        title, artist, durationSec, profile.UserAgent, profile.Id, DateTimeOffset.UtcNow.Add(StreamCacheTtl));
+                    ResolvedAudio? verifiedProg = await TryVerifyStreamRangeAsync(progCandidate, ct).ConfigureAwait(false);
+                    if (verifiedProg is not null)
+                    {
+                        _healthTracker.MarkSuccess(profile.Id);
+                        return verifiedProg;
+                    }
                 }
             }
 
+            _healthTracker.MarkFailure(profile.Id, "STREAM_PROBE_403_OR_EMPTY");
             return null;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -1518,6 +2512,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
         }
         catch
         {
+            _healthTracker.MarkFailure(profile.Id, "PLAYER_EXCEPTION");
             return null;
         }
     }
@@ -2035,10 +3030,13 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 if (needsAlternateRetry)
                 {
                     retriedAlternate = true;
+                    _healthTracker.MarkFailure(activeMedia.ClientKind, "DOWNLOAD_403");
+                    _streamCache.TryRemove(safeId, out _);
                     TryDeleteTempFile(tempPath);
+                    var excluded = new HashSet<string>(StringComparer.Ordinal) { activeMedia.ClientKind };
                     ResolvedAudio? fallback = wantVideo
                         ? await ResolveMuxedVideoAsync(safeId, skipClient: activeMedia.ClientKind, ct).ConfigureAwait(false)
-                        : await ResolveAudioStreamCoreAsync(safeId, forceRefresh: true, preferAlternateClient: true, ct).ConfigureAwait(false);
+                        : await ResolveAudioStreamCoreAsync(safeId, forceRefresh: true, preferAlternateClient: true, excludedClients: excluded, ct).ConfigureAwait(false);
                     if (fallback is not null && !string.IsNullOrEmpty(fallback.StreamUrl))
                     {
                         activeMedia = fallback;
@@ -2169,7 +3167,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
             if (vrRes is not null) return vrRes;
         }
 
-        if (!string.Equals(skipClient, "VISIONOS", StringComparison.Ordinal))
+        if (!string.Equals(skipClient, "VISIONOS_0_1", StringComparison.Ordinal) &&
+            !string.Equals(skipClient, "VISIONOS", StringComparison.Ordinal))
         {
             var visionPayload = new
             {
@@ -2178,11 +3177,12 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     client = new
                     {
                         clientName = "VISIONOS",
-                        clientVersion = "1.02",
+                        clientVersion = "0.1",
                         deviceMake = "Apple",
-                        deviceModel = "RealityDevice17,1",
-                        osName = "visionOS",
-                        osVersion = "26.5.23O471",
+                        deviceModel = "RealityDevice14,1",
+                        osName = "VISION_OS",
+                        osVersion = "1.3",
+                        platform = "MOBILE",
                         visitorData,
                         hl = "tr",
                         gl = "TR"
@@ -2195,7 +3195,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
 
             ResolvedAudio? visionRes = await TryVerifyStreamRangeAsync(
                 await ResolveMuxedVideoFromClientAsync(
-                    videoId, visionPayload, VisionOsUserAgent, null, null, visitorData, "VISIONOS", ct).ConfigureAwait(false),
+                    videoId, visionPayload, VisionOs01UserAgent, "101", "0.1", visitorData, "VISIONOS_0_1", ct).ConfigureAwait(false),
                 ct).ConfigureAwait(false);
             if (visionRes is not null) return visionRes;
         }
@@ -2223,6 +3223,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
             };
             req.Headers.TryAddWithoutValidation("User-Agent", userAgent);
+            req.Headers.TryAddWithoutValidation("X-Goog-FieldMask", PlayerFieldMask);
             if (!string.IsNullOrEmpty(clientNameId)) req.Headers.TryAddWithoutValidation("X-YouTube-Client-Name", clientNameId);
             if (!string.IsNullOrEmpty(clientVersion)) req.Headers.TryAddWithoutValidation("X-YouTube-Client-Version", clientVersion);
             if (!string.IsNullOrEmpty(visitorData)) req.Headers.TryAddWithoutValidation("X-Goog-Visitor-Id", visitorData);
