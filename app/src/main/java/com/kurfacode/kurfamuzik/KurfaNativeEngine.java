@@ -67,12 +67,16 @@ final class KurfaNativeEngine {
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15";
     private static final String IOS_UA =
             "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)";
+    private static final String ANDROID_UA =
+            "com.google.android.youtube/20.10.38 (Linux; U; Android 14; en_US; Pixel 8) gzip";
     private static final String ANDROID_VR_UA =
             "com.google.android.apps.youtube.vr.oculus/1.57.29 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip";
     private static final long VISITOR_DATA_TTL_MS = 30L * 60L * 1000L;
-    private static final long MAX_GENERAL_CHUNK_BYTES = 10L * 1024L * 1024L;
-    private static final long MAX_IOS_CHUNK_BYTES = 2L * 1024L * 1024L;
+    private static final long MAX_ADAPTIVE_CHUNK_BYTES = 512L * 1024L;
+    private static final long MAX_PROGRESSIVE_CHUNK_BYTES = 2L * 1024L * 1024L;
     private static final long HEAD_PROBE_END_BYTE = 1023L;
+    private static final long TAIL_PROBE_START_BYTE = 1_048_576L;
+    private static final long TAIL_PROBE_END_BYTE = 1_310_719L;
     private static final MediaType JSON_MEDIA_TYPE = MediaType.get("application/json; charset=utf-8");
 
     static final class ResolvedAudio {
@@ -174,6 +178,13 @@ final class KurfaNativeEngine {
         return resolveAudioStream(videoId, false, false);
     }
 
+    private static long resolveChunkCap(ResolvedAudio audio) {
+        if (audio != null && audio.mimeType != null && audio.mimeType.startsWith("video/")) {
+            return MAX_PROGRESSIVE_CHUNK_BYTES;
+        }
+        return MAX_ADAPTIVE_CHUNK_BYTES;
+    }
+
     static ResolvedAudio resolveAudioStream(String videoId, boolean forceRefresh, boolean preferAlternate) {
         if (!isValidVideoId(videoId)) {
             return null;
@@ -190,16 +201,18 @@ final class KurfaNativeEngine {
 
         ResolvedAudio resolved = null;
         if (preferAlternate) {
-            resolved = tryVerifiedAudioCandidate(resolveViaAndroidVr(videoId));
-            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaIos(videoId));
-            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaVisionOs(videoId, true));
+            resolved = resolveViaAndroid(videoId);
+            if (resolved == null) resolved = resolveViaIos(videoId);
             if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaNewPipe(videoId));
+            if (resolved == null) resolved = resolveViaAndroidVr(videoId);
+            if (resolved == null) resolved = resolveViaVisionOs(videoId, true);
         } else {
-            // Prefer NewPipe first: solves YouTube n-parameter throttling and avoids VisionOS/iOS mid-stream 403 drops
+            // Prefer NewPipe first, then verified ANDROID (with itag=18 fallback), then IOS / ANDROID_VR / VISIONOS
             resolved = tryVerifiedAudioCandidate(resolveViaNewPipe(videoId));
-            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaAndroidVr(videoId));
-            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaIos(videoId));
-            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaVisionOs(videoId, forceRefresh));
+            if (resolved == null) resolved = resolveViaAndroid(videoId);
+            if (resolved == null) resolved = resolveViaIos(videoId);
+            if (resolved == null) resolved = resolveViaAndroidVr(videoId);
+            if (resolved == null) resolved = resolveViaVisionOs(videoId, forceRefresh);
         }
 
         if (resolved != null) {
@@ -225,7 +238,25 @@ final class KurfaNativeEngine {
                 return null;
             }
             long totalLen = parseTotalLengthFromContentRange(res.header("Content-Range"));
+            if (totalLen <= 0L && code == 200) totalLen = parseLongSafe(res.header("Content-Length"));
             if (totalLen <= 0L) totalLen = candidate.contentLength;
+
+            if (totalLen > TAIL_PROBE_START_BYTE) {
+                long tailEnd = Math.min(TAIL_PROBE_END_BYTE, totalLen - 1L);
+                okhttp3.Request tailReq = new okhttp3.Request.Builder()
+                        .url(candidate.streamUrl)
+                        .get()
+                        .header("User-Agent", candidate.requestUserAgent)
+                        .header("Range", "bytes=" + TAIL_PROBE_START_BYTE + "-" + tailEnd)
+                        .build();
+                try (okhttp3.Response tailRes = HTTP_CLIENT.newCall(tailReq).execute()) {
+                    int tailCode = tailRes.code();
+                    if (tailCode < 200 || tailCode >= 300) {
+                        return null;
+                    }
+                }
+            }
+
             if (totalLen > 0L && candidate.contentLength <= 0L) {
                 return new ResolvedAudio(
                         candidate.videoId,
@@ -421,6 +452,27 @@ final class KurfaNativeEngine {
         }
     }
 
+    private static ResolvedAudio resolveViaAndroid(String videoId) {
+        try {
+            JSONObject client = new JSONObject()
+                    .put("clientName", "ANDROID")
+                    .put("clientVersion", "20.10.38")
+                    .put("androidSdkVersion", 34)
+                    .put("osName", "Android")
+                    .put("osVersion", "14")
+                    .put("hl", "tr")
+                    .put("gl", "TR");
+            JSONObject payload = new JSONObject()
+                    .put("context", new JSONObject().put("client", client))
+                    .put("videoId", videoId)
+                    .put("contentCheckOk", true)
+                    .put("racyCheckOk", true);
+            return executePlayerClient(videoId, payload, ANDROID_UA, "3", "20.10.38", null, "ANDROID");
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
     private static ResolvedAudio resolveViaAndroidVr(String videoId) {
         try {
             JSONObject client = new JSONObject()
@@ -470,48 +522,89 @@ final class KurfaNativeEngine {
             if (streamingData == null) {
                 return null;
             }
-            JSONArray adaptive = streamingData.optJSONArray("adaptiveFormats");
-            if (adaptive == null) {
-                return null;
-            }
 
-            String bestUrl = null;
-            String bestMime = "audio/mp4";
-            long bestContentLength = 0L;
-            int bestScore = Integer.MIN_VALUE;
-
-            for (int i = 0; i < adaptive.length(); i++) {
-                JSONObject f = adaptive.optJSONObject(i);
-                if (f == null) continue;
-                String mime = f.optString("mimeType", "");
-                String url = f.optString("url", "");
-                if (!mime.startsWith("audio/") || url.isEmpty()) continue;
-
-                int itag = f.optInt("itag", 0);
-                int bitrate = f.optInt("bitrate", 0);
-                long contentLen = parseLongSafe(f.optString("contentLength", ""));
-                int score = 0;
-                if (itag == 140) score += 1000;
-                else if (mime.startsWith("audio/mp4")) score += 500;
-                else if (mime.startsWith("audio/webm")) score += 300;
-                if (bitrate >= 96_000 && bitrate <= 192_000) score += 200;
-
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestUrl = url;
-                    bestContentLength = contentLen;
-                    bestMime = mime.contains(";") ? mime.substring(0, mime.indexOf(';')).trim() : mime;
-                }
-            }
-
-            if (bestUrl == null) {
-                return null;
-            }
             JSONObject details = json.optJSONObject("videoDetails");
             String title = details != null ? details.optString("title", "") : "";
             String author = details != null ? details.optString("author", "") : "";
             long dur = details != null ? details.optLong("lengthSeconds", 0L) : 0L;
-            return new ResolvedAudio(videoId, bestUrl, bestMime, title, author, dur, bestContentLength, userAgent, clientKind);
+
+            JSONArray adaptive = streamingData.optJSONArray("adaptiveFormats");
+            if (adaptive != null) {
+                String bestUrl = null;
+                String bestMime = "audio/mp4";
+                long bestContentLength = 0L;
+                int bestScore = Integer.MIN_VALUE;
+
+                for (int i = 0; i < adaptive.length(); i++) {
+                    JSONObject f = adaptive.optJSONObject(i);
+                    if (f == null) continue;
+                    String mime = f.optString("mimeType", "");
+                    String url = f.optString("url", "");
+                    if (!mime.startsWith("audio/") || url.isEmpty()) continue;
+
+                    int itag = f.optInt("itag", 0);
+                    int bitrate = f.optInt("bitrate", 0);
+                    long contentLen = parseLongSafe(f.optString("contentLength", ""));
+                    int score = 0;
+                    if (itag == 140) score += 1000;
+                    else if (mime.startsWith("audio/mp4")) score += 500;
+                    else if (mime.startsWith("audio/webm")) score += 300;
+                    if (bitrate >= 96_000 && bitrate <= 192_000) score += 200;
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestUrl = url;
+                        bestContentLength = contentLen;
+                        bestMime = mime.contains(";") ? mime.substring(0, mime.indexOf(';')).trim() : mime;
+                    }
+                }
+
+                if (bestUrl != null) {
+                    ResolvedAudio verifiedAdaptive = tryVerifiedAudioCandidate(
+                            new ResolvedAudio(videoId, bestUrl, bestMime, title, author, dur, bestContentLength, userAgent, clientKind));
+                    if (verifiedAdaptive != null) {
+                        return verifiedAdaptive;
+                    }
+                }
+            }
+
+            JSONArray formats = streamingData.optJSONArray("formats");
+            if (formats != null) {
+                String progUrl = null;
+                String progMime = "video/mp4";
+                long progContentLength = 0L;
+                int progScore = Integer.MIN_VALUE;
+
+                for (int i = 0; i < formats.length(); i++) {
+                    JSONObject f = formats.optJSONObject(i);
+                    if (f == null) continue;
+                    String mime = f.optString("mimeType", "");
+                    String url = f.optString("url", "");
+                    if ((!mime.startsWith("video/mp4") && !mime.startsWith("video/webm")) || url.isEmpty()) continue;
+
+                    int itag = f.optInt("itag", 0);
+                    int height = f.optInt("height", 0);
+                    long contentLen = parseLongSafe(f.optString("contentLength", ""));
+                    int score = mime.startsWith("video/mp4") ? 500 : 0;
+                    if (itag == 18) score += 2000;
+                    else if (itag == 22) score += 1000;
+                    else score += Math.max(0, 800 - height);
+
+                    if (score > progScore) {
+                        progScore = score;
+                        progUrl = url;
+                        progContentLength = contentLen;
+                        progMime = mime.contains(";") ? mime.substring(0, mime.indexOf(';')).trim() : "video/mp4";
+                    }
+                }
+
+                if (progUrl != null) {
+                    return tryVerifiedAudioCandidate(
+                            new ResolvedAudio(videoId, progUrl, progMime, title, author, dur, progContentLength, userAgent, clientKind));
+                }
+            }
+
+            return null;
         } catch (Exception ignored) {
             return null;
         }
@@ -628,7 +721,7 @@ final class KurfaNativeEngine {
             }
             expectedMime = cleanMimeType(null, audio.mimeType);
             expectedLength = audio.contentLength;
-            long chunkCap = "IOS".equals(audio.clientKind) ? MAX_IOS_CHUNK_BYTES : MAX_GENERAL_CHUNK_BYTES;
+            long chunkCap = resolveChunkCap(audio);
 
             try {
                 if (isHead && parsedRange == null) {
@@ -1134,7 +1227,7 @@ final class KurfaNativeEngine {
             DownloadProgressListener listener
     ) throws IOException {
         if (media == null || out == null) throw new IOException("Invalid media");
-        long chunkCap = "IOS".equals(media.clientKind) ? MAX_IOS_CHUNK_BYTES : MAX_GENERAL_CHUNK_BYTES;
+        long chunkCap = resolveChunkCap(media);
         long totalBytes = media.contentLength;
         long offset = 0L;
         long lastNotify = 0L;

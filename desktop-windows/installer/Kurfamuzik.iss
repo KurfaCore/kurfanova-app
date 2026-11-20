@@ -1,6 +1,7 @@
 ﻿#ifndef MyAppVersion
   #define MyAppVersion "1.2.0"
 #endif
+#define MyAppGuid "{8E3A4F21-7C9B-4D82-A1F6-3E92D5B74C10}"
 #ifndef SourceDir
   #define SourceDir "..\bin\Release\net10.0-windows\win-x64\publish"
 #endif
@@ -57,11 +58,23 @@ turkish.AdditionalOptions=Başlangıç Seçenekleri:
 english.AdditionalOptions=Startup Options:
 turkish.DeleteUserDataPrompt=Favoriler, çalma listeleri ve ayarlar (user-data.json) da silinsin mi?%n%n'Hayır' seçerseniz gelecekte yeniden kurduğunuzda verileriniz korunur.
 english.DeleteUserDataPrompt=Do you also want to delete your favorites, playlists, and settings (user-data.json)?%n%nIf you select 'No', your data will be preserved for future installations.
+turkish.AlreadyInstalledPrompt=Kurfamüzik (v%1) bilgisayarınızda zaten kurulu.%n%nMevcut program dosyaları temizlenip v%2 sürümü üzerine kurulacaktır. Favorileriniz, çalma listeleriniz ve ayarlarınız korunur.%n%nDevam etmek istiyor musunuz?
+english.AlreadyInstalledPrompt=Kurfamüzik (v%1) is already installed on your computer.%n%nExisting program files will be replaced cleanly with v%2. Your favorites, playlists, and settings will be preserved.%n%nDo you want to continue?
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 Name: "startmenuicon"; Description: "{cm:StartMenuTask}"; GroupDescription: "{cm:AdditionalIcons}"
 Name: "startupicon"; Description: "{cm:RunOnStartupTask}"; GroupDescription: "{cm:AdditionalOptions}"; Flags: unchecked
+
+[InstallDelete]
+; Clean stale program binaries/runtimes before copying fresh files while preserving unins*, Data/, user-data.json and config.json
+Type: files; Name: "{app}\*.dll"
+Type: files; Name: "{app}\*.pdb"
+Type: files; Name: "{app}\*.deps.json"
+Type: files; Name: "{app}\*.runtimeconfig.json"
+Type: files; Name: "{app}\Kurfanova*.exe"
+Type: files; Name: "{app}\createdump.exe"
+Type: filesandordirs; Name: "{app}\runtimes"
 
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "*.pdb"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -92,6 +105,66 @@ Filename: "{app}\Kurfanova-Muzik-Windows.exe"; Description: "{cm:LaunchProgram,K
 Filename: "{app}\Kurfanova-Muzik-Windows.exe"; Parameters: "--post-update-pid 0"; Flags: nowait skipifnotsilent; Check: ShouldRelaunchSilent
 
 [Code]
+function DetectExistingInstallVersion(var OutVersion: String): Boolean;
+var
+  UninstallKey: String;
+  LegacyKey: String;
+  BrandKey: String;
+  ExistingExe1: String;
+  ExistingExe2: String;
+begin
+  Result := False;
+  OutVersion := '';
+  UninstallKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\{#MyAppGuid}_is1';
+  LegacyKey := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\KurfanovaMuzik';
+  BrandKey := 'Software\KurfaCore\KurfanovaMuzik';
+
+  if RegKeyExists(HKCU, UninstallKey) then
+  begin
+    Result := True;
+    RegQueryStringValue(HKCU, UninstallKey, 'DisplayVersion', OutVersion);
+  end
+  else if RegKeyExists(HKCU, LegacyKey) then
+  begin
+    Result := True;
+    RegQueryStringValue(HKCU, LegacyKey, 'DisplayVersion', OutVersion);
+  end;
+
+  if (OutVersion = '') and RegKeyExists(HKCU, BrandKey) then
+  begin
+    if RegQueryStringValue(HKCU, BrandKey, 'Version', OutVersion) then
+      Result := True;
+  end;
+
+  if not Result then
+  begin
+    ExistingExe1 := ExpandConstant('{localappdata}\Programs\Kurfamuzik\Kurfanova-Muzik-Windows.exe');
+    ExistingExe2 := ExpandConstant('{localappdata}\KurfanovaMuzik\Kurfanova-Muzik-Windows.exe');
+    if FileExists(ExistingExe1) or FileExists(ExistingExe2) then
+      Result := True;
+  end;
+
+  if OutVersion = '' then
+    OutVersion := '1.x';
+end;
+
+function InitializeSetup(): Boolean;
+var
+  InstalledVer: String;
+  PromptMsg: String;
+begin
+  Result := True;
+  if WizardSilent then
+    Exit;
+
+  if DetectExistingInstallVersion(InstalledVer) then
+  begin
+    PromptMsg := FmtMessage(CustomMessage('AlreadyInstalledPrompt'), [InstalledVer, '{#MyAppVersion}']);
+    if MsgBox(PromptMsg, mbConfirmation, MB_YESNO or MB_DEFBUTTON1) <> IDYES then
+      Result := False;
+  end;
+end;
+
 function ShouldRelaunchSilent: Boolean;
 begin
   Result := ExpandConstant('{param:relaunch|0}') = '1';
