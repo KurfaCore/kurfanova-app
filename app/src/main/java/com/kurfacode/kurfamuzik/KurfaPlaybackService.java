@@ -18,7 +18,9 @@ import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
 import android.net.wifi.WifiManager;
 import android.os.Build;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.webkit.WebView;
 
@@ -52,13 +54,40 @@ public class KurfaPlaybackService extends Service {
     private static volatile long currentPositionMs = PlaybackState.PLAYBACK_POSITION_UNKNOWN;
     private static volatile Bitmap currentArtwork = null;
     private static WeakReference<WebView> activeWebView = new WeakReference<>(null);
+    private static WeakReference<KurfaPlaybackService> activeService = new WeakReference<>(null);
+    private static final Handler MAIN_HANDLER = new Handler(Looper.getMainLooper());
 
     private MediaSession mediaSession;
     private NotificationManager notificationManager;
+    private AudioManager audioManager;
+    private AudioFocusRequest audioFocusRequest;
+    private volatile boolean hasAudioFocus = false;
+    private volatile boolean pausedByAudioFocus = false;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private final ExecutorService artExecutor = Executors.newSingleThreadExecutor();
     private volatile String lastLoadedArtUrl = "";
+
+    private final AudioManager.OnAudioFocusChangeListener audioFocusListener = focusChange -> {
+        if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
+            hasAudioFocus = false;
+            pausedByAudioFocus = false;
+            if (isPlaying) {
+                dispatchPlayPauseJs(false);
+            }
+        } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
+            if (isPlaying) {
+                pausedByAudioFocus = true;
+                dispatchPlayPauseJs(false);
+            }
+        } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
+            hasAudioFocus = true;
+            if (pausedByAudioFocus && !isPlaying) {
+                pausedByAudioFocus = false;
+                dispatchPlayPauseJs(true);
+            }
+        }
+    };
 
     public static void attachWebView(WebView view) {
         activeWebView = new WeakReference<>(view);
@@ -89,6 +118,16 @@ public class KurfaPlaybackService extends Service {
         currentTitle = (title != null && !title.trim().isEmpty()) ? title.trim() : "Kurfanova Müzik";
         currentArtist = (artist != null && !artist.trim().isEmpty()) ? artist.trim() : "Kurfanova";
         currentThumbUrl = thumbUrl != null ? thumbUrl.trim() : "";
+        KurfaPlaybackService svc = activeService.get();
+        if (svc != null) {
+            MAIN_HANDLER.post(() -> {
+                if (activeService.get() == svc) {
+                    svc.updateSessionAndNotification(false);
+                    svc.loadArtworkAsyncIfNeeded();
+                }
+            });
+            return;
+        }
         if (ctx != null && isPlaying) {
             updateState(ctx, true);
         }
@@ -97,6 +136,15 @@ public class KurfaPlaybackService extends Service {
     public static void updateProgress(Context ctx, long positionSec, long durationSec) {
         currentPositionMs = positionSec >= 0 ? positionSec * 1000L : PlaybackState.PLAYBACK_POSITION_UNKNOWN;
         currentDurationMs = durationSec > 0 ? durationSec * 1000L : -1L;
+        KurfaPlaybackService svc = activeService.get();
+        if (svc != null) {
+            MAIN_HANDLER.post(() -> {
+                if (activeService.get() == svc) {
+                    svc.updateSessionPlaybackStateOnly();
+                }
+            });
+            return;
+        }
         if (ctx != null && isPlaying) {
             updateState(ctx, true);
         }
@@ -115,7 +163,9 @@ public class KurfaPlaybackService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        activeService = new WeakReference<>(this);
         notificationManager = (NotificationManager) getSystemService(Context.NOTIFICATION_SERVICE);
+        audioManager = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
         ensureNotificationChannel();
         initMediaSession();
         initLocks();
@@ -218,9 +268,14 @@ public class KurfaPlaybackService extends Service {
         }
 
         if (isPlaying) {
+            pausedByAudioFocus = false;
+            requestAudioFocus();
             acquireLocks();
         } else {
             releaseLocks();
+            if (!pausedByAudioFocus) {
+                abandonAudioFocus();
+            }
         }
 
         updateSessionAndNotification(ACTION_SYNC.equals(action) || isPlaying);
@@ -229,6 +284,86 @@ public class KurfaPlaybackService extends Service {
         }
         loadArtworkAsyncIfNeeded();
         return START_STICKY;
+    }
+
+    private void updateSessionPlaybackStateOnly() {
+        if (mediaSession == null) return;
+        try {
+            PlaybackState state = new PlaybackState.Builder()
+                    .setActions(
+                            PlaybackState.ACTION_PLAY |
+                            PlaybackState.ACTION_PAUSE |
+                            PlaybackState.ACTION_PLAY_PAUSE |
+                            PlaybackState.ACTION_SKIP_TO_NEXT |
+                            PlaybackState.ACTION_SKIP_TO_PREVIOUS |
+                            PlaybackState.ACTION_SEEK_TO |
+                            PlaybackState.ACTION_STOP
+                    )
+                    .setState(
+                            isPlaying ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
+                            currentPositionMs,
+                            isPlaying ? 1.0f : 0.0f
+                    )
+                    .build();
+            mediaSession.setPlaybackState(state);
+        } catch (Throwable ignored) {}
+    }
+
+    private void requestAudioFocus() {
+        if (audioManager == null || hasAudioFocus) return;
+        try {
+            int res;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                if (audioFocusRequest == null) {
+                    AudioAttributes attrs = new AudioAttributes.Builder()
+                            .setUsage(AudioAttributes.USAGE_MEDIA)
+                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                            .build();
+                    audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                            .setAudioAttributes(attrs)
+                            .setAcceptsDelayedFocusGain(true)
+                            .setOnAudioFocusChangeListener(audioFocusListener, MAIN_HANDLER)
+                            .build();
+                }
+                res = audioManager.requestAudioFocus(audioFocusRequest);
+            } else {
+                @SuppressWarnings("deprecation")
+                int legacyRes = audioManager.requestAudioFocus(
+                        audioFocusListener,
+                        AudioManager.STREAM_MUSIC,
+                        AudioManager.AUDIOFOCUS_GAIN
+                );
+                res = legacyRes;
+            }
+            hasAudioFocus = (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
+        } catch (Throwable ignored) {}
+    }
+
+    private void abandonAudioFocus() {
+        if (audioManager == null || !hasAudioFocus) return;
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && audioFocusRequest != null) {
+                audioManager.abandonAudioFocusRequest(audioFocusRequest);
+            } else {
+                @SuppressWarnings("deprecation")
+                int ignored = audioManager.abandonAudioFocus(audioFocusListener);
+            }
+        } catch (Throwable ignored) {}
+        hasAudioFocus = false;
+    }
+
+    private void dispatchPlayPauseJs(boolean play) {
+        WebView wv = activeWebView.get();
+        if (wv == null) return;
+        String specificFn = play ? "kurfaNativePlay" : "kurfaNativePause";
+        wv.post(() -> {
+            try {
+                wv.evaluateJavascript(
+                        "if(typeof " + specificFn + "==='function'){" + specificFn + "();}else if(typeof kurfaNativeTogglePlay==='function'){kurfaNativeTogglePlay();}",
+                        null
+                );
+            } catch (Throwable ignored) {}
+        });
     }
 
     private void updateSessionAndNotification(boolean asForeground) {
@@ -427,7 +562,11 @@ public class KurfaPlaybackService extends Service {
 
     @Override
     public void onDestroy() {
+        if (activeService.get() == this) {
+            activeService = new WeakReference<>(null);
+        }
         releaseLocks();
+        abandonAudioFocus();
         if (mediaSession != null) {
             try {
                 mediaSession.setActive(false);

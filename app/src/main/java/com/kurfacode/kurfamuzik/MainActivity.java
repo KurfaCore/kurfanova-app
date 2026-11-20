@@ -1545,7 +1545,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onPause() {
         CookieManager.getInstance().flush();
-        if (KurfaPlaybackService.isPlaying && webView != null) {
+        if ((KurfaPlaybackService.isPlaying || KurfaWebView.keepAliveInBackground) && webView != null) {
             try {
                 webView.onResume();
                 webView.resumeTimers();
@@ -1558,7 +1558,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onStop() {
         super.onStop();
-        if (KurfaPlaybackService.isPlaying && webView != null) {
+        if ((KurfaPlaybackService.isPlaying || KurfaWebView.keepAliveInBackground) && webView != null) {
             try {
                 webView.onResume();
                 webView.resumeTimers();

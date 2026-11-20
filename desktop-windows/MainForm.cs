@@ -144,6 +144,8 @@ public sealed class MainForm : Form
         {
             CoreWebView2? core = _webView.CoreWebView2;
             if (core is null) return;
+            // Never throttle/suspend WebView2 while playing or while mini-player is open;
+            // keeping Normal memory target in tray/minimized avoids Chromium media pipeline stalls.
             bool isBackground = WindowState == FormWindowState.Minimized || !Visible;
             bool keepActiveForPlayback = _isAudioPlaying || (_miniPlayer is { Visible: true });
             core.MemoryUsageTargetLevel = (isBackground && !keepActiveForPlayback)
@@ -288,7 +290,7 @@ public sealed class MainForm : Form
             Directory.CreateDirectory(_paths.WebView2DataDir);
 
             var envOptions = new CoreWebView2EnvironmentOptions(
-                "--autoplay-policy=no-user-gesture-required --disk-cache-size=33554432 --media-cache-size=33554432 --disable-features=CalculateNativeWinOcclusion"
+                "--autoplay-policy=no-user-gesture-required --disk-cache-size=33554432 --media-cache-size=33554432 --disable-features=CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows"
             );
             CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, _paths.WebView2DataDir, envOptions);
             await _webView.EnsureCoreWebView2Async(env);
@@ -1379,9 +1381,17 @@ public sealed class MainForm : Form
                     {
                         if (hasMiniPlaying)
                         {
+                            bool changed = _isAudioPlaying != miniPlaying;
                             _isAudioPlaying = miniPlaying;
+                            if (changed && !IsDisposed && IsHandleCreated)
+                            {
+                                BeginInvoke(UpdateWebViewMemoryMode);
+                            }
                         }
-                        ToggleOrUpdateMiniPlayer(false, downloadTitle, miniArtist, miniThumb, miniPlaying, miniMuted, miniCur, miniDur);
+                        if (_miniPlayer is { IsDisposed: false, Visible: true })
+                        {
+                            ToggleOrUpdateMiniPlayer(false, downloadTitle, miniArtist, miniThumb, miniPlaying, miniMuted, miniCur, miniDur);
+                        }
                         responseObj = new { success = true };
                         break;
                     }

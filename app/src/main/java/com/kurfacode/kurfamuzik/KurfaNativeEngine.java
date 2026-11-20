@@ -23,7 +23,6 @@ import org.schabi.newpipe.extractor.stream.StreamType;
 import org.schabi.newpipe.extractor.stream.VideoStream;
 
 import java.io.ByteArrayInputStream;
-import java.io.FilterInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
@@ -116,14 +115,16 @@ final class KurfaNativeEngine {
     }
 
     private static final OkHttpClient HTTP_CLIENT = new OkHttpClient.Builder()
-            .connectTimeout(15, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .connectionPool(new ConnectionPool(8, 3, TimeUnit.MINUTES))
+            .connectTimeout(6, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .writeTimeout(10, TimeUnit.SECONDS)
+            .connectionPool(new ConnectionPool(10, 2, TimeUnit.MINUTES))
             .retryOnConnectionFailure(true)
             .followRedirects(true)
             .build();
 
     private static final ConcurrentHashMap<String, ResolvedAudio> STREAM_CACHE = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, Object> RESOLVE_LOCKS = new ConcurrentHashMap<>();
     private static final Object VISITOR_LOCK = new Object();
     private static volatile String cachedVisitorData = null;
     private static volatile long cachedVisitorDataExpiresAt = 0L;
@@ -191,35 +192,38 @@ final class KurfaNativeEngine {
         }
         ensureInitialized();
 
-        if (!forceRefresh) {
-            ResolvedAudio cached = STREAM_CACHE.get(videoId);
-            if (cached != null && cached.expiresAt > System.currentTimeMillis()) {
-                return cached;
+        Object lock = RESOLVE_LOCKS.computeIfAbsent(videoId, k -> new Object());
+        synchronized (lock) {
+            if (!forceRefresh) {
+                ResolvedAudio cached = STREAM_CACHE.get(videoId);
+                if (cached != null && cached.expiresAt > System.currentTimeMillis()) {
+                    return cached;
+                }
             }
-        }
-        STREAM_CACHE.remove(videoId);
+            STREAM_CACHE.remove(videoId);
 
-        ResolvedAudio resolved = null;
-        if (preferAlternate) {
-            resolved = resolveViaAndroid(videoId);
-            if (resolved == null) resolved = resolveViaIos(videoId);
-            if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaNewPipe(videoId));
-            if (resolved == null) resolved = resolveViaAndroidVr(videoId);
-            if (resolved == null) resolved = resolveViaVisionOs(videoId, true);
-        } else {
-            // Prefer NewPipe first, then verified ANDROID (with itag=18 fallback), then IOS / ANDROID_VR / VISIONOS
-            resolved = tryVerifiedAudioCandidate(resolveViaNewPipe(videoId));
-            if (resolved == null) resolved = resolveViaAndroid(videoId);
-            if (resolved == null) resolved = resolveViaIos(videoId);
-            if (resolved == null) resolved = resolveViaAndroidVr(videoId);
-            if (resolved == null) resolved = resolveViaVisionOs(videoId, forceRefresh);
-        }
+            ResolvedAudio resolved = null;
+            if (preferAlternate) {
+                resolved = resolveViaAndroid(videoId);
+                if (resolved == null) resolved = resolveViaIos(videoId);
+                if (resolved == null) resolved = tryVerifiedAudioCandidate(resolveViaNewPipe(videoId));
+                if (resolved == null) resolved = resolveViaAndroidVr(videoId);
+                if (resolved == null) resolved = resolveViaVisionOs(videoId, true);
+            } else {
+                // Prefer NewPipe first, then verified ANDROID (with itag=18 fallback), then IOS / ANDROID_VR / VISIONOS
+                resolved = tryVerifiedAudioCandidate(resolveViaNewPipe(videoId));
+                if (resolved == null) resolved = resolveViaAndroid(videoId);
+                if (resolved == null) resolved = resolveViaIos(videoId);
+                if (resolved == null) resolved = resolveViaAndroidVr(videoId);
+                if (resolved == null) resolved = resolveViaVisionOs(videoId, forceRefresh);
+            }
 
-        if (resolved != null) {
-            pruneCacheIfNeeded();
-            STREAM_CACHE.put(videoId, resolved);
+            if (resolved != null) {
+                pruneCacheIfNeeded();
+                STREAM_CACHE.put(videoId, resolved);
+            }
+            return resolved;
         }
-        return resolved;
     }
 
     private static ResolvedAudio tryVerifiedAudioCandidate(ResolvedAudio candidate) {
@@ -701,26 +705,30 @@ final class KurfaNativeEngine {
         }
         long[] parsedRange = parseByteRangeHeader(rangeHeader);
         boolean isHead = "HEAD".equalsIgnoreCase(method);
-        boolean forceAlternate = false;
         String expectedMime = null;
         long expectedLength = -1L;
 
-        for (int attempt = 0; attempt < 2; attempt++) {
-            ResolvedAudio audio = resolveAudioStream(videoId, attempt > 0, forceAlternate);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            boolean forceRefresh = attempt > 0;
+            boolean forceAlternate = attempt >= 2;
+            ResolvedAudio audio = resolveAudioStream(videoId, forceRefresh, forceAlternate);
             if (audio == null) {
                 break;
             }
+            String candidateMime = cleanMimeType(null, audio.mimeType);
             if (attempt > 0 && parsedRange != null && parsedRange[0] > 0L) {
                 // Avoid feeding bytes from a differently-encoded stream mid-file into Chromium's decoder
-                if (expectedMime != null && !expectedMime.equals(cleanMimeType(null, audio.mimeType))) {
-                    return buildErrorResponse(502, "Stream format changed", allowOrigin);
+                if (expectedMime != null && !expectedMime.equals(candidateMime)) {
+                    continue;
                 }
                 if (expectedLength > 0L && audio.contentLength > 0L && expectedLength != audio.contentLength) {
-                    return buildErrorResponse(502, "Stream length changed", allowOrigin);
+                    continue;
                 }
             }
-            expectedMime = cleanMimeType(null, audio.mimeType);
-            expectedLength = audio.contentLength;
+            if (attempt == 0) {
+                expectedMime = candidateMime;
+                expectedLength = audio.contentLength;
+            }
             long chunkCap = resolveChunkCap(audio);
 
             try {
@@ -736,9 +744,8 @@ final class KurfaNativeEngine {
                             .build();
                     try (okhttp3.Response upstream = HTTP_CLIENT.newCall(headReq).execute()) {
                         int code = upstream.code();
-                        if (code == 403 || code == 410) {
+                        if (code == 403 || code == 410 || code >= 500) {
                             invalidateStream(videoId);
-                            forceAlternate = "VISIONOS".equals(audio.clientKind) || "IOS".equals(audio.clientKind);
                             continue;
                         }
                         if (code < 200 || code >= 300) {
@@ -788,10 +795,9 @@ final class KurfaNativeEngine {
 
                     okhttp3.Response upstream = HTTP_CLIENT.newCall(req).execute();
                     int code = upstream.code();
-                    if (code == 403 || code == 410) {
+                    if (code == 403 || code == 410 || code >= 500 || (start > 0L && code == 200)) {
                         upstream.close();
                         invalidateStream(videoId);
-                        forceAlternate = "VISIONOS".equals(audio.clientKind) || "IOS".equals(audio.clientKind);
                         continue;
                     }
                     if (code < 200 || code >= 300) {
@@ -807,9 +813,30 @@ final class KurfaNativeEngine {
                     respHeaders.put("Accept-Ranges", "bytes");
 
                     String contentRange = upstream.header("Content-Range");
-                    if (contentRange != null) respHeaders.put("Content-Range", contentRange);
+                    long crTotal = parseTotalLengthFromContentRange(contentRange);
+                    long knownTotal = crTotal > 0L ? crTotal : audio.contentLength;
+                    if (knownTotal > 0L && expectedLength <= 0L) {
+                        expectedLength = knownTotal;
+                    }
+                    if (code == 206) {
+                        if (contentRange != null && !contentRange.isEmpty()) {
+                            respHeaders.put("Content-Range", contentRange);
+                        } else if (knownTotal > 0L) {
+                            long rangeEnd = Math.min(fetchEnd, knownTotal - 1L);
+                            respHeaders.put("Content-Range", "bytes " + start + "-" + rangeEnd + "/" + knownTotal);
+                        }
+                    }
+
                     String contentLength = upstream.header("Content-Length");
-                    if (contentLength != null) respHeaders.put("Content-Length", contentLength);
+                    long declaredLen = parseLongSafe(contentLength);
+                    if (declaredLen <= 0L && code == 206) {
+                        declaredLen = Math.max(0L, fetchEnd - start + 1L);
+                    }
+                    if (contentLength != null && !contentLength.isEmpty()) {
+                        respHeaders.put("Content-Length", contentLength);
+                    } else if (declaredLen > 0L) {
+                        respHeaders.put("Content-Length", String.valueOf(declaredLen));
+                    }
 
                     String cleanMime = cleanMimeType(upstream.header("Content-Type"), audio.mimeType);
                     if (isHead) {
@@ -819,8 +846,9 @@ final class KurfaNativeEngine {
                     }
 
                     ResponseBody body = upstream.body();
+                    long targetEnd = declaredLen > 0L ? (start + declaredLen - 1L) : fetchEnd;
                     InputStream stream = body != null
-                            ? new ResponseClosingInputStream(body.byteStream(), upstream)
+                            ? new ResilientRangeInputStream(audio, upstream, start, targetEnd, knownTotal, cleanMime)
                             : new ByteArrayInputStream(new byte[0]);
                     return new WebResourceResponse(cleanMime, null, code == 206 ? 206 : 200,
                             code == 206 ? "Partial Content" : "OK", respHeaders, stream);
@@ -839,10 +867,9 @@ final class KurfaNativeEngine {
 
                 okhttp3.Response firstUpstream = HTTP_CLIENT.newCall(firstReq).execute();
                 int code = firstUpstream.code();
-                if (code == 403 || code == 410) {
+                if (code == 403 || code == 410 || code >= 500) {
                     firstUpstream.close();
                     invalidateStream(videoId);
-                    forceAlternate = "VISIONOS".equals(audio.clientKind) || "IOS".equals(audio.clientKind);
                     continue;
                 }
                 if (code < 200 || code >= 300) {
@@ -868,7 +895,6 @@ final class KurfaNativeEngine {
                 return new WebResourceResponse(cleanMime, null, 200, "OK", respHeaders, stream);
             } catch (Exception e) {
                 invalidateStream(videoId);
-                forceAlternate = "VISIONOS".equals(audio.clientKind) || "IOS".equals(audio.clientKind);
             }
         }
 
@@ -1412,21 +1438,127 @@ final class KurfaNativeEngine {
         }
     }
 
-    private static final class ResponseClosingInputStream extends FilterInputStream {
-        private final okhttp3.Response response;
+    private static final class ResilientRangeInputStream extends InputStream {
+        private ResolvedAudio audio;
+        private final long targetEnd;
+        private final long expectedTotalLength;
+        private final String expectedMime;
+        private long nextOffset;
+        private okhttp3.Response currentResponse;
+        private InputStream currentBodyStream;
+        private boolean closed;
+        private int recoveryCount = 0;
 
-        ResponseClosingInputStream(InputStream in, okhttp3.Response response) {
-            super(in);
-            this.response = response;
+        ResilientRangeInputStream(
+                ResolvedAudio audio,
+                okhttp3.Response initialResponse,
+                long startOffset,
+                long targetEnd,
+                long expectedTotalLength,
+                String expectedMime
+        ) {
+            this.audio = audio;
+            this.currentResponse = initialResponse;
+            ResponseBody body = initialResponse.body();
+            this.currentBodyStream = body != null ? body.byteStream() : new ByteArrayInputStream(new byte[0]);
+            this.nextOffset = startOffset;
+            this.targetEnd = targetEnd;
+            this.expectedTotalLength = expectedTotalLength;
+            this.expectedMime = expectedMime;
         }
 
         @Override
-        public void close() throws IOException {
-            try {
-                super.close();
-            } finally {
-                response.close();
+        public int read() throws IOException {
+            byte[] single = new byte[1];
+            int n = read(single, 0, 1);
+            return n == -1 ? -1 : (single[0] & 0xFF);
+        }
+
+        @Override
+        public int read(@NonNull byte[] b, int off, int len) throws IOException {
+            if (closed) return -1;
+            if (len == 0) return 0;
+
+            while (true) {
+                if (currentBodyStream != null) {
+                    try {
+                        int n = currentBodyStream.read(b, off, len);
+                        if (n > 0) {
+                            nextOffset += n;
+                            return n;
+                        }
+                        closeCurrentUpstream();
+                        if (targetEnd >= 0L && nextOffset <= targetEnd && recoveryCount < 2) {
+                            if (reopenRemainingRange()) {
+                                continue;
+                            }
+                        }
+                        return -1;
+                    } catch (IOException readErr) {
+                        closeCurrentUpstream();
+                        if (targetEnd >= 0L && nextOffset <= targetEnd && reopenRemainingRange()) {
+                            continue;
+                        }
+                        throw readErr;
+                    }
+                }
+                return -1;
             }
+        }
+
+        private boolean reopenRemainingRange() {
+            if (closed || recoveryCount >= 2 || nextOffset > targetEnd) return false;
+            recoveryCount++;
+            invalidateStream(audio.videoId);
+            ResolvedAudio fresh = resolveAudioStream(audio.videoId, true, recoveryCount > 1);
+            if (fresh == null || fresh.streamUrl == null) return false;
+            if (expectedMime != null && !expectedMime.equals(cleanMimeType(null, fresh.mimeType))) return false;
+            if (expectedTotalLength > 0L && fresh.contentLength > 0L && fresh.contentLength != expectedTotalLength) {
+                return false;
+            }
+
+            okhttp3.Request req = new okhttp3.Request.Builder()
+                    .url(fresh.streamUrl)
+                    .get()
+                    .header("User-Agent", fresh.requestUserAgent)
+                    .header("Range", "bytes=" + nextOffset + "-" + targetEnd)
+                    .build();
+            try {
+                okhttp3.Response resp = HTTP_CLIENT.newCall(req).execute();
+                int code = resp.code();
+                if (code != 206 && !(nextOffset == 0L && code == 200)) {
+                    resp.close();
+                    return false;
+                }
+                ResponseBody body = resp.body();
+                if (body == null) {
+                    resp.close();
+                    return false;
+                }
+                this.audio = fresh;
+                this.currentResponse = resp;
+                this.currentBodyStream = body.byteStream();
+                return true;
+            } catch (IOException ignored) {
+                return false;
+            }
+        }
+
+        private void closeCurrentUpstream() {
+            if (currentBodyStream != null) {
+                try { currentBodyStream.close(); } catch (IOException ignored) {}
+                currentBodyStream = null;
+            }
+            if (currentResponse != null) {
+                currentResponse.close();
+                currentResponse = null;
+            }
+        }
+
+        @Override
+        public void close() {
+            closed = true;
+            closeCurrentUpstream();
         }
     }
 
