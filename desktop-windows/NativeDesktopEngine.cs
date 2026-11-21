@@ -28,6 +28,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
     public const string NativeAudioPathPrefix = "/__kurfa_native_audio__/";
     public const string PrefetchPathPrefix = "/__kurfa_prefetch__/";
     public const string LocalFilePathPrefix = "/__kurfa_local_file__/";
+    public const string LocalLyricsPathPrefix = "/__kurfa_local_lyrics__";
 
     private readonly ConcurrentDictionary<string, string> _localFileRegistry = new(StringComparer.Ordinal);
     private readonly object _localAudioLock = new();
@@ -38,7 +39,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
     private const long HeadProbeEndByte = 1023;
     private const long TailProbeStartByte = 1_048_576; // 1 MB boundary where un-PoTokenized adaptive streams often 403
     private const long TailProbeEndByte = 1_310_719;
-    private const string PlayerFieldMask = "playabilityStatus,streamingData,videoDetails";
+    private const string PlayerFieldMask =
+        "playabilityStatus,streamingData,videoDetails,playerConfig.mediaCommonConfig.mediaUstreamerRequestConfig.videoPlaybackUstreamerConfig";
     private const int MaxRecoveryAttempts = 5;
     private static readonly TimeSpan ClientCooldownDuration = TimeSpan.FromMinutes(5);
     private static readonly TimeSpan ApiRequestTimeout = TimeSpan.FromSeconds(4.5);
@@ -47,6 +49,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
     private static readonly TimeSpan StreamReadIdleTimeout = TimeSpan.FromSeconds(10);
     private static readonly TimeSpan VisitorDataTimeout = TimeSpan.FromSeconds(2.5);
     private static readonly TimeSpan VisitorDataTtl = TimeSpan.FromMinutes(30);
+    private static readonly TimeSpan PoTokenTtl = TimeSpan.FromMinutes(30);
 
     private const string VisionOs01UserAgent =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_6) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15";
@@ -143,6 +146,26 @@ public sealed partial class NativeDesktopEngine : IDisposable
             AndroidSdkVersion: 34,
             UseMusicPlayerEndpoint: false,
             RequiresVisitorData: false,
+            IncludeVisitorDataIfAvailable: true,
+            IncludeContentFlags: true,
+            IncludeUserAgentInContext: false,
+            SupportsAdaptive: true,
+            SupportsProgressive: true
+        ),
+        new PlaybackClientProfile(
+            Id: "WEB_REMIX",
+            ClientName: "WEB_REMIX",
+            ClientVersion: WebRemixClientVersion,
+            ClientId: "67",
+            UserAgent: WebUserAgent,
+            OsName: "Windows",
+            OsVersion: "10.0",
+            DeviceMake: null,
+            DeviceModel: null,
+            Platform: "DESKTOP",
+            AndroidSdkVersion: null,
+            UseMusicPlayerEndpoint: true,
+            RequiresVisitorData: true,
             IncludeVisitorDataIfAvailable: true,
             IncludeContentFlags: true,
             IncludeUserAgentInContext: false,
@@ -677,12 +700,30 @@ public sealed partial class NativeDesktopEngine : IDisposable
         [property: JsonPropertyName("error")] [property: JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)] string? Error = null
     );
 
+    private sealed record PoTokenCacheEntry(
+        string PoToken,
+        string VisitorData,
+        DateTimeOffset ExpiresAtUtc
+    );
+
+    public sealed record AttestationChallengeData(
+        string InterpreterUrl,
+        string Program,
+        string GlobalName,
+        string EventId,
+        string ChallengeRaw
+    );
+
     private readonly ConcurrentDictionary<string, ResolvedAudio> _streamCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, Task<ResolvedAudio?>> _inflightResolutions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> _inflightPrefetches = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, PoTokenCacheEntry> _poTokenCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, SabrFallbackClient.SabrBootstrapInfo> _sabrBootstraps = new(StringComparer.Ordinal);
     private readonly ClientHealthTracker _healthTracker = new(ClientCooldownDuration);
     private readonly ActiveTrackChunkCache _chunkCache = new();
+    private readonly SabrFallbackClient _sabrClient = new();
     private readonly SemaphoreSlim _visitorSemaphore = new(1, 1);
+    private readonly SemaphoreSlim _poTokenSemaphore = new(1, 1);
     private readonly HttpClient _apiHttpClient;
     private readonly HttpClient _streamHttpClient;
     private readonly CancellationTokenSource _cts = new();
@@ -692,6 +733,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
     private HttpListener? _listener;
     private Task? _acceptLoopTask;
     private int _disposed;
+
+    public Func<string, string, AttestationChallengeData?, CancellationToken, Task<string?>>? PageBoundPoTokenMinter { get; set; }
 
     public int Port { get; private set; }
 
@@ -808,6 +851,10 @@ public sealed partial class NativeDesktopEngine : IDisposable
         }
 
         _chunkCache.SetMetadata(videoId, resolved.MimeType, resolved.Itag, resolved.ContentLength);
+        if (resolved.StreamUrl.StartsWith("sabr://", StringComparison.Ordinal))
+        {
+            return;
+        }
 
         // Pre-warm initial chunk into LRU cache only if not already cached
         long warmEnd = Math.Min(GetUpstreamChunkCapBytes(resolved) - 1, resolved.ContentLength > 0 ? resolved.ContentLength - 1 : GetUpstreamChunkCapBytes(resolved) - 1);
@@ -968,6 +1015,13 @@ public sealed partial class NativeDesktopEngine : IDisposable
             }
 
             string path = context.Request.Url?.AbsolutePath ?? string.Empty;
+            if (string.Equals(path, LocalLyricsPathPrefix, StringComparison.Ordinal) ||
+                string.Equals(path, LocalLyricsPathPrefix + "/", StringComparison.Ordinal))
+            {
+                await HandleLocalLyricsRequestAsync(context, isHead: method == "HEAD", ct).ConfigureAwait(false);
+                return;
+            }
+
             if (path.StartsWith(LocalFilePathPrefix, StringComparison.Ordinal))
             {
                 string localId = path[LocalFilePathPrefix.Length..].Trim();
@@ -1261,6 +1315,17 @@ public sealed partial class NativeDesktopEngine : IDisposable
             else if (hasClientRange && clientStart > 0 && !IsMatchingMidStream(resolved, expectedMime, expectedLength))
             {
                 excludedClients.Add(resolved.ClientKind);
+                continue;
+            }
+
+            if (resolved.StreamUrl.StartsWith("sabr://", StringComparison.Ordinal))
+            {
+                if (await TryServeSabrBufferedResponseAsync(context, videoId, resolved, hasClientRange, clientStart, clientRequestedEnd, isHead, ct).ConfigureAwait(false))
+                {
+                    return;
+                }
+                excludedClients.Add(resolved.ClientKind);
+                _streamCache.TryRemove(videoId, out _);
                 continue;
             }
 
@@ -1980,6 +2045,11 @@ public sealed partial class NativeDesktopEngine : IDisposable
             }
         }
 
+        if (resolved is null && (excludedClients is null || !excludedClients.Contains("SABR")))
+        {
+            resolved = await TryResolveSabrFallbackAsync(cleanId, ct).ConfigureAwait(false);
+        }
+
         if (resolved is not null)
         {
             PruneStreamCacheIfNeeded();
@@ -2016,6 +2086,12 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 : (_visitorDataExpiresAtUtc > DateTimeOffset.UtcNow ? _visitorData : null);
         }
 
+        string? poToken = null;
+        if (string.Equals(profile.Id, "WEB_REMIX", StringComparison.Ordinal))
+        {
+            poToken = await ResolvePoTokenAsync(videoId, visitorData, forceRefreshVisitor, ct).ConfigureAwait(false);
+        }
+
         var clientObj = new Dictionary<string, object?>(12)
         {
             ["clientName"] = profile.ClientName,
@@ -2032,7 +2108,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
         if (profile.AndroidSdkVersion.HasValue) clientObj["androidSdkVersion"] = profile.AndroidSdkVersion.Value;
         if (!string.IsNullOrEmpty(visitorData)) clientObj["visitorData"] = visitorData;
 
-        var payloadObj = new Dictionary<string, object?>(4)
+        var payloadObj = new Dictionary<string, object?>(5)
         {
             ["context"] = new Dictionary<string, object?>(1) { ["client"] = clientObj },
             ["videoId"] = videoId
@@ -2042,8 +2118,15 @@ public sealed partial class NativeDesktopEngine : IDisposable
             payloadObj["contentCheckOk"] = true;
             payloadObj["racyCheckOk"] = true;
         }
+        if (!string.IsNullOrEmpty(poToken))
+        {
+            payloadObj["serviceIntegrityDimensions"] = new Dictionary<string, object?>(1)
+            {
+                ["poToken"] = poToken
+            };
+        }
 
-        return await ResolveViaPlayerClientAsync(videoId, profile, payloadObj, visitorData, ct).ConfigureAwait(false);
+        return await ResolveViaPlayerClientAsync(videoId, profile, payloadObj, visitorData, poToken, ct).ConfigureAwait(false);
     }
 
     private async Task<ResolvedAudio?> TryVerifyStreamRangeAsync(ResolvedAudio? candidate, CancellationToken ct)
@@ -2294,6 +2377,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
         PlaybackClientProfile profile,
         object payloadObj,
         string? visitorData,
+        string? poToken,
         CancellationToken ct)
     {
         try
@@ -2371,9 +2455,19 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 _ = long.TryParse(lenStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out durationSec);
             }
 
+            string serverAbrStreamingUrl = GetString(streamingData, "serverAbrStreamingUrl");
+            string? ustreamerConfig = ExtractUstreamerConfig(root);
+
             ResolvedAudio? adaptiveCandidate = null;
-            if (profile.SupportsAdaptive &&
-                streamingData.TryGetProperty("adaptiveFormats", out JsonElement adaptiveFormats) &&
+            int sabrItag = 0;
+            string sabrMime = "audio/mp4";
+            long sabrClen = 0;
+            long sabrLmt = 0;
+            long sabrApproxDurMs = durationSec > 0 ? durationSec * 1000L : 0;
+            int sabrBitrate = 0;
+            int sabrBestMetaScore = int.MinValue;
+
+            if (streamingData.TryGetProperty("adaptiveFormats", out JsonElement adaptiveFormats) &&
                 adaptiveFormats.ValueKind == JsonValueKind.Array)
             {
                 string? bestUrl = null;
@@ -2387,8 +2481,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     if (format.ValueKind != JsonValueKind.Object) continue;
 
                     string mime = GetString(format, "mimeType");
-                    string url = GetString(format, "url");
-                    if (!mime.StartsWith("audio/", StringComparison.OrdinalIgnoreCase) || string.IsNullOrEmpty(url))
+                    if (!mime.StartsWith("audio/", StringComparison.OrdinalIgnoreCase))
                     {
                         continue;
                     }
@@ -2401,6 +2494,18 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     {
                         _ = long.TryParse(clenStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out clen);
                     }
+                    long lmt = 0;
+                    string lmtStr = GetString(format, "lastModified");
+                    if (!string.IsNullOrEmpty(lmtStr))
+                    {
+                        _ = long.TryParse(lmtStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out lmt);
+                    }
+                    long approxDurMs = 0;
+                    string approxStr = GetString(format, "approxDurationMs");
+                    if (!string.IsNullOrEmpty(approxStr))
+                    {
+                        _ = long.TryParse(approxStr, NumberStyles.Integer, CultureInfo.InvariantCulture, out approxDurMs);
+                    }
 
                     int score = 0;
                     if (itag == 140) score += 2000;
@@ -2411,23 +2516,60 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     if (bitrate is >= 96_000 and <= 192_000) score += 200;
                     else if (bitrate > 192_000) score += 120;
 
-                    if (score > bestScore)
+                    int semiIdx = mime.IndexOf(';');
+                    string cleanMime = semiIdx > 0 ? mime[..semiIdx].Trim() : mime.Trim();
+
+                    if (score > sabrBestMetaScore)
+                    {
+                        sabrBestMetaScore = score;
+                        sabrItag = itag;
+                        sabrMime = cleanMime;
+                        sabrClen = clen;
+                        sabrLmt = lmt;
+                        if (approxDurMs > 0) sabrApproxDurMs = approxDurMs;
+                        sabrBitrate = bitrate;
+                    }
+
+                    string url = GetString(format, "url");
+                    if (profile.SupportsAdaptive && !string.IsNullOrEmpty(url) && score > bestScore)
                     {
                         bestScore = score;
                         bestUrl = url;
                         bestItag = itag;
                         bestContentLength = clen;
-                        int semiIdx = mime.IndexOf(';');
-                        bestMime = semiIdx > 0 ? mime[..semiIdx].Trim() : mime.Trim();
+                        bestMime = cleanMime;
                     }
                 }
 
                 if (!string.IsNullOrEmpty(bestUrl))
                 {
+                    if (!string.IsNullOrEmpty(poToken) && !bestUrl.Contains("pot=", StringComparison.Ordinal))
+                    {
+                        bestUrl += (bestUrl.Contains('?', StringComparison.Ordinal) ? "&pot=" : "?pot=") + Uri.EscapeDataString(poToken);
+                    }
                     adaptiveCandidate = new ResolvedAudio(
                         videoId, bestUrl, bestMime, bestItag, bestContentLength,
                         title, artist, durationSec, profile.UserAgent, profile.Id, DateTimeOffset.UtcNow.Add(StreamCacheTtl));
                 }
+            }
+
+            if (!string.IsNullOrEmpty(serverAbrStreamingUrl))
+            {
+                _sabrBootstraps[videoId] = new SabrFallbackClient.SabrBootstrapInfo(
+                    videoId,
+                    serverAbrStreamingUrl,
+                    ustreamerConfig,
+                    poToken,
+                    visitorData,
+                    title,
+                    artist,
+                    durationSec,
+                    sabrItag > 0 ? sabrItag : 140,
+                    sabrMime,
+                    sabrClen,
+                    sabrLmt,
+                    sabrApproxDurMs,
+                    sabrBitrate);
             }
 
             if (adaptiveCandidate is not null)
@@ -4030,6 +4172,693 @@ public sealed partial class NativeDesktopEngine : IDisposable
         try { if (File.Exists(path)) File.Delete(path); } catch { /* ignore */ }
     }
 
+    private static string? ExtractUstreamerConfig(JsonElement root)
+    {
+        if (root.TryGetProperty("playerConfig", out JsonElement pc) && pc.ValueKind == JsonValueKind.Object &&
+            pc.TryGetProperty("mediaCommonConfig", out JsonElement mcc) && mcc.ValueKind == JsonValueKind.Object &&
+            mcc.TryGetProperty("mediaUstreamerRequestConfig", out JsonElement murc) && murc.ValueKind == JsonValueKind.Object)
+        {
+            string cfg = GetString(murc, "videoPlaybackUstreamerConfig");
+            if (!string.IsNullOrWhiteSpace(cfg))
+            {
+                return cfg;
+            }
+        }
+        return null;
+    }
+
+    public async Task<string?> ResolvePoTokenAsync(
+        string videoId,
+        string? visitorData,
+        bool forceRefresh,
+        CancellationToken ct)
+    {
+        string vd = !string.IsNullOrWhiteSpace(visitorData)
+            ? visitorData!
+            : (await ResolveVisitorDataAsync(forceRefresh, ct).ConfigureAwait(false) ?? string.Empty);
+        if (string.IsNullOrWhiteSpace(vd))
+        {
+            return null;
+        }
+
+        string cacheKey = $"{vd}:{videoId}";
+        if (!forceRefresh &&
+            _poTokenCache.TryGetValue(cacheKey, out PoTokenCacheEntry? cached) &&
+            cached.ExpiresAtUtc > DateTimeOffset.UtcNow)
+        {
+            return cached.PoToken;
+        }
+
+        await _poTokenSemaphore.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            if (!forceRefresh &&
+                _poTokenCache.TryGetValue(cacheKey, out cached) &&
+                cached.ExpiresAtUtc > DateTimeOffset.UtcNow)
+            {
+                return cached.PoToken;
+            }
+
+            AttestationChallengeData? challenge = await FetchAttestationChallengeAsync(videoId, vd, ct).ConfigureAwait(false);
+
+            string? minted = null;
+            if (PageBoundPoTokenMinter is not null)
+            {
+                try
+                {
+                    minted = await PageBoundPoTokenMinter(videoId, vd, challenge, ct).ConfigureAwait(false);
+                }
+                catch
+                {
+                    minted = null;
+                }
+            }
+
+            if (!string.IsNullOrWhiteSpace(minted))
+            {
+                _poTokenCache[cacheKey] = new PoTokenCacheEntry(minted!, vd, DateTimeOffset.UtcNow + PoTokenTtl);
+                return minted;
+            }
+        }
+        catch
+        {
+            // Keep null on PoToken failure so fallback clients continue cleanly
+        }
+        finally
+        {
+            _poTokenSemaphore.Release();
+        }
+        return null;
+    }
+
+    private async Task<AttestationChallengeData?> FetchAttestationChallengeAsync(
+        string videoId,
+        string visitorData,
+        CancellationToken ct)
+    {
+        try
+        {
+            var body = new
+            {
+                context = new
+                {
+                    client = new
+                    {
+                        clientName = "WEB_REMIX",
+                        clientVersion = WebRemixClientVersion,
+                        hl = "tr",
+                        gl = "TR",
+                        visitorData
+                    }
+                },
+                engagementType = "ENGAGEMENT_TYPE_UNBOUND",
+                ids = new[] { new { encryptedVideoId = videoId } }
+            };
+
+            using var req = new HttpRequestMessage(
+                HttpMethod.Post,
+                "https://music.youtube.com/youtubei/v1/att/get?prettyPrint=false")
+            {
+                Content = new StringContent(JsonSerializer.Serialize(body), Encoding.UTF8, "application/json")
+            };
+            req.Headers.TryAddWithoutValidation("User-Agent", WebUserAgent);
+            req.Headers.TryAddWithoutValidation("Origin", "https://music.youtube.com");
+            req.Headers.TryAddWithoutValidation("Referer", "https://music.youtube.com/");
+            req.Headers.TryAddWithoutValidation("X-Goog-Visitor-Id", visitorData);
+
+            using var attCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            attCts.CancelAfter(VisitorDataTimeout);
+            using HttpResponseMessage res = await _apiHttpClient.SendAsync(req, attCts.Token).ConfigureAwait(false);
+            if (!res.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            string raw = await res.Content.ReadAsStringAsync(attCts.Token).ConfigureAwait(false);
+            using JsonDocument doc = JsonDocument.Parse(raw);
+            JsonElement root = doc.RootElement;
+
+            if (!root.TryGetProperty("bgChallenge", out JsonElement bg) || bg.ValueKind != JsonValueKind.Object)
+            {
+                return null;
+            }
+
+            string interpreterUrl = string.Empty;
+            if (bg.TryGetProperty("interpreterUrl", out JsonElement iu) && iu.ValueKind == JsonValueKind.Object)
+            {
+                interpreterUrl = GetString(iu, "privateDoNotAccessOrElseTrustedResourceUrlWrappedValue");
+                if (string.IsNullOrEmpty(interpreterUrl))
+                {
+                    interpreterUrl = GetString(iu, "trustedResourceUrl");
+                }
+            }
+
+            string program = GetString(bg, "program");
+            string globalName = GetString(bg, "globalName");
+            if (string.IsNullOrEmpty(program) || string.IsNullOrEmpty(globalName))
+            {
+                return null;
+            }
+
+            if (interpreterUrl.StartsWith("//", StringComparison.Ordinal))
+            {
+                interpreterUrl = "https:" + interpreterUrl;
+            }
+
+            return new AttestationChallengeData(interpreterUrl, program, globalName, string.Empty, bg.GetRawText());
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public async Task<ResolvedAudio?> TryResolveSabrFallbackAsync(string videoId, CancellationToken ct)
+    {
+        if (!_healthTracker.IsHealthy("SABR"))
+        {
+            return null;
+        }
+
+        try
+        {
+            if (!_sabrBootstraps.TryGetValue(videoId, out SabrFallbackClient.SabrBootstrapInfo? bootstrap) ||
+                string.IsNullOrWhiteSpace(bootstrap.ServerAbrStreamingUrl))
+            {
+                // Last-chance metadata lookup via WEB_REMIX player endpoint if no earlier attempt captured SABR bootstrap
+                PlaybackClientProfile? webRemix = AudioPlaybackClients.FirstOrDefault(c => c.Id == "WEB_REMIX");
+                if (webRemix is not null)
+                {
+                    _ = await ResolveViaClientProfileAsync(videoId, webRemix, forceRefreshVisitor: false, ct).ConfigureAwait(false);
+                    _sabrBootstraps.TryGetValue(videoId, out bootstrap);
+                }
+            }
+
+            if (bootstrap is null || string.IsNullOrWhiteSpace(bootstrap.ServerAbrStreamingUrl))
+            {
+                return null;
+            }
+
+            if (string.IsNullOrWhiteSpace(bootstrap.PoToken) && !string.IsNullOrWhiteSpace(bootstrap.VisitorData))
+            {
+                string? pot = await ResolvePoTokenAsync(videoId, bootstrap.VisitorData, forceRefresh: false, ct).ConfigureAwait(false);
+                if (!string.IsNullOrWhiteSpace(pot))
+                {
+                    bootstrap = bootstrap with { PoToken = pot };
+                }
+            }
+
+            SabrFallbackClient.SabrAudioPayload? payload = await _sabrClient
+                .TryResolveSabrFallbackAsync(bootstrap, _streamHttpClient, WebUserAgent, ct)
+                .ConfigureAwait(false);
+
+            if (payload is null || payload.AudioBytes.Length == 0)
+            {
+                _healthTracker.MarkFailure("SABR", "SABR_NO_AUDIO");
+                return null;
+            }
+
+            _chunkCache.SetMetadata(videoId, payload.MimeType, payload.Itag, payload.TotalLength);
+            _chunkCache.StoreChunk(videoId, payload.MimeType, payload.Itag, payload.TotalLength, 0, payload.AudioBytes);
+            _healthTracker.MarkSuccess("SABR");
+
+            return new ResolvedAudio(
+                videoId,
+                $"sabr://{videoId}",
+                payload.MimeType,
+                payload.Itag,
+                payload.TotalLength,
+                payload.Title,
+                payload.Artist,
+                payload.DurationSec,
+                WebUserAgent,
+                "SABR",
+                DateTimeOffset.UtcNow.Add(StreamCacheTtl));
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            _healthTracker.MarkFailure("SABR", "SABR_EXCEPTION");
+            return null;
+        }
+    }
+
+    private async Task<bool> TryServeSabrBufferedResponseAsync(
+        HttpListenerContext context,
+        string videoId,
+        ResolvedAudio resolved,
+        bool hasClientRange,
+        long clientStart,
+        long? clientRequestedEnd,
+        bool isHead,
+        CancellationToken ct)
+    {
+        if (!_chunkCache.TryGetMetadata(videoId, out string cachedMime, out _, out long totalLen) || totalLen <= 0)
+        {
+            return false;
+        }
+
+        string mime = string.IsNullOrWhiteSpace(cachedMime) ? resolved.MimeType : cachedMime;
+        HttpListenerResponse resp = context.Response;
+        ApplyCorsHeaders(resp, context.Request);
+        resp.ContentType = string.IsNullOrWhiteSpace(mime) ? "audio/mp4" : mime;
+        resp.Headers["Accept-Ranges"] = "bytes";
+        resp.Headers["X-Kurfa-Client"] = "SABR";
+
+        if (hasClientRange)
+        {
+            if (clientStart >= totalLen)
+            {
+                resp.StatusCode = 416;
+                resp.StatusDescription = "Range Not Satisfiable";
+                resp.Headers["Content-Range"] = $"bytes */{totalLen}";
+                resp.ContentLength64 = 0;
+                return true;
+            }
+
+            long reqEnd = clientRequestedEnd.HasValue ? Math.Min(clientRequestedEnd.Value, totalLen - 1) : (totalLen - 1);
+            if (!_chunkCache.TryReadRange(videoId, clientStart, reqEnd, out byte[] slice, out _, out _, out _))
+            {
+                return false;
+            }
+
+            long sliceEnd = clientStart + slice.Length - 1;
+            resp.StatusCode = 206;
+            resp.StatusDescription = "Partial Content";
+            resp.Headers["Content-Range"] = $"bytes {clientStart}-{sliceEnd}/{totalLen}";
+            resp.ContentLength64 = slice.Length;
+            if (!isHead)
+            {
+                await resp.OutputStream.WriteAsync(slice, ct).ConfigureAwait(false);
+                await resp.OutputStream.FlushAsync(ct).ConfigureAwait(false);
+            }
+            return true;
+        }
+
+        resp.StatusCode = 200;
+        resp.StatusDescription = "OK";
+        resp.ContentLength64 = totalLen;
+        if (isHead)
+        {
+            return true;
+        }
+
+        long offset = 0;
+        while (offset < totalLen)
+        {
+            long chunkEnd = Math.Min(totalLen - 1, offset + MaxAdaptiveUpstreamChunkBytes - 1);
+            if (!_chunkCache.TryReadRange(videoId, offset, chunkEnd, out byte[] part, out _, out _, out _) || part.Length == 0)
+            {
+                break;
+            }
+            await resp.OutputStream.WriteAsync(part, ct).ConfigureAwait(false);
+            offset += part.Length;
+        }
+        await resp.OutputStream.FlushAsync(ct).ConfigureAwait(false);
+        return true;
+    }
+
+    private async Task HandleLocalLyricsRequestAsync(HttpListenerContext context, bool isHead, CancellationToken ct)
+    {
+        ApplyCorsHeaders(context.Response, context.Request);
+
+        string? rawPath = context.Request.QueryString["path"];
+        if (string.IsNullOrWhiteSpace(rawPath) || rawPath.IndexOf('\0') >= 0)
+        {
+            await WriteJsonAsync(context.Response, 400, new { success = false, error = "Missing or invalid path" }, isHead, ct).ConfigureAwait(false);
+            return;
+        }
+
+        string decoded = Uri.UnescapeDataString(rawPath).Trim();
+        if (decoded.StartsWith(@"\\", StringComparison.Ordinal) ||
+            decoded.Contains("..", StringComparison.Ordinal) ||
+            !Path.IsPathFullyQualified(decoded))
+        {
+            await WriteJsonAsync(context.Response, 403, new { success = false, error = "Forbidden path" }, isHead, ct).ConfigureAwait(false);
+            return;
+        }
+
+        string musicDirRaw = Environment.GetFolderPath(Environment.SpecialFolder.MyMusic);
+        if (string.IsNullOrWhiteSpace(musicDirRaw))
+        {
+            await WriteJsonAsync(context.Response, 403, new { success = false, error = "Music folder unavailable" }, isHead, ct).ConfigureAwait(false);
+            return;
+        }
+
+        string fullMusicDir;
+        string fullTargetPath;
+        try
+        {
+            fullMusicDir = Path.GetFullPath(musicDirRaw).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar)
+                           + Path.DirectorySeparatorChar;
+            fullTargetPath = Path.GetFullPath(decoded);
+        }
+        catch
+        {
+            await WriteJsonAsync(context.Response, 400, new { success = false, error = "Invalid path" }, isHead, ct).ConfigureAwait(false);
+            return;
+        }
+
+        if (!fullTargetPath.StartsWith(fullMusicDir, StringComparison.OrdinalIgnoreCase))
+        {
+            await WriteJsonAsync(context.Response, 403, new { success = false, error = "Path outside user music folder" }, isHead, ct).ConfigureAwait(false);
+            return;
+        }
+
+        var result = ReadLocalLyricsForFile(fullTargetPath, fullMusicDir);
+        int status = result.Found ? 200 : (File.Exists(fullTargetPath) ? 200 : 404);
+        await WriteJsonAsync(context.Response, status, new
+        {
+            success = result.Found,
+            synced = result.Synced,
+            lrc = result.Lrc,
+            plain = result.Plain,
+            source = result.Source
+        }, isHead, ct).ConfigureAwait(false);
+    }
+
+    private static async Task WriteJsonAsync(
+        HttpListenerResponse response,
+        int statusCode,
+        object payload,
+        bool isHead,
+        CancellationToken ct)
+    {
+        string json = JsonSerializer.Serialize(payload);
+        byte[] bytes = Encoding.UTF8.GetBytes(json);
+        response.StatusCode = statusCode;
+        response.ContentType = "application/json; charset=utf-8";
+        response.ContentLength64 = bytes.Length;
+        if (!isHead)
+        {
+            await response.OutputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
+            await response.OutputStream.FlushAsync(ct).ConfigureAwait(false);
+        }
+    }
+
+    public sealed record LocalLyricsLookupResult(bool Found, bool Synced, string? Lrc, string? Plain, string? Source);
+
+    public static LocalLyricsLookupResult ReadLocalLyricsForFile(string fullAudioPath, string? allowedMusicRootWithSep = null)
+    {
+        try
+        {
+            string lrcPath = Path.ChangeExtension(fullAudioPath, ".lrc");
+            if (!string.IsNullOrEmpty(lrcPath) &&
+                (allowedMusicRootWithSep is null || Path.GetFullPath(lrcPath).StartsWith(allowedMusicRootWithSep, StringComparison.OrdinalIgnoreCase)) &&
+                File.Exists(lrcPath))
+            {
+                string rawLrc = ReadTextWithUtf8Fallback(lrcPath);
+                if (!string.IsNullOrWhiteSpace(rawLrc))
+                {
+                    bool hasTimestamps = Regex.IsMatch(rawLrc, @"\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]");
+                    string plain = hasTimestamps ? StripLrcTimestamps(rawLrc) : rawLrc.Trim();
+                    return new LocalLyricsLookupResult(true, hasTimestamps, hasTimestamps ? rawLrc.Trim() : null, plain, "lrc_file");
+                }
+            }
+
+            if (File.Exists(fullAudioPath) &&
+                string.Equals(Path.GetExtension(fullAudioPath), ".mp3", StringComparison.OrdinalIgnoreCase))
+            {
+                LocalLyricsLookupResult? id3Lyrics = TryReadId3v2Lyrics(fullAudioPath);
+                if (id3Lyrics is not null)
+                {
+                    return id3Lyrics;
+                }
+            }
+        }
+        catch
+        {
+            // Ignore malformed lyrics/tags
+        }
+
+        return new LocalLyricsLookupResult(false, false, null, null, null);
+    }
+
+    private static string ReadTextWithUtf8Fallback(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
+        {
+            return Encoding.UTF8.GetString(bytes, 3, bytes.Length - 3);
+        }
+        if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
+        {
+            return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+        if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
+        {
+            return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
+        }
+        try
+        {
+            var strictUtf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
+            return strictUtf8.GetString(bytes);
+        }
+        catch
+        {
+            return Encoding.Latin1.GetString(bytes);
+        }
+    }
+
+    private static LocalLyricsLookupResult? TryReadId3v2Lyrics(string mp3Path)
+    {
+        using var fs = new FileStream(mp3Path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        if (fs.Length < 10) return null;
+
+        Span<byte> hdr = stackalloc byte[10];
+        if (fs.Read(hdr) != 10) return null;
+        if (hdr[0] != 'I' || hdr[1] != 'D' || hdr[2] != '3') return null;
+
+        byte major = hdr[3];
+        byte tagFlags = hdr[5];
+        if (major is < 2 or > 4) return null;
+
+        int tagSize = ((hdr[6] & 0x7F) << 21)
+                    | ((hdr[7] & 0x7F) << 14)
+                    | ((hdr[8] & 0x7F) << 7)
+                    | (hdr[9] & 0x7F);
+        if (tagSize <= 0) return null;
+
+        int toRead = (int)Math.Min(tagSize, Math.Min(fs.Length - 10, 4 * 1024 * 1024));
+        byte[] tagData = new byte[toRead];
+        int actualRead = fs.Read(tagData, 0, toRead);
+        if (actualRead <= 0) return null;
+
+        int pos = 0;
+        if (major >= 3 && (tagFlags & 0x40) != 0 && actualRead >= 4)
+        {
+            int extSize = major == 4
+                ? (((tagData[0] & 0x7F) << 21) | ((tagData[1] & 0x7F) << 14) | ((tagData[2] & 0x7F) << 7) | (tagData[3] & 0x7F))
+                : BinaryPrimitives.ReadInt32BigEndian(tagData.AsSpan(0, 4)) + 4;
+            if (extSize > 0 && extSize < actualRead)
+            {
+                pos = extSize;
+            }
+        }
+
+        string? usltFound = null;
+
+        while (pos < actualRead)
+        {
+            if (tagData[pos] == 0) break;
+
+            string frameId;
+            int frameSize;
+            int frameHeaderLen;
+            bool frameUnsync = (tagFlags & 0x80) != 0;
+
+            if (major == 2)
+            {
+                if (pos + 6 > actualRead) break;
+                frameId = Encoding.ASCII.GetString(tagData, pos, 3);
+                frameSize = (tagData[pos + 3] << 16) | (tagData[pos + 4] << 8) | tagData[pos + 5];
+                frameHeaderLen = 6;
+            }
+            else
+            {
+                if (pos + 10 > actualRead) break;
+                frameId = Encoding.ASCII.GetString(tagData, pos, 4);
+                frameSize = major == 4
+                    ? (((tagData[pos + 4] & 0x7F) << 21) | ((tagData[pos + 5] & 0x7F) << 14) | ((tagData[pos + 6] & 0x7F) << 7) | (tagData[pos + 7] & 0x7F))
+                    : BinaryPrimitives.ReadInt32BigEndian(tagData.AsSpan(pos + 4, 4));
+                if (major == 4 && (tagData[pos + 9] & 0x02) != 0)
+                {
+                    frameUnsync = true;
+                }
+                frameHeaderLen = 10;
+            }
+
+            pos += frameHeaderLen;
+            if (frameSize <= 0 || pos + frameSize > actualRead) break;
+
+            ReadOnlySpan<byte> rawPayload = tagData.AsSpan(pos, frameSize);
+            pos += frameSize;
+
+            if (frameId is "SYLT" or "SLT")
+            {
+                byte[] payload = frameUnsync ? UndoId3Unsync(rawPayload) : rawPayload.ToArray();
+                LocalLyricsLookupResult? sylt = DecodeSyltFrame(payload);
+                if (sylt is not null)
+                {
+                    return sylt;
+                }
+            }
+            else if (frameId is "USLT" or "ULT" && usltFound is null)
+            {
+                byte[] payload = frameUnsync ? UndoId3Unsync(rawPayload) : rawPayload.ToArray();
+                usltFound = DecodeUsltFrame(payload);
+            }
+        }
+
+        if (!string.IsNullOrWhiteSpace(usltFound))
+        {
+            string trimmed = usltFound.Trim();
+            bool hasLrc = Regex.IsMatch(trimmed, @"\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]");
+            string plain = hasLrc ? StripLrcTimestamps(trimmed) : trimmed;
+            return new LocalLyricsLookupResult(true, hasLrc, hasLrc ? trimmed : null, plain, "id3_uslt");
+        }
+
+        return null;
+    }
+
+    private static byte[] UndoId3Unsync(ReadOnlySpan<byte> src)
+    {
+        var list = new List<byte>(src.Length);
+        for (int i = 0; i < src.Length; i++)
+        {
+            byte b = src[i];
+            list.Add(b);
+            if (b == 0xFF && i + 1 < src.Length && src[i + 1] == 0x00)
+            {
+                i++;
+            }
+        }
+        return list.ToArray();
+    }
+
+    private static string? DecodeUsltFrame(byte[] payload)
+    {
+        if (payload.Length < 5) return null;
+        byte enc = payload[0];
+        // Bytes 1..3 are ISO-639-2 language code
+        int idx = 4;
+        int descEnd = FindId3Terminator(payload, idx, enc);
+        if (descEnd < 0) return null;
+        idx = descEnd + GetId3TerminatorWidth(enc);
+        if (idx >= payload.Length) return null;
+
+        string text = DecodeId3String(payload.AsSpan(idx), enc);
+        return string.IsNullOrWhiteSpace(text) ? null : text;
+    }
+
+    private static LocalLyricsLookupResult? DecodeSyltFrame(byte[] payload)
+    {
+        if (payload.Length < 7) return null;
+        byte enc = payload[0];
+        // Bytes 1..3: language, byte 4: timestamp format (2=ms), byte 5: content type
+        byte tsFormat = payload[4];
+        int idx = 6;
+        int descEnd = FindId3Terminator(payload, idx, enc);
+        if (descEnd < 0) return null;
+        idx = descEnd + GetId3TerminatorWidth(enc);
+
+        var lrcSb = new StringBuilder();
+        var plainSb = new StringBuilder();
+        int termWidth = GetId3TerminatorWidth(enc);
+
+        while (idx < payload.Length)
+        {
+            int textEnd = FindId3Terminator(payload, idx, enc);
+            if (textEnd < 0) break;
+
+            string line = DecodeId3String(payload.AsSpan(idx, textEnd - idx), enc).Replace("\r", string.Empty).Replace("\n", " ").Trim();
+            idx = textEnd + termWidth;
+            if (idx + 4 > payload.Length) break;
+
+            uint tsVal = BinaryPrimitives.ReadUInt32BigEndian(payload.AsSpan(idx, 4));
+            idx += 4;
+
+            long ms = tsFormat == 2 ? tsVal : tsVal * 26L;
+            long mins = ms / 60_000L;
+            long secs = (ms % 60_000L) / 1000L;
+            long cs = (ms % 1000L) / 10L;
+
+            lrcSb.Append('[').Append(mins.ToString("D2", CultureInfo.InvariantCulture))
+                 .Append(':').Append(secs.ToString("D2", CultureInfo.InvariantCulture))
+                 .Append('.').Append(cs.ToString("D2", CultureInfo.InvariantCulture))
+                 .Append(']').AppendLine(line);
+            if (!string.IsNullOrEmpty(line))
+            {
+                plainSb.AppendLine(line);
+            }
+        }
+
+        string lrc = lrcSb.ToString().Trim();
+        if (string.IsNullOrEmpty(lrc)) return null;
+        return new LocalLyricsLookupResult(true, true, lrc, plainSb.ToString().Trim(), "id3_sylt");
+    }
+
+    private static int FindId3Terminator(byte[] data, int start, byte enc)
+    {
+        if (enc is 1 or 2)
+        {
+            for (int i = start; i + 1 < data.Length; i += 2)
+            {
+                if (data[i] == 0 && data[i + 1] == 0) return i;
+            }
+            return -1;
+        }
+        for (int i = start; i < data.Length; i++)
+        {
+            if (data[i] == 0) return i;
+        }
+        return -1;
+    }
+
+    private static int GetId3TerminatorWidth(byte enc) => enc is 1 or 2 ? 2 : 1;
+
+    private static string DecodeId3String(ReadOnlySpan<byte> bytes, byte enc)
+    {
+        if (bytes.IsEmpty) return string.Empty;
+        return enc switch
+        {
+            0 => Encoding.Latin1.GetString(bytes),
+            1 => DecodeUtf16WithBom(bytes),
+            2 => Encoding.BigEndianUnicode.GetString(bytes),
+            3 => Encoding.UTF8.GetString(bytes),
+            _ => Encoding.UTF8.GetString(bytes)
+        };
+    }
+
+    private static string DecodeUtf16WithBom(ReadOnlySpan<byte> bytes)
+    {
+        if (bytes.Length >= 2)
+        {
+            if (bytes[0] == 0xFE && bytes[1] == 0xFF)
+            {
+                return Encoding.BigEndianUnicode.GetString(bytes[2..]);
+            }
+            if (bytes[0] == 0xFF && bytes[1] == 0xFE)
+            {
+                return Encoding.Unicode.GetString(bytes[2..]);
+            }
+        }
+        return Encoding.Unicode.GetString(bytes);
+    }
+
+    private static string StripLrcTimestamps(string lrc)
+    {
+        string stripped = Regex.Replace(lrc, @"\[\d{1,3}:\d{2}(?:[.:]\d{1,3})?\]", string.Empty);
+        stripped = Regex.Replace(stripped, @"<\d{1,3}:\d{2}(?:[.:]\d{1,3})?>", string.Empty);
+        var lines = stripped.Split('\n')
+            .Select(l => l.Trim())
+            .Where(l => l.Length > 0 && !Regex.IsMatch(l, @"^\[(?:ti|ar|al|au|by|offset|length|re|ve):.*\]$", RegexOptions.IgnoreCase));
+        return string.Join("\n", lines);
+    }
+
     public void Dispose()
     {
         if (Interlocked.Exchange(ref _disposed, 1) != 0)
@@ -4053,6 +4882,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
         _apiHttpClient.Dispose();
         _streamHttpClient.Dispose();
         _visitorSemaphore.Dispose();
+        _poTokenSemaphore.Dispose();
         _cts.Dispose();
     }
 }

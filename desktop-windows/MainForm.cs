@@ -71,9 +71,16 @@ public sealed class MainForm : Form
     private readonly AppPaths _paths;
     private readonly DesktopAppConfig _config;
     private readonly NativeDesktopEngine _engine = new();
+    private readonly DiscordRpcService _discordRpc = new();
     private readonly AutoUpdater _updater;
     private readonly WebView2 _webView = new();
     private readonly CancellationTokenSource _shutdownCts = new();
+    private readonly SemaphoreSlim _poTokenUiLock = new(1, 1);
+    private CoreWebView2Environment? _webViewEnv;
+    private WebView2? _poTokenWebView;
+    private bool _poTokenPageReady;
+    private string? _currentTrackTitle;
+    private string? _currentTrackArtist;
     private Icon? _embeddedIcon;
     private NotifyIcon? _trayIcon;
     private bool _restartForUpdate;
@@ -293,6 +300,8 @@ public sealed class MainForm : Form
                 "--autoplay-policy=no-user-gesture-required --disk-cache-size=33554432 --media-cache-size=33554432 --disable-features=CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows"
             );
             CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, _paths.WebView2DataDir, envOptions);
+            _webViewEnv = env;
+            _engine.PageBoundPoTokenMinter = MintPageBoundPoTokenViaWebViewAsync;
             await _webView.EnsureCoreWebView2Async(env);
 
             CoreWebView2 core = _webView.CoreWebView2;
@@ -1400,6 +1409,8 @@ public sealed class MainForm : Form
 
                     case "UPDATE_MINI_PLAYER":
                     {
+                        if (!string.IsNullOrWhiteSpace(downloadTitle)) _currentTrackTitle = downloadTitle.Trim();
+                        if (!string.IsNullOrWhiteSpace(miniArtist)) _currentTrackArtist = miniArtist.Trim();
                         if (hasMiniPlaying)
                         {
                             bool changed = _isAudioPlaying != miniPlaying;
@@ -1408,6 +1419,14 @@ public sealed class MainForm : Form
                             {
                                 BeginInvoke(UpdateWebViewMemoryMode);
                             }
+                        }
+                        if (_isAudioPlaying && !string.IsNullOrWhiteSpace(_currentTrackTitle))
+                        {
+                            _discordRpc.UpdatePresence(_currentTrackTitle, _currentTrackArtist, true, miniCur, miniDur);
+                        }
+                        else if (hasMiniPlaying && !miniPlaying)
+                        {
+                            _discordRpc.ClearPresence();
                         }
                         if (_miniPlayer is { IsDisposed: false, Visible: true })
                         {
@@ -1419,12 +1438,22 @@ public sealed class MainForm : Form
 
                     case "SET_PLAYBACK_STATE":
                     {
+                        if (!string.IsNullOrWhiteSpace(downloadTitle)) _currentTrackTitle = downloadTitle.Trim();
+                        if (!string.IsNullOrWhiteSpace(miniArtist)) _currentTrackArtist = miniArtist.Trim();
                         if (hasMiniPlaying)
                         {
                             _isAudioPlaying = miniPlaying;
                             if (!IsDisposed && IsHandleCreated)
                             {
                                 BeginInvoke(UpdateWebViewMemoryMode);
+                            }
+                            if (miniPlaying && !string.IsNullOrWhiteSpace(_currentTrackTitle))
+                            {
+                                _discordRpc.UpdatePresence(_currentTrackTitle, _currentTrackArtist, true, miniCur, miniDur);
+                            }
+                            else if (!miniPlaying)
+                            {
+                                _discordRpc.ClearPresence();
                             }
                         }
                         responseObj = new { success = true, isPlaying = _isAudioPlaying };
@@ -2087,9 +2116,225 @@ public sealed class MainForm : Form
         return null;
     }
 
+    private async Task<string?> MintPageBoundPoTokenViaWebViewAsync(
+        string videoId,
+        string visitorData,
+        NativeDesktopEngine.AttestationChallengeData? challenge,
+        CancellationToken ct)
+    {
+        if (IsDisposed || !IsHandleCreated || _webViewEnv is null || challenge is null ||
+            string.IsNullOrWhiteSpace(challenge.InterpreterUrl) ||
+            string.IsNullOrWhiteSpace(challenge.Program) ||
+            string.IsNullOrWhiteSpace(challenge.GlobalName))
+        {
+            return null;
+        }
+
+        await _poTokenUiLock.WaitAsync(ct).ConfigureAwait(false);
+        try
+        {
+            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(5) };
+            http.DefaultRequestHeaders.TryAddWithoutValidation(
+                "User-Agent",
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36");
+
+            string interpreterJs = await http.GetStringAsync(challenge.InterpreterUrl, ct).ConfigureAwait(false);
+            if (string.IsNullOrWhiteSpace(interpreterJs)) return null;
+
+            string? botguardResp = await EvaluateOnPoTokenWebViewAsync(async core =>
+            {
+                string helperScript = """
+                    if (!globalThis.__kurfaBgReady) {
+                      globalThis.__kurfaBgReady = true;
+                      globalThis.runKurfaBotGuard = function(interpreter, program, globalName) {
+                        new Function(interpreter)();
+                        var bgVm = window[globalName];
+                        if (!bgVm || !bgVm.a) throw new Error('BotGuard VM unavailable');
+                        var bgFns = null;
+                        var vmLoad = bgVm.a(program, function(a, s, p, c) {
+                          bgFns = { asyncSnapshotFunction: a, shutdownFunction: s };
+                        }, true, undefined, function() {}, [[], []], undefined, false,
+                        [function(){},function(){},function(){},function(){},function(){}]);
+                        var sigOut = [];
+                        return Promise.resolve(vmLoad).then(function() {
+                          return new Promise(function(resolve, reject) {
+                            var tries = 0;
+                            var iv = setInterval(function() {
+                              if (bgFns && bgFns.asyncSnapshotFunction) { clearInterval(iv); resolve(bgFns); }
+                              else if (++tries > 4000) { clearInterval(iv); reject(new Error('BG timeout')); }
+                            }, 2);
+                          });
+                        }).then(function(fns) {
+                          return new Promise(function(resolve, reject) {
+                            fns.asyncSnapshotFunction(function(resp) {
+                              globalThis.__kurfaWebPoSignalOutput = sigOut;
+                              resolve(resp);
+                            }, [undefined, undefined, sigOut, undefined]);
+                          });
+                        });
+                      };
+                    }
+                    """;
+                await core.ExecuteScriptAsync(helperScript);
+
+                string challengeCall = $$"""
+                    (function() {
+                      globalThis.__kurfaBgSnap = { state: 'running' };
+                      runKurfaBotGuard({{JsonSerializer.Serialize(interpreterJs)}}, {{JsonSerializer.Serialize(challenge.Program)}}, {{JsonSerializer.Serialize(challenge.GlobalName)}})
+                        .then(function(r) { globalThis.__kurfaBgSnap = { state: 'ready', value: r }; })
+                        .catch(function(e) { globalThis.__kurfaBgSnap = { state: 'error', value: String(e) }; });
+                      return 'ok';
+                    })();
+                    """;
+                await core.ExecuteScriptAsync(challengeCall);
+                return await PollWebViewGlobalResultAsync(core, "__kurfaBgSnap", ct).ConfigureAwait(false);
+            }, ct).ConfigureAwait(false);
+
+            if (string.IsNullOrWhiteSpace(botguardResp)) return null;
+
+            using var genReq = new HttpRequestMessage(HttpMethod.Post, "https://www.youtube.com/api/jnn/v1/GenerateIT")
+            {
+                Content = new StringContent(
+                    $"[\"O43z0dpjhgX20SCx4KAo\",{JsonSerializer.Serialize(botguardResp)}]",
+                    System.Text.Encoding.UTF8,
+                    "application/json+protobuf")
+            };
+            genReq.Headers.TryAddWithoutValidation("Accept", "application/json");
+            genReq.Headers.TryAddWithoutValidation("x-goog-api-key", "AIzaSyDyT5W0Jh49F30Pqqtyfdf7pDLFKLJoAnw");
+            genReq.Headers.TryAddWithoutValidation("x-user-agent", "grpc-web-javascript/0.1");
+
+            using HttpResponseMessage genRes = await http.SendAsync(genReq, ct).ConfigureAwait(false);
+            if (!genRes.IsSuccessStatusCode) return null;
+
+            string genBody = await genRes.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+            using JsonDocument genDoc = JsonDocument.Parse(genBody);
+            if (genDoc.RootElement.ValueKind != JsonValueKind.Array || genDoc.RootElement.GetArrayLength() < 1)
+            {
+                return null;
+            }
+            string integrityTokenJson = genDoc.RootElement[0].GetRawText();
+
+            string identifier = !string.IsNullOrWhiteSpace(videoId) ? videoId : visitorData;
+            string? tokenCsv = await EvaluateOnPoTokenWebViewAsync(async core =>
+            {
+                string mintCall = $$"""
+                    (function() {
+                      globalThis.__kurfaPotRes = { state: 'running' };
+                      var getMinter = (globalThis.__kurfaWebPoSignalOutput || [])[0];
+                      if (typeof getMinter !== 'function') {
+                        globalThis.__kurfaPotRes = { state: 'error', value: 'no minter factory' };
+                        return 'err';
+                      }
+                      var idBytes = new TextEncoder().encode({{JsonSerializer.Serialize(identifier)}});
+                      Promise.resolve(getMinter({{integrityTokenJson}}))
+                        .then(function(minter) { return minter(idBytes); })
+                        .then(function(u8) { globalThis.__kurfaPotRes = { state: 'ready', value: Array.from(u8).join(',') }; })
+                        .catch(function(e) { globalThis.__kurfaPotRes = { state: 'error', value: String(e) }; });
+                      return 'ok';
+                    })();
+                    """;
+                await core.ExecuteScriptAsync(mintCall);
+                return await PollWebViewGlobalResultAsync(core, "__kurfaPotRes", ct).ConfigureAwait(false);
+            }, ct).ConfigureAwait(false);
+
+            if (string.IsNullOrWhiteSpace(tokenCsv)) return null;
+            byte[] tokenBytes = tokenCsv.Split(',').Select(s => byte.Parse(s.Trim())).ToArray();
+            return Convert.ToBase64String(tokenBytes).Replace('+', '-').Replace('/', '_').TrimEnd('=');
+        }
+        catch
+        {
+            return null;
+        }
+        finally
+        {
+            _poTokenUiLock.Release();
+        }
+    }
+
+    private async Task<string?> EvaluateOnPoTokenWebViewAsync(Func<CoreWebView2, Task<string?>> action, CancellationToken ct)
+    {
+        var tcs = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        BeginInvoke(async () =>
+        {
+            try
+            {
+                if (IsDisposed || _webViewEnv is null)
+                {
+                    tcs.TrySetResult(null);
+                    return;
+                }
+
+                if (_poTokenWebView is null)
+                {
+                    var wv = new WebView2
+                    {
+                        Visible = false,
+                        Size = new Size(1, 1),
+                        Location = new Point(-2000, -2000)
+                    };
+                    Controls.Add(wv);
+                    await wv.EnsureCoreWebView2Async(_webViewEnv);
+                    wv.CoreWebView2.Settings.IsScriptEnabled = true;
+                    wv.CoreWebView2.Settings.AreDefaultScriptDialogsEnabled = false;
+
+                    var navTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+                    wv.CoreWebView2.NavigationCompleted += (_, _) => navTcs.TrySetResult(true);
+                    wv.CoreWebView2.Navigate("https://www.youtube.com/robots.txt");
+                    using var navTimeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    using var reg = navTimeout.Token.Register(() => navTcs.TrySetResult(false));
+                    _poTokenPageReady = await navTcs.Task;
+                    _poTokenWebView = wv;
+                }
+
+                if (!_poTokenPageReady || _poTokenWebView?.CoreWebView2 is null)
+                {
+                    tcs.TrySetResult(null);
+                    return;
+                }
+
+                using var regCt = ct.Register(() => tcs.TrySetCanceled(ct));
+                string? res = await action(_poTokenWebView.CoreWebView2);
+                tcs.TrySetResult(res);
+            }
+            catch
+            {
+                tcs.TrySetResult(null);
+            }
+        });
+        return await tcs.Task.ConfigureAwait(false);
+    }
+
+    private static async Task<string?> PollWebViewGlobalResultAsync(CoreWebView2 core, string globalName, CancellationToken ct)
+    {
+        for (int i = 0; i < 200; i++)
+        {
+            ct.ThrowIfCancellationRequested();
+            string raw = await core.ExecuteScriptAsync($"JSON.stringify(globalThis.{globalName} || null)");
+            string? unescaped = JsonSerializer.Deserialize<string>(raw);
+            if (!string.IsNullOrWhiteSpace(unescaped) && unescaped != "null")
+            {
+                using JsonDocument d = JsonDocument.Parse(unescaped);
+                string? state = d.RootElement.TryGetProperty("state", out JsonElement st) ? st.GetString() : null;
+                if (state == "ready")
+                {
+                    return d.RootElement.TryGetProperty("value", out JsonElement val) ? val.GetString() : null;
+                }
+                if (state == "error")
+                {
+                    return null;
+                }
+            }
+            await Task.Delay(30, ct);
+        }
+        return null;
+    }
+
     private void OnFormClosed(object? sender, FormClosedEventArgs e)
     {
         try { _shutdownCts.Cancel(); } catch { /* ignore */ }
+        _discordRpc.Dispose();
+        _poTokenUiLock.Dispose();
+        _poTokenWebView?.Dispose();
         _trayMenu?.Dispose();
         _trayIcon?.Dispose();
         _trayCroppedIcon?.Dispose();

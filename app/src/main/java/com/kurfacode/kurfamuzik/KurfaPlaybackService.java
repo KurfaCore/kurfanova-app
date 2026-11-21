@@ -15,6 +15,7 @@ import android.media.AudioAttributes;
 import android.media.AudioFocusRequest;
 import android.media.AudioManager;
 import android.media.MediaMetadata;
+import android.media.audiofx.LoudnessEnhancer;
 import android.media.session.MediaSession;
 import android.media.session.PlaybackState;
 import android.net.wifi.WifiManager;
@@ -23,12 +24,14 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.webkit.WebView;
 
 import androidx.annotation.NonNull;
 import androidx.media3.common.C;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.PlaybackException;
+import androidx.media3.common.PlaybackParameters;
 import androidx.media3.common.Player;
 import androidx.media3.database.StandaloneDatabaseProvider;
 import androidx.media3.datasource.HttpDataSource;
@@ -42,6 +45,7 @@ import androidx.media3.exoplayer.source.ProgressiveMediaSource;
 import androidx.media3.exoplayer.upstream.DefaultLoadErrorHandlingPolicy;
 import androidx.media3.exoplayer.upstream.LoadErrorHandlingPolicy;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.File;
@@ -49,6 +53,8 @@ import java.io.InputStream;
 import java.lang.ref.WeakReference;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
@@ -64,6 +70,35 @@ public class KurfaPlaybackService extends Service {
     private static final long EXO_CACHE_MAX_BYTES = 128L * 1024L * 1024L;
     private static final long SCREEN_OFF_FOCUS_RECOVERY_DELAY_MS = 800L;
     private static final long TIME_TICK_INTERVAL_MS = 500L;
+    private static final long STALL_WATCHDOG_INTERVAL_MS = 2_000L;
+    private static final long STALL_TIMEOUT_MS = 10_000L;
+    private static final long STALL_TIMEOUT_TRACK_START_MS = 15_000L;
+    private static final long STALL_COUNTER_RESET_PROGRESS_MS = 20_000L;
+    private static final int MAX_RECOVERIES_PER_TRACK = 3;
+    private static final long ENDED_LOCK_GRACE_MS = 45_000L;
+    private static final long NATIVE_PREFETCH_DELAY_MS = 5_000L;
+
+    static final class NativeQueueTrack {
+        final String videoId;
+        final String title;
+        final String artist;
+        final String cover;
+
+        NativeQueueTrack(String videoId, String title, String artist, String cover) {
+            this.videoId = videoId;
+            this.title = title;
+            this.artist = artist;
+            this.cover = cover;
+        }
+    }
+
+    private static final Object QUEUE_LOCK = new Object();
+    private static final List<NativeQueueTrack> NATIVE_QUEUE = new ArrayList<>();
+    private static volatile int nativeQueueIndex = -1;
+    private static volatile boolean desiredSkipSilence = false;
+    private static volatile float desiredSpeed = 1.0f;
+    private static volatile float desiredPitch = 1.0f;
+    private static volatile boolean desiredNormalization = false;
 
     private static final String ACTION_SYNC = "com.kurfacode.kurfamuzik.action.SYNC";
     private static final String ACTION_TOGGLE = "com.kurfacode.kurfamuzik.action.TOGGLE";
@@ -109,12 +144,76 @@ public class KurfaPlaybackService extends Service {
     private volatile String lastLoadedArtUrl = "";
 
     private ExoPlayer exoPlayer;
+    private LoudnessEnhancer loudnessEnhancer;
     private ProgressiveMediaSource.Factory mediaSourceFactory;
     private boolean userRequestedPlayback = false;
     private boolean endedEmittedForTrack = false;
-    private boolean errorRecoveryAttemptedForTrack = false;
+    private int recoveryAttemptsForTrack = 0;
+    private long lastRecoveryPosMs = 0L;
+    private long lastProgressPosMs = -1L;
+    private long lastProgressAtMs = 0L;
+    private boolean reachedReadyForTrack = false;
+    private boolean stallWatchdogScheduled = false;
+    private int cacheSessionNonce = 0;
     private Runnable pendingFocusRecovery;
     private boolean timeTickScheduled = false;
+
+    private final Runnable nativePrefetchRunnable = () -> {
+        if (!nativeExoMode || !userRequestedPlayback) return;
+        NativeQueueTrack nextTrack = peekNextNativeQueueTrack();
+        if (nextTrack != null && nextTrack.videoId != null && !nextTrack.videoId.isEmpty()) {
+            KurfaNativeEngine.prefetchAudioAsync(nextTrack.videoId);
+        }
+    };
+
+    private final Runnable endedLockReleaseRunnable = () -> {
+        if (exoPlayer == null || !exoPlayer.getPlayWhenReady() || exoPlayer.getPlaybackState() == Player.STATE_ENDED) {
+            if (!userRequestedPlayback) {
+                KurfaWebView.keepAliveInBackground = false;
+            }
+            releaseLocks();
+        }
+    };
+
+    /**
+     * Self-healing freeze watchdog. While the user expects playback (playWhenReady, not suppressed by
+     * audio focus) the playhead must advance; if it stays put for STALL_TIMEOUT_MS (buffering forever,
+     * a hung proxy socket, a URL that died after ~1 MB, ...) the stalled client is blacklisted, the
+     * stream re-resolved and playback resumed from the exact position. After
+     * MAX_RECOVERIES_PER_TRACK failed attempts a clean "error" is sent to JS, which falls back to
+     * the HTML5/YouTube engines instead of leaving a frozen "playing" UI.
+     */
+    private final Runnable stallWatchdogRunnable = new Runnable() {
+        @Override
+        public void run() {
+            stallWatchdogScheduled = false;
+            if (!nativeExoMode || exoPlayer == null || !userRequestedPlayback) {
+                return;
+            }
+            long now = SystemClock.elapsedRealtime();
+            int state = exoPlayer.getPlaybackState();
+            long pos = Math.max(0L, exoPlayer.getCurrentPosition());
+            boolean expectingProgress = exoPlayer.getPlayWhenReady()
+                    && state != Player.STATE_ENDED
+                    && exoPlayer.getPlaybackSuppressionReason() == Player.PLAYBACK_SUPPRESSION_REASON_NONE;
+
+            if (!expectingProgress || lastProgressPosMs < 0L || Math.abs(pos - lastProgressPosMs) >= 200L) {
+                if (expectingProgress && lastProgressPosMs >= 0L && recoveryAttemptsForTrack > 0
+                        && pos - lastRecoveryPosMs >= STALL_COUNTER_RESET_PROGRESS_MS) {
+                    recoveryAttemptsForTrack = 0;
+                }
+                lastProgressPosMs = pos;
+                lastProgressAtMs = now;
+            } else {
+                long limit = reachedReadyForTrack ? STALL_TIMEOUT_MS : STALL_TIMEOUT_TRACK_START_MS;
+                if (now - lastProgressAtMs >= limit) {
+                    recoverNativePlayback("stall(state=" + state + ")");
+                    return;
+                }
+            }
+            scheduleStallWatchdog();
+        }
+    };
 
     private final Runnable timeTickRunnable = new Runnable() {
         @Override
@@ -180,22 +279,31 @@ public class KurfaPlaybackService extends Service {
     }
 
     /**
-     * Metrolist-style resilient error handling: keeps buffered media intact across transient
-     * network dropouts while failing fast on hard 401/403/404/410 responses.
+     * Bounded, fail-fast load error handling. The previous policy retried transient errors forever
+     * (Integer.MAX_VALUE), which left ExoPlayer in STATE_BUFFERING with playWhenReady=true and never
+     * surfaced an error when the local proxy kept answering 502 / timing out (e.g. a stream URL that
+     * dies after ~1 MB while the screen is locked). Now: hard 4xx fail immediately, everything else
+     * gets at most {@link #MAX_LOAD_RETRIES} quick retries (≤3 s apart) before the error reaches
+     * onPlayerError, where the service re-resolves a fresh client and resumes at the same position.
      */
     private static final class PlaybackLoadErrorHandlingPolicy extends DefaultLoadErrorHandlingPolicy {
+        private static final int MAX_LOAD_RETRIES = 3;
+
         @Override
         public int getMinimumLoadableRetryCount(int dataType) {
-            return Integer.MAX_VALUE;
+            return MAX_LOAD_RETRIES;
         }
 
         @Override
         public long getRetryDelayMsFor(@NonNull LoadErrorHandlingPolicy.LoadErrorInfo loadErrorInfo) {
             int statusCode = extractHttpStatusCode(loadErrorInfo.exception);
-            if (statusCode == 401 || statusCode == 403 || statusCode == 404 || statusCode == 410) {
+            if (statusCode == 401 || statusCode == 403 || statusCode == 404 || statusCode == 410 || statusCode == 416) {
                 return C.TIME_UNSET;
             }
-            return Math.min(Math.max(1, loadErrorInfo.errorCount) * 1_000L, 10_000L);
+            if (loadErrorInfo.errorCount > MAX_LOAD_RETRIES) {
+                return C.TIME_UNSET;
+            }
+            return Math.min(Math.max(1, loadErrorInfo.errorCount) * 1_000L, 3_000L);
         }
 
         private static int extractHttpStatusCode(Throwable error) {
@@ -316,6 +424,132 @@ public class KurfaPlaybackService extends Service {
                 svc.exoPlayer.setVolume(clamped);
             }
         });
+    }
+
+    public static void setNativeQueue(String queueJson, int currentIndex) {
+        List<NativeQueueTrack> parsed = new ArrayList<>();
+        if (queueJson != null && !queueJson.trim().isEmpty()) {
+            try {
+                JSONArray arr = new JSONArray(queueJson);
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject obj = arr.optJSONObject(i);
+                    if (obj == null) continue;
+                    String rawId = obj.optString("videoId", "");
+                    if (rawId.isEmpty()) rawId = obj.optString("id", "");
+                    String videoId = KurfaNativeEngine.extractVideoId(rawId);
+                    if (videoId == null) continue;
+                    String title = obj.optString("title", "Kurfanova Müzik");
+                    String artist = obj.optString("artist", "Kurfanova");
+                    String cover = obj.optString("cover", "");
+                    if (cover.isEmpty()) cover = obj.optString("coverUrl", "");
+                    if (cover.isEmpty()) cover = obj.optString("thumbnail", "");
+                    parsed.add(new NativeQueueTrack(videoId, title, artist, cover));
+                }
+            } catch (Throwable ignored) {
+                return;
+            }
+        }
+        synchronized (QUEUE_LOCK) {
+            NATIVE_QUEUE.clear();
+            NATIVE_QUEUE.addAll(parsed);
+            if (parsed.isEmpty()) {
+                nativeQueueIndex = -1;
+            } else if (currentIndex >= 0 && currentIndex < parsed.size()) {
+                nativeQueueIndex = currentIndex;
+            } else {
+                nativeQueueIndex = findQueueIndexByVideoIdLocked(activeVideoId);
+            }
+        }
+        MAIN_HANDLER.post(() -> {
+            KurfaPlaybackService svc = activeService.get();
+            if (svc != null && nativeExoMode && svc.userRequestedPlayback) {
+                svc.scheduleNextTrackPrefetch();
+            }
+        });
+    }
+
+    public static void setSkipSilenceNative(boolean enabled) {
+        desiredSkipSilence = enabled;
+        MAIN_HANDLER.post(() -> {
+            KurfaPlaybackService svc = activeService.get();
+            if (svc != null && svc.exoPlayer != null) {
+                try {
+                    svc.exoPlayer.setSkipSilenceEnabled(enabled);
+                } catch (Throwable ignored) {}
+            }
+        });
+    }
+
+    public static void setPlaybackParamsNative(float speed, float pitch) {
+        final float safeSpeed = (Float.isNaN(speed) || Float.isInfinite(speed) || speed <= 0f)
+                ? 1.0f : Math.max(0.25f, Math.min(4.0f, speed));
+        final float safePitch = (Float.isNaN(pitch) || Float.isInfinite(pitch) || pitch <= 0f)
+                ? 1.0f : Math.max(0.25f, Math.min(4.0f, pitch));
+        desiredSpeed = safeSpeed;
+        desiredPitch = safePitch;
+        MAIN_HANDLER.post(() -> {
+            KurfaPlaybackService svc = activeService.get();
+            if (svc != null && svc.exoPlayer != null) {
+                try {
+                    svc.exoPlayer.setPlaybackParameters(new PlaybackParameters(safeSpeed, safePitch));
+                    svc.updateSessionPlaybackStateOnly();
+                } catch (Throwable ignored) {}
+            }
+        });
+    }
+
+    public static void setNormalizationNative(boolean enabled) {
+        desiredNormalization = enabled;
+        MAIN_HANDLER.post(() -> {
+            KurfaPlaybackService svc = activeService.get();
+            if (svc != null) {
+                svc.applyLoudnessEnhancerInternal();
+            }
+        });
+    }
+
+    private static int findQueueIndexByVideoIdLocked(String videoId) {
+        if (videoId == null || videoId.isEmpty()) return -1;
+        for (int i = 0; i < NATIVE_QUEUE.size(); i++) {
+            if (videoId.equals(NATIVE_QUEUE.get(i).videoId)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    private static NativeQueueTrack peekNextNativeQueueTrack() {
+        synchronized (QUEUE_LOCK) {
+            if (NATIVE_QUEUE.isEmpty()) return null;
+            int idx = nativeQueueIndex;
+            if (idx < 0 || idx >= NATIVE_QUEUE.size() || !NATIVE_QUEUE.get(idx).videoId.equals(activeVideoId)) {
+                int found = findQueueIndexByVideoIdLocked(activeVideoId);
+                if (found >= 0) idx = found;
+            }
+            int nextIdx = idx + 1;
+            if (nextIdx >= 0 && nextIdx < NATIVE_QUEUE.size()) {
+                return NATIVE_QUEUE.get(nextIdx);
+            }
+            return null;
+        }
+    }
+
+    private static int advanceNextNativeQueueTrack(NativeQueueTrack[] outTrack) {
+        synchronized (QUEUE_LOCK) {
+            if (NATIVE_QUEUE.isEmpty()) return -1;
+            int idx = nativeQueueIndex;
+            if (idx < 0 || idx >= NATIVE_QUEUE.size() || !NATIVE_QUEUE.get(idx).videoId.equals(activeVideoId)) {
+                int found = findQueueIndexByVideoIdLocked(activeVideoId);
+                if (found >= 0) idx = found;
+            }
+            int nextIdx = idx + 1;
+            if (nextIdx >= 0 && nextIdx < NATIVE_QUEUE.size()) {
+                nativeQueueIndex = nextIdx;
+                outTrack[0] = NATIVE_QUEUE.get(nextIdx);
+                return nextIdx;
+            }
+            return -1;
+        }
     }
 
     public static void updateState(Context ctx, boolean playing) {
@@ -480,9 +714,11 @@ public class KurfaPlaybackService extends Service {
         try {
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wm != null) {
-                int mode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
-                        ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
-                        : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                // FULL_LOW_LATENCY is only honoured while the app is foreground + screen on, so it
+                // silently stops protecting the radio once the screen locks. HIGH_PERF (what Media3's
+                // WAKE_MODE_NETWORK uses) keeps Wi-Fi out of power-save during locked playback.
+                @SuppressWarnings("deprecation")
+                int mode = WifiManager.WIFI_MODE_FULL_HIGH_PERF;
                 wifiLock = wm.createWifiLock(mode, "Kurfanova::BgPlaybackWifi");
                 wifiLock.setReferenceCounted(false);
             }
@@ -500,7 +736,7 @@ public class KurfaPlaybackService extends Service {
                         .build();
 
         OkHttpDataSource.Factory upstreamFactory =
-                new OkHttpDataSource.Factory(KurfaNativeEngine.getSharedHttpClient())
+                new OkHttpDataSource.Factory(KurfaNativeEngine.getLocalProxyHttpClient())
                         .setUserAgent("KurfanovaMuzik-ExoPlayer/1.0");
         CacheDataSource.Factory cacheDataSourceFactory = new CacheDataSource.Factory()
                 .setCache(getOrCreateExoCache(this))
@@ -517,24 +753,56 @@ public class KurfaPlaybackService extends Service {
                 .setHandleAudioBecomingNoisy(true)
                 .build();
         exoPlayer.setVolume(desiredVolume);
+        try {
+            exoPlayer.setSkipSilenceEnabled(desiredSkipSilence);
+        } catch (Throwable ignored) {}
+        try {
+            if (desiredSpeed != 1.0f || desiredPitch != 1.0f) {
+                exoPlayer.setPlaybackParameters(new PlaybackParameters(desiredSpeed, desiredPitch));
+            }
+        } catch (Throwable ignored) {}
+        applyLoudnessEnhancerInternal();
         exoPlayer.addListener(new Player.Listener() {
+            @Override
+            public void onAudioSessionIdChanged(int audioSessionId) {
+                applyLoudnessEnhancerInternal();
+            }
+
             @Override
             public void onPlaybackStateChanged(int playbackState) {
                 if (!nativeExoMode || exoPlayer == null) return;
                 if (playbackState == Player.STATE_ENDED) {
                     if (!endedEmittedForTrack) {
                         endedEmittedForTrack = true;
+                        NativeQueueTrack[] nextHolder = new NativeQueueTrack[1];
+                        int nextIdx = advanceNextNativeQueueTrack(nextHolder);
+                        if (nextIdx >= 0 && nextHolder[0] != null) {
+                            NativeQueueTrack nextTrack = nextHolder[0];
+                            startOrUpdateNativePlayback(
+                                    nextTrack.videoId,
+                                    nextTrack.title,
+                                    nextTrack.artist,
+                                    nextTrack.cover,
+                                    0.0
+                            );
+                            emitNativeTrackChangedEvent(nextIdx, nextTrack);
+                            return;
+                        }
                         userRequestedPlayback = false;
                         isPlaying = false;
-                        KurfaWebView.keepAliveInBackground = false;
                         stopTimeTick();
-                        releaseLocks();
+                        stopStallWatchdog();
+                        cancelNextTrackPrefetch();
+                        // Keep CPU + Wi-Fi awake for a grace window so the (screen-off) WebView can
+                        // resolve and start the next track instead of being frozen by Doze/MIUI.
+                        scheduleEndedLockRelease();
                         updateSessionAndNotification(false);
                         emitNativeExoEvent("ended", null);
                     }
                     return;
                 }
                 if (playbackState == Player.STATE_READY) {
+                    reachedReadyForTrack = true;
                     long dur = exoPlayer.getDuration();
                     if (dur > 0L) currentDurationMs = dur;
                     long pos = Math.max(0L, exoPlayer.getCurrentPosition());
@@ -549,7 +817,6 @@ public class KurfaPlaybackService extends Service {
                 if (!nativeExoMode || exoPlayer == null) return;
                 isPlaying = playing;
                 if (playing) {
-                    errorRecoveryAttemptedForTrack = false;
                     startTimeTick();
                 } else if (exoPlayer.getPlaybackState() != Player.STATE_BUFFERING || !exoPlayer.getPlayWhenReady()) {
                     stopTimeTick();
@@ -573,32 +840,65 @@ public class KurfaPlaybackService extends Service {
             @Override
             public void onPlayerError(@NonNull PlaybackException error) {
                 if (!nativeExoMode || exoPlayer == null) return;
-                final String failingVideoId = activeVideoId;
-                if (!errorRecoveryAttemptedForTrack && failingVideoId != null && !failingVideoId.isEmpty()) {
-                    errorRecoveryAttemptedForTrack = true;
-                    final long resumePosMs = Math.max(0L, exoPlayer.getCurrentPosition());
-                    new Thread(() -> {
-                        KurfaNativeEngine.invalidateStream(failingVideoId);
-                        MAIN_HANDLER.post(() -> {
-                            if (exoPlayer == null || !nativeExoMode || !failingVideoId.equals(activeVideoId)) {
-                                return;
-                            }
-                            prepareAndPlayOnExo(failingVideoId, resumePosMs / 1000.0);
-                        });
-                    }, "KurfaExoErrorRecover").start();
-                    return;
-                }
-
-                userRequestedPlayback = false;
-                isPlaying = false;
-                KurfaWebView.keepAliveInBackground = false;
-                stopTimeTick();
-                releaseLocks();
-                updateSessionAndNotification(false);
                 String msg = error.getMessage() != null ? error.getMessage() : "ExoPlayer playback error";
-                emitNativeExoEvent("error", msg);
+                recoverNativePlayback("error(" + error.getErrorCodeName() + "): " + msg);
             }
         });
+    }
+
+    /**
+     * Shared recovery path for the stall watchdog and onPlayerError: blacklist the client that
+     * produced the stalled URL, drop the cached stream, and resume from the last known position on
+     * a fresh cache session (so bytes of a different itag are never mixed into the decoder).
+     */
+    private void recoverNativePlayback(String reason) {
+        if (!nativeExoMode || exoPlayer == null) return;
+        final String videoId = activeVideoId;
+        if (videoId == null || videoId.isEmpty() || !userRequestedPlayback) {
+            failNativePlayback(reason);
+            return;
+        }
+        if (recoveryAttemptsForTrack >= MAX_RECOVERIES_PER_TRACK) {
+            failNativePlayback(reason);
+            return;
+        }
+        recoveryAttemptsForTrack++;
+        long resumeMs = Math.max(0L, exoPlayer.getCurrentPosition());
+        if (resumeMs <= 0L && currentPositionMs > 0L) {
+            resumeMs = currentPositionMs;
+        }
+        long durMs = exoPlayer.getDuration();
+        if (durMs > 0L && resumeMs >= durMs - 1_000L) {
+            resumeMs = Math.max(0L, durMs - 1_000L);
+        }
+        lastRecoveryPosMs = resumeMs;
+        android.util.Log.w("KurfaPlayback", "Native recovery " + recoveryAttemptsForTrack + "/"
+                + MAX_RECOVERIES_PER_TRACK + " for " + videoId + " at " + resumeMs + "ms: " + reason);
+
+        KurfaNativeEngine.invalidateStream(videoId, true);
+        KurfaNativeEngine.clearStreamSignature(videoId);
+        cacheSessionNonce++;
+        prepareAndPlayOnExo(videoId, resumeMs / 1000.0, true);
+        acquireLocks();
+        startTimeTick();
+        emitNativeExoEvent("state", null);
+    }
+
+    private void failNativePlayback(String reason) {
+        userRequestedPlayback = false;
+        isPlaying = false;
+        KurfaWebView.keepAliveInBackground = false;
+        stopTimeTick();
+        stopStallWatchdog();
+        try {
+            if (exoPlayer != null) {
+                exoPlayer.setPlayWhenReady(false);
+                exoPlayer.stop();
+            }
+        } catch (Throwable ignored) {}
+        releaseLocks();
+        updateSessionAndNotification(false);
+        emitNativeExoEvent("error", reason != null ? reason : "Native playback failed");
     }
 
     private void startOrUpdateNativePlayback(
@@ -617,10 +917,14 @@ public class KurfaPlaybackService extends Service {
         currentThumbUrl = coverUrl != null ? coverUrl.trim() : "";
         userRequestedPlayback = true;
         endedEmittedForTrack = false;
-        errorRecoveryAttemptedForTrack = false;
+        recoveryAttemptsForTrack = 0;
+        lastRecoveryPosMs = 0L;
+        MAIN_HANDLER.removeCallbacks(endedLockReleaseRunnable);
 
         ensureExoPlayer();
-        prepareAndPlayOnExo(videoId, startSec);
+        prepareAndPlayOnExo(videoId, startSec, false);
+        if (!userRequestedPlayback) return;
+        scheduleNextTrackPrefetch();
         acquireLocks();
         updateSessionAndNotification(true);
         loadArtworkAsyncIfNeeded();
@@ -628,27 +932,96 @@ public class KurfaPlaybackService extends Service {
         emitNativeExoEvent("state", null);
     }
 
-    private void prepareAndPlayOnExo(String videoId, double startSec) {
+    private void scheduleNextTrackPrefetch() {
+        MAIN_HANDLER.removeCallbacks(nativePrefetchRunnable);
+        MAIN_HANDLER.postDelayed(nativePrefetchRunnable, NATIVE_PREFETCH_DELAY_MS);
+    }
+
+    private void cancelNextTrackPrefetch() {
+        MAIN_HANDLER.removeCallbacks(nativePrefetchRunnable);
+    }
+
+    private void applyLoudnessEnhancerInternal() {
+        try {
+            if (loudnessEnhancer != null) {
+                try { loudnessEnhancer.release(); } catch (Throwable ignored) {}
+                loudnessEnhancer = null;
+            }
+            if (!desiredNormalization || exoPlayer == null) {
+                return;
+            }
+            int sessionId = exoPlayer.getAudioSessionId();
+            if (sessionId == C.AUDIO_SESSION_ID_UNSET || sessionId == 0) {
+                return;
+            }
+            loudnessEnhancer = new LoudnessEnhancer(sessionId);
+            loudnessEnhancer.setTargetGain(600);
+            loudnessEnhancer.setEnabled(true);
+        } catch (Throwable ignored) {
+            loudnessEnhancer = null;
+        }
+    }
+
+    private void emitNativeTrackChangedEvent(int index, NativeQueueTrack track) {
+        WebView wv = activeWebView.get();
+        if (wv == null || track == null) return;
+        try {
+            JSONObject ev = new JSONObject();
+            ev.put("type", "trackChanged");
+            ev.put("index", index);
+            ev.put("videoId", track.videoId != null ? track.videoId : "");
+            ev.put("title", track.title != null ? track.title : "");
+            ev.put("artist", track.artist != null ? track.artist : "");
+            ev.put("cover", track.cover != null ? track.cover : "");
+            ev.put("playing", true);
+            ev.put("playWhenReady", true);
+            ev.put("currentTime", 0.0);
+            final String script = "if(typeof window.__kurfaNativeExoEvent==='function'){try{window.__kurfaNativeExoEvent("
+                    + ev.toString() + ");}catch(_){}}";
+            wv.post(() -> {
+                try {
+                    wv.evaluateJavascript(script, null);
+                } catch (Throwable ignored) {}
+            });
+        } catch (Throwable ignored) {}
+    }
+
+    private void prepareAndPlayOnExo(String videoId, double startSec, boolean freshCacheSession) {
         if (exoPlayer == null || mediaSourceFactory == null) return;
         String localUrl = KurfaNativeEngine.getLocalNativeAudioUrl(videoId);
         if (localUrl == null) {
-            emitNativeExoEvent("error", "Local proxy unavailable");
+            failNativePlayback("Local proxy unavailable");
             return;
         }
+        // Cache key bound to the exact stream identity (mime + length) when it is already known, or
+        // to a per-session nonce otherwise, so SimpleCache never splices two different encodings.
+        String signature = freshCacheSession ? null : KurfaNativeEngine.peekAndPinStreamSignature(videoId);
+        if (signature == null) {
+            KurfaNativeEngine.clearStreamSignature(videoId);
+        }
+        String cacheKey = signature != null
+                ? "kurfa_audio_" + videoId + "_" + signature
+                : "kurfa_audio_" + videoId + "_s" + android.os.Process.myPid() + "_" + (++cacheSessionNonce);
         MediaItem mediaItem = new MediaItem.Builder()
                 .setUri(localUrl)
-                .setCustomCacheKey("kurfa_audio_" + videoId)
+                .setCustomCacheKey(cacheKey)
                 .build();
         MediaSource source = mediaSourceFactory.createMediaSource(mediaItem);
         long startMs = startSec > 0 ? Math.round(startSec * 1000.0) : 0L;
+        reachedReadyForTrack = false;
+        lastProgressPosMs = startMs;
+        lastProgressAtMs = SystemClock.elapsedRealtime();
         exoPlayer.setMediaSource(source, startMs);
         exoPlayer.prepare();
         exoPlayer.setPlayWhenReady(true);
+        scheduleStallWatchdog();
     }
 
     private void pauseExoInternal() {
         cancelScreenOffFocusRecovery();
         userRequestedPlayback = false;
+        stopStallWatchdog();
+        MAIN_HANDLER.removeCallbacks(endedLockReleaseRunnable);
         if (exoPlayer != null) {
             exoPlayer.pause();
         }
@@ -662,13 +1035,26 @@ public class KurfaPlaybackService extends Service {
 
     private void resumeExoInternal() {
         cancelScreenOffFocusRecovery();
+        MAIN_HANDLER.removeCallbacks(endedLockReleaseRunnable);
         userRequestedPlayback = true;
         if (exoPlayer != null) {
-            if (exoPlayer.getPlaybackState() == Player.STATE_ENDED) {
+            int st = exoPlayer.getPlaybackState();
+            if (st == Player.STATE_ENDED) {
                 endedEmittedForTrack = false;
                 exoPlayer.seekTo(0L);
+                exoPlayer.play();
+            } else if (st == Player.STATE_IDLE && activeVideoId != null && !activeVideoId.isEmpty()) {
+                // Player was torn down by a fatal error / stall: rebuild from the last position.
+                recoveryAttemptsForTrack = 0;
+                long resumeMs = Math.max(0L, exoPlayer.getCurrentPosition());
+                if (resumeMs <= 0L && currentPositionMs > 0L) resumeMs = currentPositionMs;
+                prepareAndPlayOnExo(activeVideoId, resumeMs / 1000.0, true);
+            } else {
+                exoPlayer.play();
             }
-            exoPlayer.play();
+            lastProgressPosMs = Math.max(0L, exoPlayer.getCurrentPosition());
+            lastProgressAtMs = SystemClock.elapsedRealtime();
+            scheduleStallWatchdog();
             startTimeTick();
         }
         acquireLocks();
@@ -680,8 +1066,11 @@ public class KurfaPlaybackService extends Service {
 
     private void stopExoInternal(boolean clearTrack) {
         cancelScreenOffFocusRecovery();
+        cancelNextTrackPrefetch();
         userRequestedPlayback = false;
         stopTimeTick();
+        stopStallWatchdog();
+        MAIN_HANDLER.removeCallbacks(endedLockReleaseRunnable);
         if (exoPlayer != null) {
             exoPlayer.stop();
             if (clearTrack) {
@@ -703,6 +1092,8 @@ public class KurfaPlaybackService extends Service {
         long targetMs = Math.max(0L, Math.round(sec * 1000.0));
         exoPlayer.seekTo(targetMs);
         currentPositionMs = targetMs;
+        lastProgressPosMs = targetMs;
+        lastProgressAtMs = SystemClock.elapsedRealtime();
         updateSessionPlaybackStateOnly();
         emitNativeExoEvent("time", null);
     }
@@ -765,6 +1156,46 @@ public class KurfaPlaybackService extends Service {
         MAIN_HANDLER.removeCallbacks(timeTickRunnable);
     }
 
+    private void scheduleStallWatchdog() {
+        MAIN_HANDLER.removeCallbacks(stallWatchdogRunnable);
+        stallWatchdogScheduled = true;
+        MAIN_HANDLER.postDelayed(stallWatchdogRunnable, STALL_WATCHDOG_INTERVAL_MS);
+    }
+
+    private void stopStallWatchdog() {
+        stallWatchdogScheduled = false;
+        MAIN_HANDLER.removeCallbacks(stallWatchdogRunnable);
+    }
+
+    private void scheduleEndedLockRelease() {
+        MAIN_HANDLER.removeCallbacks(endedLockReleaseRunnable);
+        MAIN_HANDLER.postDelayed(endedLockReleaseRunnable, ENDED_LOCK_GRACE_MS);
+    }
+
+    /** True while the native ExoPlayer engine owns playback (used by MainActivity.onResume). */
+    public static boolean isNativeExoActive() {
+        KurfaPlaybackService svc = activeService.get();
+        return nativeExoMode && svc != null && svc.exoPlayer != null;
+    }
+
+    /**
+     * Pushes the real ExoPlayer state (playing / buffering / currentTime / duration) to the WebView,
+     * e.g. when the activity comes back from a locked screen and JS timers may have been frozen.
+     */
+    public static void syncNativeExoState() {
+        MAIN_HANDLER.post(() -> {
+            KurfaPlaybackService svc = activeService.get();
+            if (svc == null || !nativeExoMode || svc.exoPlayer == null) return;
+            svc.emitNativeExoEvent("state", null);
+            svc.emitNativeExoEvent("time", null);
+            if (svc.userRequestedPlayback && !svc.stallWatchdogScheduled) {
+                svc.lastProgressPosMs = Math.max(0L, svc.exoPlayer.getCurrentPosition());
+                svc.lastProgressAtMs = SystemClock.elapsedRealtime();
+                svc.scheduleStallWatchdog();
+            }
+        });
+    }
+
     private void emitNativeExoEvent(String type, String errorMsg) {
         WebView wv = activeWebView.get();
         if (wv == null) return;
@@ -778,6 +1209,7 @@ public class KurfaPlaybackService extends Service {
             ev.put("type", type);
             ev.put("playing", playingNow);
             ev.put("buffering", bufferingNow);
+            ev.put("playWhenReady", exoPlayer != null && exoPlayer.getPlayWhenReady() && userRequestedPlayback);
             ev.put("currentTime", posMs / 1000.0);
             ev.put("duration", durMs > 0L ? (durMs / 1000.0) : 0.0);
             ev.put("videoId", activeVideoId != null ? activeVideoId : "");
@@ -876,7 +1308,7 @@ public class KurfaPlaybackService extends Service {
                     .setState(
                             isPlaying ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
                             currentPositionMs,
-                            isPlaying ? 1.0f : 0.0f
+                            isPlaying ? desiredSpeed : 0.0f
                     )
                     .build();
             mediaSession.setPlaybackState(state);
@@ -955,7 +1387,7 @@ public class KurfaPlaybackService extends Service {
                     .setState(
                             isPlaying ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
                             currentPositionMs,
-                            isPlaying ? 1.0f : 0.0f
+                            isPlaying ? desiredSpeed : 0.0f
                     )
                     .build();
             mediaSession.setPlaybackState(state);
@@ -1135,7 +1567,10 @@ public class KurfaPlaybackService extends Service {
         isPlaying = false;
         KurfaWebView.keepAliveInBackground = false;
         cancelScreenOffFocusRecovery();
+        cancelNextTrackPrefetch();
         stopTimeTick();
+        stopStallWatchdog();
+        MAIN_HANDLER.removeCallbacks(endedLockReleaseRunnable);
         releaseLocks();
         stopForegroundCompat(true);
         stopSelf();
@@ -1147,7 +1582,16 @@ public class KurfaPlaybackService extends Service {
             activeService = new WeakReference<>(null);
         }
         cancelScreenOffFocusRecovery();
+        cancelNextTrackPrefetch();
         stopTimeTick();
+        stopStallWatchdog();
+        MAIN_HANDLER.removeCallbacks(endedLockReleaseRunnable);
+        if (loudnessEnhancer != null) {
+            try {
+                loudnessEnhancer.release();
+            } catch (Throwable ignored) {}
+            loudnessEnhancer = null;
+        }
         if (exoPlayer != null) {
             try {
                 exoPlayer.release();

@@ -351,6 +351,26 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public void setNativeQueueJson(String queueJson, int currentIndex) {
+            KurfaPlaybackService.setNativeQueue(queueJson, currentIndex);
+        }
+
+        @JavascriptInterface
+        public void setSkipSilenceNative(boolean enabled) {
+            KurfaPlaybackService.setSkipSilenceNative(enabled);
+        }
+
+        @JavascriptInterface
+        public void setPlaybackParamsNative(float speed, float pitch) {
+            KurfaPlaybackService.setPlaybackParamsNative(speed, pitch);
+        }
+
+        @JavascriptInterface
+        public void setNormalizationNative(boolean enabled) {
+            KurfaPlaybackService.setNormalizationNative(enabled);
+        }
+
+        @JavascriptInterface
         public void prefetchNative(String videoId) {
             KurfaNativeEngine.prefetchAudioAsync(videoId);
         }
@@ -1580,6 +1600,11 @@ public class MainActivity extends Activity {
         if (webView != null) {
             webView.onResume();
             webView.resumeTimers();
+        }
+        // Screen unlocked / app reopened: JS timers may have been frozen while locked, so push the
+        // authoritative ExoPlayer state (playing, buffering, currentTime, duration) back to the UI.
+        if (KurfaPlaybackService.isNativeExoActive()) {
+            KurfaPlaybackService.syncNativeExoState();
         }
         ApkAutoUpdater.resumePendingInstallIfPermitted(this);
     }

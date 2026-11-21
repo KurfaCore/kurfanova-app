@@ -1,6 +1,7 @@
 package com.kurfacode.kurfamuzik;
 
 import android.net.Uri;
+import android.util.Base64;
 import android.webkit.WebResourceResponse;
 
 import org.json.JSONArray;
@@ -25,6 +26,7 @@ import org.schabi.newpipe.extractor.stream.VideoStream;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -98,13 +100,15 @@ final class KurfaNativeEngine {
                     + "mediaCommonConfig(mediaUstreamerRequestConfig(videoPlaybackUstreamerConfig)))";
 
     private static final String[] PRIMARY_CLIENT_ORDER = new String[]{
-            "VISIONOS", "ANDROID", "NEWPIPE", "IOS", "TVHTML5_SIMPLY", "ANDROID_VR"
+            "VISIONOS", "ANDROID", "WEB_REMIX", "NEWPIPE", "IOS", "TVHTML5_SIMPLY", "ANDROID_VR", "SABR"
     };
     private static final String[] ALTERNATE_CLIENT_ORDER = new String[]{
-            "ANDROID", "IOS", "TVHTML5_SIMPLY", "VISIONOS", "NEWPIPE", "ANDROID_VR"
+            "ANDROID", "WEB_REMIX", "IOS", "TVHTML5_SIMPLY", "VISIONOS", "NEWPIPE", "ANDROID_VR", "SABR"
     };
 
+    private static final String WEB_REMIX_VERSION = "1.20260707.12.00";
     private static final long VISITOR_DATA_TTL_MS = 30L * 60L * 1000L;
+    private static final long PO_TOKEN_TTL_MS = 30L * 60L * 1000L;
     private static final long MAX_ADAPTIVE_CHUNK_BYTES = 512L * 1024L;
     private static final long MAX_PROGRESSIVE_CHUNK_BYTES = 2L * 1024L * 1024L;
     private static final long HEAD_PROBE_END_BYTE = 1023L;
@@ -187,9 +191,68 @@ final class KurfaNativeEngine {
             .build();
 
     private static final ConcurrentHashMap<String, ResolvedAudio> STREAM_CACHE = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, PoTokenCacheEntry> PO_TOKEN_CACHE = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, SabrBootstrapContext> SABR_CONTEXT_CACHE = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<String, byte[]> SABR_AUDIO_BUFFER = new ConcurrentHashMap<>();
     private static final ConcurrentHashMap<String, Object> RESOLVE_LOCKS = new ConcurrentHashMap<>();
     private static final Object VISITOR_LOCK = new Object();
+    private static final Object PO_TOKEN_LOCK = new Object();
     private static final Object PROXY_LOCK = new Object();
+
+    private static final class PoTokenCacheEntry {
+        final String poToken;
+        final String visitorData;
+        final long expiresAt;
+
+        PoTokenCacheEntry(String poToken, String visitorData, long expiresAt) {
+            this.poToken = poToken;
+            this.visitorData = visitorData;
+            this.expiresAt = expiresAt;
+        }
+    }
+
+    private static final class SabrBootstrapContext {
+        final String videoId;
+        final String serverAbrStreamingUrl;
+        final String ustreamerConfig;
+        final String visitorData;
+        final String poToken;
+        final String title;
+        final String artist;
+        final long durationSec;
+        final int itag;
+        final String mimeType;
+        final long contentLength;
+        final long lastModified;
+
+        SabrBootstrapContext(
+                String videoId,
+                String serverAbrStreamingUrl,
+                String ustreamerConfig,
+                String visitorData,
+                String poToken,
+                String title,
+                String artist,
+                long durationSec,
+                int itag,
+                String mimeType,
+                long contentLength,
+                long lastModified
+        ) {
+            this.videoId = videoId;
+            this.serverAbrStreamingUrl = serverAbrStreamingUrl;
+            this.ustreamerConfig = ustreamerConfig;
+            this.visitorData = visitorData;
+            this.poToken = poToken;
+            this.title = title;
+            this.artist = artist;
+            this.durationSec = durationSec;
+            this.itag = itag;
+            this.mimeType = mimeType;
+            this.contentLength = contentLength;
+            this.lastModified = lastModified;
+        }
+    }
     private static final ExecutorService PROXY_EXECUTOR = Executors.newCachedThreadPool(r -> {
         Thread t = new Thread(r, "KurfaLocalProxyWorker");
         t.setDaemon(true);
@@ -206,6 +269,32 @@ final class KurfaNativeEngine {
 
     static OkHttpClient getSharedHttpClient() {
         return HTTP_CLIENT;
+    }
+
+    /**
+     * Client used by ExoPlayer to talk to the 127.0.0.1 proxy. The read timeout is longer than the
+     * upstream one so a mid-stream client switch inside the proxy (re-resolve + range resume) can
+     * complete without ExoPlayer tearing down the connection; the service stall watchdog still
+     * guarantees recovery if the proxy itself hangs.
+     */
+    private static volatile OkHttpClient localProxyClient;
+
+    static OkHttpClient getLocalProxyHttpClient() {
+        OkHttpClient c = localProxyClient;
+        if (c == null) {
+            synchronized (PROXY_LOCK) {
+                c = localProxyClient;
+                if (c == null) {
+                    c = HTTP_CLIENT.newBuilder()
+                            .connectTimeout(4, TimeUnit.SECONDS)
+                            .readTimeout(20, TimeUnit.SECONDS)
+                            .connectionPool(new ConnectionPool(4, 30, TimeUnit.SECONDS))
+                            .build();
+                    localProxyClient = c;
+                }
+            }
+        }
+        return c;
     }
 
     static synchronized void ensureInitialized() {
@@ -291,8 +380,54 @@ final class KurfaNativeEngine {
     }
 
     static void invalidateStream(String videoId) {
-        if (videoId != null) {
-            STREAM_CACHE.remove(videoId);
+        invalidateStream(videoId, false);
+    }
+
+    /**
+     * Byte-level identity (mime + total length) of the stream ExoPlayer is currently decoding per
+     * videoId. Mid-file range requests (start &gt; 0) are only ever served from a stream with the same
+     * signature, so a client switch can never splice bytes of a different itag into the decoder.
+     */
+    private static final ConcurrentHashMap<String, String> SERVED_SIGNATURE = new ConcurrentHashMap<>();
+
+    private static String buildSignature(String mime, long length) {
+        if (length <= 0L) return null;
+        return cleanMimeType(null, mime) + "|" + length;
+    }
+
+    /**
+     * Returns a cache-key-safe signature of the currently cached (prefetched) stream and pins it for
+     * subsequent mid-file requests, or null when nothing valid is cached yet.
+     */
+    static String peekAndPinStreamSignature(String rawVideoId) {
+        String videoId = extractVideoId(rawVideoId);
+        if (videoId == null) return null;
+        ResolvedAudio cached = STREAM_CACHE.get(videoId);
+        if (cached == null || cached.expiresAt <= System.currentTimeMillis()
+                || !ClientHealthTracker.isHealthy(cached.clientKind)) {
+            return null;
+        }
+        String sig = buildSignature(cached.mimeType, cached.contentLength);
+        if (sig == null) return null;
+        SERVED_SIGNATURE.put(videoId, sig);
+        return sig.replaceAll("[^A-Za-z0-9]", "_");
+    }
+
+    static void clearStreamSignature(String rawVideoId) {
+        String videoId = extractVideoId(rawVideoId);
+        if (videoId != null) SERVED_SIGNATURE.remove(videoId);
+    }
+
+    /**
+     * Drops the cached stream URL for {@code videoId}. When {@code blacklistCurrentClient} is true the
+     * InnerTube client that produced the stalled URL is temporarily blacklisted so the next proxy
+     * request immediately resolves a fresh URL from a different, healthy client.
+     */
+    static void invalidateStream(String videoId, boolean blacklistCurrentClient) {
+        if (videoId == null) return;
+        ResolvedAudio stale = STREAM_CACHE.remove(videoId);
+        if (blacklistCurrentClient && stale != null) {
+            ClientHealthTracker.markUnhealthy(stale.clientKind);
         }
     }
 
@@ -391,6 +526,9 @@ final class KurfaNativeEngine {
         if ("ANDROID".equals(clientKind)) {
             return resolveViaAndroid(videoId);
         }
+        if ("WEB_REMIX".equals(clientKind)) {
+            return resolveViaWebRemix(videoId, forceRefreshVisitor);
+        }
         if ("IOS".equals(clientKind)) {
             return resolveViaIos(videoId);
         }
@@ -403,12 +541,18 @@ final class KurfaNativeEngine {
         if ("NEWPIPE".equals(clientKind)) {
             return tryVerifiedAudioCandidate(resolveViaNewPipe(videoId));
         }
+        if ("SABR".equals(clientKind)) {
+            return resolveViaSabrFallback(videoId, forceRefreshVisitor);
+        }
         return null;
     }
 
     private static ResolvedAudio tryVerifiedAudioCandidate(ResolvedAudio candidate) {
         if (candidate == null || candidate.streamUrl == null || candidate.streamUrl.isEmpty()) {
             return null;
+        }
+        if (candidate.streamUrl.startsWith("sabr://")) {
+            return candidate;
         }
         okhttp3.Request req = new okhttp3.Request.Builder()
                 .url(candidate.streamUrl)
@@ -567,6 +711,34 @@ final class KurfaNativeEngine {
                 return cachedVisitorData;
             }
             try {
+                JSONObject vBody = new JSONObject().put("context", new JSONObject().put("client",
+                        new JSONObject()
+                                .put("clientName", "WEB_REMIX")
+                                .put("clientVersion", WEB_REMIX_VERSION)
+                                .put("hl", "tr")
+                                .put("gl", "TR")));
+                okhttp3.Request vReq = new okhttp3.Request.Builder()
+                        .url("https://music.youtube.com/youtubei/v1/visitor_id?prettyPrint=false")
+                        .post(RequestBody.create(vBody.toString(), JSON_MEDIA_TYPE))
+                        .header("User-Agent", WEB_UA)
+                        .header("Origin", "https://music.youtube.com")
+                        .header("Referer", "https://music.youtube.com/")
+                        .build();
+                try (okhttp3.Response vRes = HTTP_CLIENT.newCall(vReq).execute()) {
+                    if (vRes.isSuccessful() && vRes.body() != null) {
+                        JSONObject vJson = new JSONObject(vRes.body().string());
+                        JSONObject rc = vJson.optJSONObject("responseContext");
+                        String vd = rc != null ? rc.optString("visitorData", "").trim() : "";
+                        if (!vd.isEmpty()) {
+                            cachedVisitorData = vd;
+                            cachedVisitorDataExpiresAt = System.currentTimeMillis() + VISITOR_DATA_TTL_MS;
+                            return vd;
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+            try {
                 okhttp3.Request req = new okhttp3.Request.Builder()
                         .url("https://www.youtube.com/sw.js_data")
                         .get()
@@ -596,6 +768,394 @@ final class KurfaNativeEngine {
             }
         }
         return cachedVisitorData;
+    }
+
+    private static String resolvePoTokenForWebRemix(String videoId, String visitorData, boolean forceRefresh) {
+        if (visitorData == null || visitorData.isEmpty()) {
+            return null;
+        }
+        String cacheKey = visitorData + ":" + videoId;
+        long now = System.currentTimeMillis();
+        PoTokenCacheEntry cached = PO_TOKEN_CACHE.get(cacheKey);
+        if (!forceRefresh && cached != null && cached.expiresAt > now) {
+            return cached.poToken;
+        }
+        synchronized (PO_TOKEN_LOCK) {
+            now = System.currentTimeMillis();
+            cached = PO_TOKEN_CACHE.get(cacheKey);
+            if (!forceRefresh && cached != null && cached.expiresAt > now) {
+                return cached.poToken;
+            }
+            try {
+                JSONObject attBody = new JSONObject()
+                        .put("context", new JSONObject().put("client",
+                                new JSONObject()
+                                        .put("clientName", "WEB_REMIX")
+                                        .put("clientVersion", WEB_REMIX_VERSION)
+                                        .put("hl", "tr")
+                                        .put("gl", "TR")
+                                        .put("visitorData", visitorData)))
+                        .put("engagementType", "ENGAGEMENT_TYPE_UNBOUND")
+                        .put("ids", new JSONArray().put(new JSONObject().put("encryptedVideoId", videoId)));
+
+                okhttp3.Request attReq = new okhttp3.Request.Builder()
+                        .url("https://music.youtube.com/youtubei/v1/att/get?prettyPrint=false")
+                        .post(RequestBody.create(attBody.toString(), JSON_MEDIA_TYPE))
+                        .header("User-Agent", WEB_UA)
+                        .header("Origin", "https://music.youtube.com")
+                        .header("Referer", "https://music.youtube.com/")
+                        .header("X-Goog-Visitor-Id", visitorData)
+                        .build();
+
+                try (okhttp3.Response attRes = HTTP_CLIENT.newCall(attReq).execute()) {
+                    if (!attRes.isSuccessful() || attRes.body() == null) {
+                        return null;
+                    }
+                    JSONObject attJson = new JSONObject(attRes.body().string());
+                    String directToken = attJson.optString("challenge", "").trim();
+                    if (directToken.isEmpty()) {
+                        JSONObject bg = attJson.optJSONObject("bgChallenge");
+                        if (bg != null) {
+                            String challengeToken = bg.optString("challenge", "").trim();
+                            if (!challengeToken.isEmpty()) {
+                                directToken = challengeToken;
+                            }
+                        }
+                    }
+                    if (!directToken.isEmpty()) {
+                        PO_TOKEN_CACHE.put(cacheKey, new PoTokenCacheEntry(
+                                directToken, visitorData, System.currentTimeMillis() + PO_TOKEN_TTL_MS));
+                        return directToken;
+                    }
+                }
+            } catch (Exception ignored) {
+            }
+        }
+        return null;
+    }
+
+    private static ResolvedAudio resolveViaWebRemix(String videoId, boolean forceRefreshVisitor) {
+        try {
+            String visitorData = resolveVisitorData(forceRefreshVisitor);
+            if (visitorData == null || visitorData.isEmpty()) {
+                visitorData = resolveVisitorData(true);
+            }
+            if (visitorData == null || visitorData.isEmpty()) {
+                return null;
+            }
+            String poToken = resolvePoTokenForWebRemix(videoId, visitorData, forceRefreshVisitor);
+            JSONObject client = new JSONObject()
+                    .put("clientName", "WEB_REMIX")
+                    .put("clientVersion", WEB_REMIX_VERSION)
+                    .put("osName", "Windows")
+                    .put("osVersion", "10.0")
+                    .put("platform", "DESKTOP")
+                    .put("visitorData", visitorData)
+                    .put("hl", "tr")
+                    .put("gl", "TR");
+            JSONObject payload = new JSONObject()
+                    .put("context", new JSONObject().put("client", client))
+                    .put("videoId", videoId)
+                    .put("contentCheckOk", true)
+                    .put("racyCheckOk", true);
+            if (poToken != null && !poToken.isEmpty()) {
+                payload.put("serviceIntegrityDimensions", new JSONObject().put("poToken", poToken));
+            }
+            return executePlayerClientInternal(
+                    videoId, payload, WEB_UA, "67", WEB_REMIX_VERSION, visitorData, "WEB_REMIX", true, true, poToken);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private static String extractUstreamerConfig(JSONObject root) {
+        if (root == null) return "";
+        JSONObject pc = root.optJSONObject("playerConfig");
+        JSONObject mcc = pc != null ? pc.optJSONObject("mediaCommonConfig") : null;
+        JSONObject murc = mcc != null ? mcc.optJSONObject("mediaUstreamerRequestConfig") : null;
+        return murc != null ? murc.optString("videoPlaybackUstreamerConfig", "").trim() : "";
+    }
+
+    private static ResolvedAudio resolveViaSabrFallback(String videoId, boolean forceRefreshVisitor) {
+        try {
+            SabrBootstrapContext ctx = SABR_CONTEXT_CACHE.get(videoId);
+            if (ctx == null || ctx.serverAbrStreamingUrl == null || ctx.serverAbrStreamingUrl.isEmpty()) {
+                resolveViaWebRemix(videoId, forceRefreshVisitor);
+                ctx = SABR_CONTEXT_CACHE.get(videoId);
+            }
+            if (ctx == null || ctx.serverAbrStreamingUrl == null || ctx.serverAbrStreamingUrl.isEmpty()) {
+                return null;
+            }
+
+            String url = ctx.serverAbrStreamingUrl;
+            url += (url.contains("?") ? "&" : "?") + "rn=0";
+            if (!url.contains("c=")) {
+                url += "&c=WEB_REMIX";
+            }
+            if (ctx.poToken != null && !ctx.poToken.isEmpty() && !url.contains("pot=")) {
+                url += "&pot=" + Uri.encode(ctx.poToken);
+            }
+
+            byte[] reqBody = buildSabrAbrRequest(ctx);
+            MediaType protoType = MediaType.get("application/x-protobuf");
+            for (int hop = 0; hop < 3; hop++) {
+                okhttp3.Request req = new okhttp3.Request.Builder()
+                        .url(url)
+                        .post(RequestBody.create(reqBody, protoType))
+                        .header("User-Agent", WEB_UA)
+                        .header("Origin", "https://music.youtube.com")
+                        .header("Referer", "https://music.youtube.com/")
+                        .build();
+                try (okhttp3.Response res = HTTP_CLIENT.newCall(req).execute()) {
+                    if (!res.isSuccessful() || res.body() == null) {
+                        ClientHealthTracker.markUnhealthy("SABR");
+                        return null;
+                    }
+                    byte[] raw = res.body().bytes();
+                    if (raw.length == 0) {
+                        ClientHealthTracker.markUnhealthy("SABR");
+                        return null;
+                    }
+                    String[] redirectOut = new String[1];
+                    byte[] audioBytes = parseUmpAudioBytes(raw, redirectOut);
+                    if (redirectOut[0] != null && !redirectOut[0].isEmpty()) {
+                        url = redirectOut[0];
+                        continue;
+                    }
+                    if (audioBytes != null && audioBytes.length >= 256) {
+                        if (SABR_AUDIO_BUFFER.size() >= 2) {
+                            SABR_AUDIO_BUFFER.clear();
+                        }
+                        SABR_AUDIO_BUFFER.put(videoId, audioBytes);
+                        ClientHealthTracker.markHealthy("SABR");
+                        return new ResolvedAudio(
+                                videoId,
+                                "sabr://" + videoId,
+                                ctx.mimeType != null && !ctx.mimeType.isEmpty() ? ctx.mimeType : "audio/mp4",
+                                ctx.title != null ? ctx.title : "",
+                                ctx.artist != null ? ctx.artist : "",
+                                ctx.durationSec,
+                                audioBytes.length,
+                                WEB_UA,
+                                "SABR"
+                        );
+                    }
+                    ClientHealthTracker.markUnhealthy("SABR");
+                    return null;
+                }
+            }
+        } catch (Exception ignored) {
+            ClientHealthTracker.markUnhealthy("SABR");
+        }
+        return null;
+    }
+
+    private static ProxyResponse serveSabrBufferedResponse(
+            String videoId,
+            ResolvedAudio audio,
+            boolean isHead,
+            long[] parsedRange,
+            String allowOrigin
+    ) {
+        byte[] data = SABR_AUDIO_BUFFER.get(videoId);
+        if (data == null || data.length == 0) {
+            return null;
+        }
+        long totalLen = data.length;
+        String mime = cleanMimeType(null, audio.mimeType);
+        Map<String, String> headers = new HashMap<>();
+        headers.put("Access-Control-Allow-Origin", allowOrigin);
+        headers.put("Vary", "Origin");
+        headers.put("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+        headers.put("Cache-Control", "no-store");
+        headers.put("Accept-Ranges", "bytes");
+
+        if (parsedRange != null) {
+            long start = parsedRange[0];
+            if (start >= totalLen) {
+                headers.put("Content-Range", "bytes */" + totalLen);
+                return new ProxyResponse(416, "Range Not Satisfiable", "text/plain",
+                        headers, new ByteArrayInputStream(new byte[0]));
+            }
+            long end = parsedRange[1] >= 0L ? Math.min(parsedRange[1], totalLen - 1L) : (totalLen - 1L);
+            int len = (int) Math.max(0L, end - start + 1L);
+            headers.put("Content-Range", "bytes " + start + "-" + end + "/" + totalLen);
+            headers.put("Content-Length", String.valueOf(len));
+            InputStream body = isHead
+                    ? new ByteArrayInputStream(new byte[0])
+                    : new ByteArrayInputStream(data, (int) start, len);
+            return new ProxyResponse(206, "Partial Content", mime, headers, body);
+        }
+
+        headers.put("Content-Length", String.valueOf(totalLen));
+        InputStream body = isHead
+                ? new ByteArrayInputStream(new byte[0])
+                : new ByteArrayInputStream(data);
+        return new ProxyResponse(200, "OK", mime, headers, body);
+    }
+
+    private static byte[] buildSabrAbrRequest(SabrBootstrapContext ctx) {
+        ByteArrayOutputStream root = new ByteArrayOutputStream();
+        ByteArrayOutputStream abrState = new ByteArrayOutputStream();
+        writeProtoVarIntField(abrState, 1, 0L);
+        writeProtoVarIntField(abrState, 25, 1L);
+        writeProtoBytesField(root, 1, abrState.toByteArray());
+
+        if (ctx.itag > 0) {
+            ByteArrayOutputStream fmt = new ByteArrayOutputStream();
+            writeProtoVarIntField(fmt, 1, ctx.itag);
+            if (ctx.lastModified > 0L) {
+                writeProtoVarIntField(fmt, 2, ctx.lastModified);
+            }
+            writeProtoBytesField(root, 2, fmt.toByteArray());
+        }
+        if (ctx.ustreamerConfig != null && !ctx.ustreamerConfig.isEmpty()) {
+            byte[] cfg = tryDecodeBase64Flexible(ctx.ustreamerConfig);
+            if (cfg != null && cfg.length > 0) {
+                writeProtoBytesField(root, 5, cfg);
+            }
+        }
+        if (ctx.poToken != null && !ctx.poToken.isEmpty()) {
+            byte[] pot = tryDecodeBase64Flexible(ctx.poToken);
+            if (pot != null && pot.length > 0) {
+                writeProtoBytesField(root, 16, pot);
+            }
+        }
+        return root.toByteArray();
+    }
+
+    private static byte[] parseUmpAudioBytes(byte[] raw, String[] redirectOut) {
+        ByteArrayOutputStream audioOut = new ByteArrayOutputStream();
+        int[] offset = new int[]{0};
+        while (offset[0] < raw.length) {
+            long partType = readUmpVarInt(raw, offset);
+            long partSize = readUmpVarInt(raw, offset);
+            if (partType < 0 || partSize < 0 || offset[0] + partSize > raw.length) {
+                break;
+            }
+            int pStart = offset[0];
+            int pLen = (int) partSize;
+            offset[0] += pLen;
+
+            if (partType == 21L && pLen > 1) { // MEDIA
+                int[] segOff = new int[]{pStart};
+                long hdrId = readUmpVarInt(raw, segOff);
+                if (hdrId >= 0 && segOff[0] < pStart + pLen) {
+                    audioOut.write(raw, segOff[0], (pStart + pLen) - segOff[0]);
+                }
+            } else if (partType == 58L && pLen > 0) { // SABR_REDIRECT
+                String url = readFirstProtoString(raw, pStart, pLen, 1);
+                if (url != null && !url.isEmpty()) {
+                    redirectOut[0] = url;
+                }
+            }
+        }
+        return audioOut.toByteArray();
+    }
+
+    private static long readUmpVarInt(byte[] data, int[] offset) {
+        int pos = offset[0];
+        if (pos >= data.length) return -1L;
+        int b0 = data[pos] & 0xFF;
+        if (b0 < 0x80) {
+            offset[0] = pos + 1;
+            return b0;
+        }
+        if (b0 < 0xC0) {
+            if (pos + 2 > data.length) return -1L;
+            offset[0] = pos + 2;
+            return (b0 & 0x3F) | ((long) (data[pos + 1] & 0xFF) << 6);
+        }
+        if (b0 < 0xE0) {
+            if (pos + 3 > data.length) return -1L;
+            offset[0] = pos + 3;
+            return (b0 & 0x1F) | ((long) (data[pos + 1] & 0xFF) << 5) | ((long) (data[pos + 2] & 0xFF) << 13);
+        }
+        if (b0 < 0xF0) {
+            if (pos + 4 > data.length) return -1L;
+            offset[0] = pos + 4;
+            return (b0 & 0x0F) | ((long) (data[pos + 1] & 0xFF) << 4)
+                    | ((long) (data[pos + 2] & 0xFF) << 12) | ((long) (data[pos + 3] & 0xFF) << 20);
+        }
+        if (pos + 5 > data.length) return -1L;
+        offset[0] = pos + 5;
+        return (data[pos + 1] & 0xFFL)
+                | ((data[pos + 2] & 0xFFL) << 8)
+                | ((data[pos + 3] & 0xFFL) << 16)
+                | ((data[pos + 4] & 0xFFL) << 24);
+    }
+
+    private static String readFirstProtoString(byte[] data, int start, int len, int targetField) {
+        int pos = start;
+        int end = start + len;
+        while (pos < end) {
+            long tag = 0L;
+            int shift = 0;
+            while (pos < end && shift < 64) {
+                int b = data[pos++] & 0xFF;
+                tag |= (long) (b & 0x7F) << shift;
+                if ((b & 0x80) == 0) break;
+                shift += 7;
+            }
+            int field = (int) (tag >>> 3);
+            int wire = (int) (tag & 0x07);
+            if (wire == 0) {
+                while (pos < end && (data[pos++] & 0x80) != 0) {}
+            } else if (wire == 2) {
+                long sLen = 0L;
+                int sShift = 0;
+                while (pos < end && sShift < 64) {
+                    int b = data[pos++] & 0xFF;
+                    sLen |= (long) (b & 0x7F) << sShift;
+                    if ((b & 0x80) == 0) break;
+                    sShift += 7;
+                }
+                if (sLen < 0 || pos + sLen > end) break;
+                if (field == targetField) {
+                    return new String(data, pos, (int) sLen, StandardCharsets.UTF_8);
+                }
+                pos += (int) sLen;
+            } else if (wire == 1) {
+                pos += 8;
+            } else if (wire == 5) {
+                pos += 4;
+            } else {
+                break;
+            }
+        }
+        return null;
+    }
+
+    private static byte[] tryDecodeBase64Flexible(String raw) {
+        try {
+            return Base64.decode(raw.trim(), Base64.URL_SAFE | Base64.NO_WRAP);
+        } catch (IllegalArgumentException e) {
+            try {
+                return Base64.decode(raw.trim(), Base64.DEFAULT);
+            } catch (IllegalArgumentException ignored) {
+                return null;
+            }
+        }
+    }
+
+    private static void writeProtoVarIntField(ByteArrayOutputStream s, int fieldNumber, long value) {
+        writeProtoVarInt(s, ((long) fieldNumber << 3));
+        writeProtoVarInt(s, value);
+    }
+
+    private static void writeProtoBytesField(ByteArrayOutputStream s, int fieldNumber, byte[] bytes) {
+        writeProtoVarInt(s, ((long) fieldNumber << 3) | 2L);
+        writeProtoVarInt(s, bytes.length);
+        s.write(bytes, 0, bytes.length);
+    }
+
+    private static void writeProtoVarInt(ByteArrayOutputStream s, long value) {
+        long v = value;
+        while ((v & ~0x7FL) != 0L) {
+            s.write((int) ((v & 0x7FL) | 0x80L));
+            v >>>= 7;
+        }
+        s.write((int) v);
     }
 
     private static ResolvedAudio resolveViaVisionOs(String videoId, boolean forceRefreshVisitor) {
@@ -731,7 +1291,7 @@ final class KurfaNativeEngine {
             boolean useMusicEndpoint
     ) throws IOException {
         return executePlayerClientInternal(
-                videoId, payload, userAgent, clientNameId, clientVersion, visitorData, clientKind, useMusicEndpoint, true);
+                videoId, payload, userAgent, clientNameId, clientVersion, visitorData, clientKind, useMusicEndpoint, true, null);
     }
 
     private static ResolvedAudio executePlayerClientInternal(
@@ -743,7 +1303,8 @@ final class KurfaNativeEngine {
             String visitorData,
             String clientKind,
             boolean useMusicEndpoint,
-            boolean includeFieldMask
+            boolean includeFieldMask,
+            String poToken
     ) throws IOException {
         String baseUrl = useMusicEndpoint
                 ? "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
@@ -773,7 +1334,7 @@ final class KurfaNativeEngine {
             int statusCode = res.code();
             if (statusCode == 400 && includeFieldMask) {
                 return executePlayerClientInternal(
-                        videoId, payload, userAgent, clientNameId, clientVersion, visitorData, clientKind, useMusicEndpoint, false);
+                        videoId, payload, userAgent, clientNameId, clientVersion, visitorData, clientKind, useMusicEndpoint, false, poToken);
             }
             if (statusCode == 403 || statusCode == 429 || statusCode >= 500) {
                 ClientHealthTracker.markUnhealthy(clientKind);
@@ -793,6 +1354,14 @@ final class KurfaNativeEngine {
             String author = details != null ? details.optString("author", "") : "";
             long dur = details != null ? details.optLong("lengthSeconds", 0L) : 0L;
 
+            String serverAbrUrl = streamingData.optString("serverAbrStreamingUrl", "").trim();
+            String ustreamerCfg = extractUstreamerConfig(json);
+            int sabrItag = 140;
+            String sabrMime = "audio/mp4";
+            long sabrClen = 0L;
+            long sabrLmt = 0L;
+            int sabrBestMetaScore = Integer.MIN_VALUE;
+
             JSONArray adaptive = streamingData.optJSONArray("adaptiveFormats");
             if (adaptive != null) {
                 String bestUrl = null;
@@ -804,33 +1373,56 @@ final class KurfaNativeEngine {
                     JSONObject f = adaptive.optJSONObject(i);
                     if (f == null) continue;
                     String mime = f.optString("mimeType", "");
-                    String url = f.optString("url", "");
-                    if (!mime.startsWith("audio/") || url.isEmpty()) continue;
+                    if (!mime.startsWith("audio/")) continue;
 
                     int itag = f.optInt("itag", 0);
                     int bitrate = f.optInt("bitrate", 0);
                     long contentLen = parseLongSafe(f.optString("contentLength", ""));
+                    long lmt = parseLongSafe(f.optString("lastModified", ""));
                     int score = 0;
                     if (itag == 140) score += 1000;
                     else if (mime.startsWith("audio/mp4")) score += 500;
                     else if (mime.startsWith("audio/webm")) score += 300;
                     if (bitrate >= 96_000 && bitrate <= 192_000) score += 200;
 
-                    if (score > bestScore) {
+                    String cleanMime = mime.contains(";") ? mime.substring(0, mime.indexOf(';')).trim() : mime;
+                    if (score > sabrBestMetaScore) {
+                        sabrBestMetaScore = score;
+                        sabrItag = itag > 0 ? itag : 140;
+                        sabrMime = cleanMime;
+                        sabrClen = contentLen;
+                        sabrLmt = lmt;
+                    }
+
+                    String url = f.optString("url", "");
+                    if (!url.isEmpty() && score > bestScore) {
                         bestScore = score;
                         bestUrl = url;
                         bestContentLength = contentLen;
-                        bestMime = mime.contains(";") ? mime.substring(0, mime.indexOf(';')).trim() : mime;
+                        bestMime = cleanMime;
                     }
                 }
 
+                if (!serverAbrUrl.isEmpty()) {
+                    SABR_CONTEXT_CACHE.put(videoId, new SabrBootstrapContext(
+                            videoId, serverAbrUrl, ustreamerCfg, visitorData, poToken,
+                            title, author, dur, sabrItag, sabrMime, sabrClen, sabrLmt));
+                }
+
                 if (bestUrl != null) {
+                    if (poToken != null && !poToken.isEmpty() && !bestUrl.contains("pot=")) {
+                        bestUrl += (bestUrl.contains("?") ? "&pot=" : "?pot=") + Uri.encode(poToken);
+                    }
                     ResolvedAudio verifiedAdaptive = tryVerifiedAudioCandidate(
                             new ResolvedAudio(videoId, bestUrl, bestMime, title, author, dur, bestContentLength, userAgent, clientKind));
                     if (verifiedAdaptive != null) {
                         return verifiedAdaptive;
                     }
                 }
+            } else if (!serverAbrUrl.isEmpty()) {
+                SABR_CONTEXT_CACHE.put(videoId, new SabrBootstrapContext(
+                        videoId, serverAbrUrl, ustreamerCfg, visitorData, poToken,
+                        title, author, dur, sabrItag, sabrMime, sabrClen, sabrLmt));
             }
 
             JSONArray formats = streamingData.optJSONArray("formats");
@@ -1170,16 +1762,29 @@ final class KurfaNativeEngine {
         boolean isHead = "HEAD".equalsIgnoreCase(method);
         String expectedMime = null;
         long expectedLength = -1L;
+        boolean midFileRequest = parsedRange != null && parsedRange[0] > 0L;
+        boolean pinnedConstraints = false;
+        if (streamFullOpenRange && midFileRequest) {
+            String pinned = SERVED_SIGNATURE.get(videoId);
+            int bar = pinned != null ? pinned.lastIndexOf('|') : -1;
+            if (bar > 0) {
+                expectedMime = pinned.substring(0, bar);
+                expectedLength = parseLongSafe(pinned.substring(bar + 1));
+                pinnedConstraints = expectedLength > 0L;
+            }
+        }
 
         for (int attempt = 0; attempt < 4; attempt++) {
             boolean forceRefresh = attempt > 0;
             boolean forceAlternate = attempt >= 1;
-            ResolvedAudio audio = resolveAudioStream(videoId, forceRefresh, forceAlternate);
+            ResolvedAudio audio = pinnedConstraints
+                    ? resolveAudioStream(videoId, forceRefresh, forceAlternate, expectedMime, expectedLength)
+                    : resolveAudioStream(videoId, forceRefresh, forceAlternate);
             if (audio == null) {
                 break;
             }
             String candidateMime = cleanMimeType(null, audio.mimeType);
-            if (attempt > 0 && parsedRange != null && parsedRange[0] > 0L) {
+            if (attempt > 0 && midFileRequest) {
                 // Avoid feeding bytes from a differently-encoded stream mid-file into decoder
                 if (expectedMime != null && !expectedMime.equals(candidateMime)) {
                     continue;
@@ -1188,9 +1793,22 @@ final class KurfaNativeEngine {
                     continue;
                 }
             }
-            if (attempt == 0) {
+            if (attempt == 0 && !pinnedConstraints) {
                 expectedMime = candidateMime;
                 expectedLength = audio.contentLength;
+            }
+            if (streamFullOpenRange && !midFileRequest && !isHead) {
+                String sig = buildSignature(audio.mimeType, audio.contentLength);
+                if (sig != null) SERVED_SIGNATURE.put(videoId, sig);
+            }
+            if (audio.streamUrl != null && audio.streamUrl.startsWith("sabr://")) {
+                ProxyResponse sabrResp = serveSabrBufferedResponse(videoId, audio, isHead, parsedRange, allowOrigin);
+                if (sabrResp != null) {
+                    return sabrResp;
+                }
+                ClientHealthTracker.markUnhealthy("SABR");
+                invalidateStream(videoId);
+                continue;
             }
             long chunkCap = resolveChunkCap(audio);
 
@@ -2012,7 +2630,9 @@ final class KurfaNativeEngine {
                         return -1;
                     } catch (IOException readErr) {
                         closeCurrentUpstream();
-                        if (nextOffset <= targetEnd && openNextChunkOrRecover(true)) {
+                        // A dropped/idle upstream socket is not proof the URL is dead: first retry the
+                        // same URL from nextOffset, and only blacklist + re-resolve if that fails.
+                        if (nextOffset <= targetEnd && openNextChunkOrRecover(false)) {
                             continue;
                         }
                         throw readErr;
