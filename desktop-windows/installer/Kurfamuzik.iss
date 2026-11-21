@@ -1,5 +1,5 @@
 ﻿#ifndef MyAppVersion
-  #define MyAppVersion "1.2.0"
+  #define MyAppVersion "1.2.9"
 #endif
 #define MyAppGuid "{8E3A4F21-7C9B-4D82-A1F6-3E92D5B74C10}"
 #ifndef SourceDir

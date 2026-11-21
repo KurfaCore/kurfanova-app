@@ -7,6 +7,8 @@ internal static class Program
 {
     private const string SingleInstanceMutexName = "Local\\KurfamuzikDesktopSingleInstanceMutex";
     private const string ActivatePipeName = "KurfamuzikDesktopActivatePipe";
+    private const string TestSingleInstanceMutexName = "KurfaTest_SingleInstance_Mutex";
+    private const string TestActivatePipeName = "KurfaTestDesktopActivatePipe";
 
     [DllImport("shell32.dll", SetLastError = true)]
     private static extern int SetCurrentProcessExplicitAppUserModelID([MarshalAs(UnmanagedType.LPWStr)] string appId);
@@ -14,8 +16,11 @@ internal static class Program
     [STAThread]
     private static void Main(string[] args)
     {
+        bool isTestMode = args.Any(a => string.Equals(a, "--test", StringComparison.OrdinalIgnoreCase));
+        string? customTargetUrl = ParseUrlArg(args);
+
         // Register AppUserModelID before creating any Win32 window (required for Windows 10 taskbar/tray/toast identity)
-        try { _ = SetCurrentProcessExplicitAppUserModelID("KurfaCore.Kurfamuzik"); } catch { }
+        try { _ = SetCurrentProcessExplicitAppUserModelID(isTestMode ? "KurfaCore.KurfaTest" : "KurfaCore.Kurfamuzik"); } catch { }
 
         // 0. Preview screenshot helpers for visual verification
         int previewMiniIdx = Array.FindIndex(args, a => string.Equals(a, "--preview-miniplayer", StringComparison.OrdinalIgnoreCase));
@@ -82,13 +87,16 @@ internal static class Program
 
         ApplicationConfiguration.Initialize();
 
-        var activePaths = new AppPaths(AppPaths.ResolveActiveInstallDir());
+        var activePaths = new AppPaths(isTestMode ? AppPaths.DefaultTestInstallDir : AppPaths.ResolveActiveInstallDir());
         bool isPortable = args.Any(a => string.Equals(a, "--portable", StringComparison.OrdinalIgnoreCase));
-        bool forceSetup = args.Any(a => string.Equals(a, "--setup", StringComparison.OrdinalIgnoreCase) ||
+        bool forceSetup = !isTestMode && args.Any(a => string.Equals(a, "--setup", StringComparison.OrdinalIgnoreCase) ||
                                         string.Equals(a, "--reinstall", StringComparison.OrdinalIgnoreCase));
-        bool isInnoInstalled = AppPaths.IsInnoSetupInstalled;
-        bool isFromInstallDir = AppPaths.IsProcessRunningFromInstallDir(Environment.ProcessPath, activePaths);
-        bool effectivePortable = isPortable || (!isInnoInstalled && !isFromInstallDir);
+        bool isInnoInstalled = !isTestMode && AppPaths.IsInnoSetupInstalled;
+        bool isFromInstallDir = !isTestMode && AppPaths.IsProcessRunningFromInstallDir(Environment.ProcessPath, activePaths);
+        bool effectivePortable = isTestMode || isPortable || (!isInnoInstalled && !isFromInstallDir);
+
+        string mutexName = isTestMode ? TestSingleInstanceMutexName : SingleInstanceMutexName;
+        string pipeName = isTestMode ? TestActivatePipeName : ActivatePipeName;
 
         if (!forceSetup)
         {
@@ -104,11 +112,11 @@ internal static class Program
                 catch { /* already exited */ }
             }
 
-            var singleInstanceMutex = new Mutex(true, SingleInstanceMutexName, out bool isFirstInstance);
+            var singleInstanceMutex = new Mutex(true, mutexName, out bool isFirstInstance);
             if (!isFirstInstance)
             {
                 singleInstanceMutex.Dispose();
-                SignalExistingInstance();
+                SignalExistingInstance(pipeName);
                 return;
             }
 
@@ -123,8 +131,8 @@ internal static class Program
                     InstallerService.SyncMetadataOnLaunch(activePaths, config, AppPaths.GetNormalizedCurrentVersion());
                 }
 
-                var mainForm = new MainForm(activePaths, config);
-                StartActivationPipeListener(mainForm);
+                var mainForm = new MainForm(activePaths, config, isTestMode, customTargetUrl);
+                StartActivationPipeListener(mainForm, pipeName);
                 Application.Run(mainForm);
                 pendingUpdater = mainForm.DetachPendingUpdaterOnExit(out relaunchAfterUpdate);
             }
@@ -158,11 +166,39 @@ internal static class Program
         }
     }
 
-    private static void SignalExistingInstance()
+    private static string? ParseUrlArg(string[] args)
+    {
+        for (int i = 0; i < args.Length; i++)
+        {
+            string arg = args[i];
+            if (string.IsNullOrWhiteSpace(arg)) continue;
+
+            string? candidate = null;
+            if (arg.StartsWith("--url=", StringComparison.OrdinalIgnoreCase))
+            {
+                candidate = arg["--url=".Length..].Trim().Trim('"');
+            }
+            else if (string.Equals(arg, "--url", StringComparison.OrdinalIgnoreCase) && i + 1 < args.Length)
+            {
+                candidate = args[i + 1].Trim().Trim('"');
+            }
+
+            if (!string.IsNullOrWhiteSpace(candidate) &&
+                Uri.TryCreate(candidate, UriKind.Absolute, out Uri? parsed) &&
+                (parsed.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase) ||
+                 parsed.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)))
+            {
+                return parsed.AbsoluteUri;
+            }
+        }
+        return null;
+    }
+
+    private static void SignalExistingInstance(string pipeName)
     {
         try
         {
-            using var client = new NamedPipeClientStream(".", ActivatePipeName, PipeDirection.Out);
+            using var client = new NamedPipeClientStream(".", pipeName, PipeDirection.Out);
             client.Connect(1200);
             using var writer = new StreamWriter(client) { AutoFlush = true };
             writer.WriteLine("ACTIVATE");
@@ -173,7 +209,7 @@ internal static class Program
         }
     }
 
-    private static void StartActivationPipeListener(MainForm form)
+    private static void StartActivationPipeListener(MainForm form, string pipeName)
     {
         var thread = new Thread(() =>
         {
@@ -181,7 +217,7 @@ internal static class Program
             {
                 try
                 {
-                    using var server = new NamedPipeServerStream(ActivatePipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+                    using var server = new NamedPipeServerStream(pipeName, PipeDirection.In, 1, PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
                     server.WaitForConnection();
                     using var reader = new StreamReader(server);
                     string? msg = reader.ReadLine();

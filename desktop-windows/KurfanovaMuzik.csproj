@@ -11,7 +11,7 @@
     <ApplicationIcon>app.ico</ApplicationIcon>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
-    <Version>1.2.0</Version>
+    <Version>1.2.9</Version>
     <AssemblyTitle>Kurfamüzik</AssemblyTitle>
     <Product>Kurfamüzik</Product>
     <Company>KurfaCore</Company>

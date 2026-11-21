@@ -23,9 +23,11 @@ public sealed partial class NativeDesktopEngine : IDisposable
     private static readonly string[] AllowedOrigins =
     [
         "https://kurfanova.github.io",
-        "https://kurfanova.kurfa.workers.dev"
+        "https://kurfanova.kurfa.workers.dev",
+        "https://kurfatest.kurfa.workers.dev"
     ];
     public const string NativeAudioPathPrefix = "/__kurfa_native_audio__/";
+    public const string NativeVideoPathPrefix = "/__kurfa_native_video__/";
     public const string PrefetchPathPrefix = "/__kurfa_prefetch__/";
     public const string LocalFilePathPrefix = "/__kurfa_local_file__/";
     public const string LocalLyricsPathPrefix = "/__kurfa_local_lyrics__";
@@ -104,6 +106,153 @@ public sealed partial class NativeDesktopEngine : IDisposable
         string? LastReason
     );
 
+    private static readonly PlaybackClientProfile VisionOs01Profile = new(
+        Id: "VISIONOS_0_1",
+        ClientName: "VISIONOS",
+        ClientVersion: "0.1",
+        ClientId: "101",
+        UserAgent: VisionOs01UserAgent,
+        OsName: "VISION_OS",
+        OsVersion: "1.3",
+        DeviceMake: "Apple",
+        DeviceModel: "RealityDevice14,1",
+        Platform: "MOBILE",
+        AndroidSdkVersion: null,
+        UseMusicPlayerEndpoint: true,
+        RequiresVisitorData: true,
+        IncludeVisitorDataIfAvailable: true,
+        IncludeContentFlags: true,
+        IncludeUserAgentInContext: false,
+        SupportsAdaptive: true,
+        SupportsProgressive: true
+    );
+
+    private static readonly PlaybackClientProfile AndroidProfile = new(
+        Id: "ANDROID",
+        ClientName: "ANDROID",
+        ClientVersion: "20.10.38",
+        ClientId: "3",
+        UserAgent: AndroidUserAgent,
+        OsName: "Android",
+        OsVersion: "14",
+        DeviceMake: null,
+        DeviceModel: null,
+        Platform: null,
+        AndroidSdkVersion: 34,
+        UseMusicPlayerEndpoint: false,
+        RequiresVisitorData: false,
+        IncludeVisitorDataIfAvailable: true,
+        IncludeContentFlags: true,
+        IncludeUserAgentInContext: false,
+        SupportsAdaptive: true,
+        SupportsProgressive: true
+    );
+
+    private static readonly PlaybackClientProfile WebRemixProfile = new(
+        Id: "WEB_REMIX",
+        ClientName: "WEB_REMIX",
+        ClientVersion: WebRemixClientVersion,
+        ClientId: "67",
+        UserAgent: WebUserAgent,
+        OsName: "Windows",
+        OsVersion: "10.0",
+        DeviceMake: null,
+        DeviceModel: null,
+        Platform: "DESKTOP",
+        AndroidSdkVersion: null,
+        UseMusicPlayerEndpoint: true,
+        RequiresVisitorData: true,
+        IncludeVisitorDataIfAvailable: true,
+        IncludeContentFlags: true,
+        IncludeUserAgentInContext: false,
+        SupportsAdaptive: true,
+        SupportsProgressive: true
+    );
+
+    private static readonly PlaybackClientProfile IosProducerProfile = new(
+        Id: "IOS_PRODUCER",
+        ClientName: "IOS_PRODUCER",
+        ClientVersion: "0.10",
+        ClientId: "92",
+        UserAgent: IosProducerUserAgent,
+        OsName: "iPhone",
+        OsVersion: "18.6.2.22G100",
+        DeviceMake: "Apple",
+        DeviceModel: "iPhone16,2",
+        Platform: null,
+        AndroidSdkVersion: null,
+        UseMusicPlayerEndpoint: false,
+        RequiresVisitorData: false,
+        IncludeVisitorDataIfAvailable: false,
+        IncludeContentFlags: true,
+        IncludeUserAgentInContext: false,
+        SupportsAdaptive: false,
+        SupportsProgressive: true
+    );
+
+    private static readonly PlaybackClientProfile IosProfile = new(
+        Id: "IOS",
+        ClientName: "IOS",
+        ClientVersion: "20.10.4",
+        ClientId: "5",
+        UserAgent: IosUserAgent,
+        OsName: "iPhone",
+        OsVersion: "18.3.2.22D82",
+        DeviceMake: "Apple",
+        DeviceModel: "iPhone16,2",
+        Platform: null,
+        AndroidSdkVersion: null,
+        UseMusicPlayerEndpoint: false,
+        RequiresVisitorData: false,
+        IncludeVisitorDataIfAvailable: false,
+        IncludeContentFlags: false,
+        IncludeUserAgentInContext: true,
+        SupportsAdaptive: true,
+        SupportsProgressive: true
+    );
+
+    private static readonly PlaybackClientProfile TvHtml5SimplyProfile = new(
+        Id: "TVHTML5_SIMPLY",
+        ClientName: "TVHTML5_SIMPLY",
+        ClientVersion: "1.0",
+        ClientId: "75",
+        UserAgent: TvHtml5SimplyUserAgent,
+        OsName: null,
+        OsVersion: null,
+        DeviceMake: null,
+        DeviceModel: null,
+        Platform: null,
+        AndroidSdkVersion: null,
+        UseMusicPlayerEndpoint: true,
+        RequiresVisitorData: false,
+        IncludeVisitorDataIfAvailable: true,
+        IncludeContentFlags: true,
+        IncludeUserAgentInContext: false,
+        SupportsAdaptive: true,
+        SupportsProgressive: true
+    );
+
+    private static readonly PlaybackClientProfile AndroidVrProfile = new(
+        Id: "ANDROID_VR",
+        ClientName: "ANDROID_VR",
+        ClientVersion: "1.57.29",
+        ClientId: "28",
+        UserAgent: AndroidVrUserAgent,
+        OsName: null,
+        OsVersion: null,
+        DeviceMake: null,
+        DeviceModel: null,
+        Platform: null,
+        AndroidSdkVersion: 34,
+        UseMusicPlayerEndpoint: true,
+        RequiresVisitorData: false,
+        IncludeVisitorDataIfAvailable: false,
+        IncludeContentFlags: false,
+        IncludeUserAgentInContext: true,
+        SupportsAdaptive: true,
+        SupportsProgressive: true
+    );
+
     /// <summary>
     /// Metrolist 2026 live-tested playback client catalog in priority order:
     /// 1) VISIONOS (0.1 + fresh visitorData)
@@ -112,146 +261,26 @@ public sealed partial class NativeDesktopEngine : IDisposable
     /// </summary>
     private static readonly IReadOnlyList<PlaybackClientProfile> AudioPlaybackClients =
     [
-        new PlaybackClientProfile(
-            Id: "VISIONOS_0_1",
-            ClientName: "VISIONOS",
-            ClientVersion: "0.1",
-            ClientId: "101",
-            UserAgent: VisionOs01UserAgent,
-            OsName: "VISION_OS",
-            OsVersion: "1.3",
-            DeviceMake: "Apple",
-            DeviceModel: "RealityDevice14,1",
-            Platform: "MOBILE",
-            AndroidSdkVersion: null,
-            UseMusicPlayerEndpoint: true,
-            RequiresVisitorData: true,
-            IncludeVisitorDataIfAvailable: true,
-            IncludeContentFlags: true,
-            IncludeUserAgentInContext: false,
-            SupportsAdaptive: true,
-            SupportsProgressive: true
-        ),
-        new PlaybackClientProfile(
-            Id: "ANDROID",
-            ClientName: "ANDROID",
-            ClientVersion: "20.10.38",
-            ClientId: "3",
-            UserAgent: AndroidUserAgent,
-            OsName: "Android",
-            OsVersion: "14",
-            DeviceMake: null,
-            DeviceModel: null,
-            Platform: null,
-            AndroidSdkVersion: 34,
-            UseMusicPlayerEndpoint: false,
-            RequiresVisitorData: false,
-            IncludeVisitorDataIfAvailable: true,
-            IncludeContentFlags: true,
-            IncludeUserAgentInContext: false,
-            SupportsAdaptive: true,
-            SupportsProgressive: true
-        ),
-        new PlaybackClientProfile(
-            Id: "WEB_REMIX",
-            ClientName: "WEB_REMIX",
-            ClientVersion: WebRemixClientVersion,
-            ClientId: "67",
-            UserAgent: WebUserAgent,
-            OsName: "Windows",
-            OsVersion: "10.0",
-            DeviceMake: null,
-            DeviceModel: null,
-            Platform: "DESKTOP",
-            AndroidSdkVersion: null,
-            UseMusicPlayerEndpoint: true,
-            RequiresVisitorData: true,
-            IncludeVisitorDataIfAvailable: true,
-            IncludeContentFlags: true,
-            IncludeUserAgentInContext: false,
-            SupportsAdaptive: true,
-            SupportsProgressive: true
-        ),
-        new PlaybackClientProfile(
-            Id: "IOS_PRODUCER",
-            ClientName: "IOS_PRODUCER",
-            ClientVersion: "0.10",
-            ClientId: "92",
-            UserAgent: IosProducerUserAgent,
-            OsName: "iPhone",
-            OsVersion: "18.6.2.22G100",
-            DeviceMake: "Apple",
-            DeviceModel: "iPhone16,2",
-            Platform: null,
-            AndroidSdkVersion: null,
-            UseMusicPlayerEndpoint: false,
-            RequiresVisitorData: false,
-            IncludeVisitorDataIfAvailable: false,
-            IncludeContentFlags: true,
-            IncludeUserAgentInContext: false,
-            SupportsAdaptive: false,
-            SupportsProgressive: true
-        ),
-        new PlaybackClientProfile(
-            Id: "IOS",
-            ClientName: "IOS",
-            ClientVersion: "20.10.4",
-            ClientId: "5",
-            UserAgent: IosUserAgent,
-            OsName: "iPhone",
-            OsVersion: "18.3.2.22D82",
-            DeviceMake: "Apple",
-            DeviceModel: "iPhone16,2",
-            Platform: null,
-            AndroidSdkVersion: null,
-            UseMusicPlayerEndpoint: false,
-            RequiresVisitorData: false,
-            IncludeVisitorDataIfAvailable: false,
-            IncludeContentFlags: false,
-            IncludeUserAgentInContext: true,
-            SupportsAdaptive: true,
-            SupportsProgressive: true
-        ),
-        new PlaybackClientProfile(
-            Id: "TVHTML5_SIMPLY",
-            ClientName: "TVHTML5_SIMPLY",
-            ClientVersion: "1.0",
-            ClientId: "75",
-            UserAgent: TvHtml5SimplyUserAgent,
-            OsName: null,
-            OsVersion: null,
-            DeviceMake: null,
-            DeviceModel: null,
-            Platform: null,
-            AndroidSdkVersion: null,
-            UseMusicPlayerEndpoint: true,
-            RequiresVisitorData: false,
-            IncludeVisitorDataIfAvailable: true,
-            IncludeContentFlags: true,
-            IncludeUserAgentInContext: false,
-            SupportsAdaptive: true,
-            SupportsProgressive: true
-        ),
-        new PlaybackClientProfile(
-            Id: "ANDROID_VR",
-            ClientName: "ANDROID_VR",
-            ClientVersion: "1.57.29",
-            ClientId: "28",
-            UserAgent: AndroidVrUserAgent,
-            OsName: null,
-            OsVersion: null,
-            DeviceMake: null,
-            DeviceModel: null,
-            Platform: null,
-            AndroidSdkVersion: 34,
-            UseMusicPlayerEndpoint: true,
-            RequiresVisitorData: false,
-            IncludeVisitorDataIfAvailable: false,
-            IncludeContentFlags: false,
-            IncludeUserAgentInContext: true,
-            SupportsAdaptive: true,
-            SupportsProgressive: true
-        )
+        VisionOs01Profile,
+        AndroidProfile,
+        WebRemixProfile,
+        IosProducerProfile,
+        IosProfile,
+        TvHtml5SimplyProfile,
+        AndroidVrProfile
+    ];
+
+    /// <summary>
+    /// Metrolist 2026 muxed progressive MP4 client priority order for ad-free native video.
+    /// </summary>
+    private static readonly IReadOnlyList<PlaybackClientProfile> VideoPlaybackClients =
+    [
+        VisionOs01Profile,
+        AndroidProfile,
+        IosProducerProfile,
+        TvHtml5SimplyProfile,
+        AndroidVrProfile,
+        IosProfile
     ];
 
     /// <summary>
@@ -716,11 +745,15 @@ public sealed partial class NativeDesktopEngine : IDisposable
 
     private readonly ConcurrentDictionary<string, ResolvedAudio> _streamCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, Task<ResolvedAudio?>> _inflightResolutions = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, ResolvedAudio> _videoStreamCache = new(StringComparer.Ordinal);
+    private readonly ConcurrentDictionary<string, Task<ResolvedAudio?>> _inflightVideoResolutions = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, byte> _inflightPrefetches = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, PoTokenCacheEntry> _poTokenCache = new(StringComparer.Ordinal);
     private readonly ConcurrentDictionary<string, SabrFallbackClient.SabrBootstrapInfo> _sabrBootstraps = new(StringComparer.Ordinal);
     private readonly ClientHealthTracker _healthTracker = new(ClientCooldownDuration);
+    private readonly ClientHealthTracker _videoHealthTracker = new(ClientCooldownDuration);
     private readonly ActiveTrackChunkCache _chunkCache = new();
+    private readonly ActiveTrackChunkCache _videoChunkCache = new();
     private readonly SabrFallbackClient _sabrClient = new();
     private readonly SemaphoreSlim _visitorSemaphore = new(1, 1);
     private readonly SemaphoreSlim _poTokenSemaphore = new(1, 1);
@@ -783,6 +816,19 @@ public sealed partial class NativeDesktopEngine : IDisposable
             throw new InvalidOperationException("Local audio HTTP server has not been started.");
         }
         return $"http://127.0.0.1:{Port}{NativeAudioPathPrefix}{videoId}";
+    }
+
+    public string GetLocalVideoUrl(string videoId)
+    {
+        if (!IsValidVideoId(videoId))
+        {
+            throw new ArgumentException("Invalid YouTube video ID.", nameof(videoId));
+        }
+        if (Port <= 0)
+        {
+            throw new InvalidOperationException("Local audio HTTP server has not been started.");
+        }
+        return $"http://127.0.0.1:{Port}{NativeVideoPathPrefix}{videoId}";
     }
 
     public string GetLocalPrefetchUrl(string videoId)
@@ -996,10 +1042,13 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 return;
             }
 
+            string path = context.Request.Url?.AbsolutePath ?? string.Empty;
+            bool isNativeVideoRoute = path.StartsWith(NativeVideoPathPrefix, StringComparison.Ordinal);
+
             string method = context.Request.HttpMethod?.ToUpperInvariant() ?? "GET";
             if (method == "OPTIONS")
             {
-                ApplyCorsHeaders(context.Response, context.Request);
+                ApplyCorsHeaders(context.Response, context.Request, wildcardOrigin: isNativeVideoRoute);
                 context.Response.StatusCode = 204;
                 context.Response.StatusDescription = "No Content";
                 context.Response.ContentLength64 = 0;
@@ -1008,13 +1057,12 @@ public sealed partial class NativeDesktopEngine : IDisposable
 
             if (method != "GET" && method != "HEAD")
             {
-                ApplyCorsHeaders(context.Response, context.Request);
+                ApplyCorsHeaders(context.Response, context.Request, wildcardOrigin: isNativeVideoRoute);
                 context.Response.AddHeader("Allow", "GET, HEAD, OPTIONS");
-                await WritePlainErrorAsync(context.Response, 405, "Method Not Allowed", ct).ConfigureAwait(false);
+                await WritePlainErrorAsync(context.Response, 405, "Method Not Allowed", ct, wildcardOrigin: isNativeVideoRoute).ConfigureAwait(false);
                 return;
             }
 
-            string path = context.Request.Url?.AbsolutePath ?? string.Empty;
             if (string.Equals(path, LocalLyricsPathPrefix, StringComparison.Ordinal) ||
                 string.Equals(path, LocalLyricsPathPrefix + "/", StringComparison.Ordinal))
             {
@@ -1036,6 +1084,19 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 return;
             }
 
+            if (isNativeVideoRoute)
+            {
+                string videoClipId = path[NativeVideoPathPrefix.Length..].Trim();
+                if (!IsValidVideoId(videoClipId))
+                {
+                    await WritePlainErrorAsync(context.Response, 400, "Invalid video ID", ct, wildcardOrigin: true).ConfigureAwait(false);
+                    return;
+                }
+
+                await ProxyMediaStreamAsync(context, videoClipId, isHead: method == "HEAD", isVideo: true, ct).ConfigureAwait(false);
+                return;
+            }
+
             if (!path.StartsWith(NativeAudioPathPrefix, StringComparison.Ordinal))
             {
                 await WritePlainErrorAsync(context.Response, 404, "Not Found", ct).ConfigureAwait(false);
@@ -1049,7 +1110,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 return;
             }
 
-            await ProxyAudioStreamAsync(context, videoId, isHead: method == "HEAD", ct).ConfigureAwait(false);
+            await ProxyMediaStreamAsync(context, videoId, isHead: method == "HEAD", isVideo: false, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -1120,15 +1181,19 @@ public sealed partial class NativeDesktopEngine : IDisposable
         return false;
     }
 
-    private static void ApplyCorsHeaders(HttpListenerResponse response, HttpListenerRequest request)
+    private static void ApplyCorsHeaders(HttpListenerResponse response, HttpListenerRequest request, bool wildcardOrigin = false)
     {
-        IsAllowedOriginHeader(request.Headers["Origin"], out string corsOrigin);
+        string corsOrigin = "*";
+        if (!wildcardOrigin)
+        {
+            IsAllowedOriginHeader(request.Headers["Origin"], out corsOrigin);
+            response.Headers["Vary"] = "Origin";
+        }
         response.Headers["Access-Control-Allow-Origin"] = corsOrigin;
         response.Headers["Access-Control-Allow-Methods"] = "GET, HEAD, OPTIONS";
         response.Headers["Access-Control-Allow-Headers"] = "Range, Content-Type";
         response.Headers["Access-Control-Expose-Headers"] = "Content-Range, Content-Length, Accept-Ranges";
         response.Headers["Access-Control-Max-Age"] = "3600";
-        response.Headers["Vary"] = "Origin";
         response.Headers["Cache-Control"] = "no-store";
 
         if (string.Equals(request.Headers["Access-Control-Request-Private-Network"], "true", StringComparison.OrdinalIgnoreCase))
@@ -1141,12 +1206,13 @@ public sealed partial class NativeDesktopEngine : IDisposable
         HttpListenerResponse response,
         int statusCode,
         string message,
-        CancellationToken ct)
+        CancellationToken ct,
+        bool wildcardOrigin = false)
     {
         byte[] bytes = Encoding.UTF8.GetBytes(message);
         response.StatusCode = statusCode;
         response.ContentType = "text/plain; charset=utf-8";
-        response.Headers["Access-Control-Allow-Origin"] = AllowedOrigin;
+        response.Headers["Access-Control-Allow-Origin"] = wildcardOrigin ? "*" : AllowedOrigin;
         response.Headers["Cache-Control"] = "no-store";
         response.ContentLength64 = bytes.Length;
         await response.OutputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
@@ -1214,10 +1280,40 @@ public sealed partial class NativeDesktopEngine : IDisposable
         await resp.OutputStream.WriteAsync(bytes, ct).ConfigureAwait(false);
     }
 
-    private async Task ProxyAudioStreamAsync(
+    private Task ProxyMediaStreamAsync(
         HttpListenerContext context,
         string videoId,
         bool isHead,
+        bool isVideo,
+        CancellationToken ct)
+    {
+        ConcurrentDictionary<string, ResolvedAudio> streamCache = isVideo ? _videoStreamCache : _streamCache;
+        ActiveTrackChunkCache chunkCache = isVideo ? _videoChunkCache : _chunkCache;
+        ClientHealthTracker healthTracker = isVideo ? _videoHealthTracker : _healthTracker;
+        string defaultMime = isVideo ? "video/mp4" : "audio/mp4";
+        bool wildcardOrigin = isVideo;
+
+        Task<ResolvedAudio?> ResolveMedia(bool forceRefresh, IReadOnlySet<string>? excluded) =>
+            isVideo
+                ? ResolveVideoStreamForProxyAsync(videoId, ct, forceRefresh, excluded)
+                : ResolveAudioStreamAsync(videoId, ct, forceRefresh, excludedClients: excluded);
+
+        return ProxyMediaStreamCoreAsync(
+            context, videoId, isHead, isVideo, streamCache, chunkCache, healthTracker,
+            defaultMime, wildcardOrigin, ResolveMedia, ct);
+    }
+
+    private async Task ProxyMediaStreamCoreAsync(
+        HttpListenerContext context,
+        string videoId,
+        bool isHead,
+        bool isVideo,
+        ConcurrentDictionary<string, ResolvedAudio> streamCache,
+        ActiveTrackChunkCache chunkCache,
+        ClientHealthTracker healthTracker,
+        string defaultMime,
+        bool wildcardOrigin,
+        Func<bool, IReadOnlySet<string>?, Task<ResolvedAudio?>> resolveMediaAsync,
         CancellationToken ct)
     {
         string? rangeHeader = context.Request.Headers["Range"];
@@ -1227,14 +1323,14 @@ public sealed partial class NativeDesktopEngine : IDisposable
 
         // 0ms fast path from active 2-track LRU chunk/metadata cache
         if (isHead && !hasClientRange &&
-            _streamCache.TryGetValue(videoId, out ResolvedAudio? headCached) &&
+            streamCache.TryGetValue(videoId, out ResolvedAudio? headCached) &&
             headCached.ExpiresAtUtc > DateTimeOffset.UtcNow &&
-            _chunkCache.TryGetMetadata(videoId, out string cachedHeadMime, out _, out long cachedHeadLen) &&
+            chunkCache.TryGetMetadata(videoId, out string cachedHeadMime, out _, out long cachedHeadLen) &&
             cachedHeadLen > 0)
         {
             HttpListenerResponse fastHead = context.Response;
-            ApplyCorsHeaders(fastHead, context.Request);
-            fastHead.ContentType = string.IsNullOrWhiteSpace(cachedHeadMime) ? "audio/mp4" : cachedHeadMime;
+            ApplyCorsHeaders(fastHead, context.Request, wildcardOrigin);
+            fastHead.ContentType = string.IsNullOrWhiteSpace(cachedHeadMime) ? defaultMime : cachedHeadMime;
             fastHead.Headers["Accept-Ranges"] = "bytes";
             fastHead.StatusCode = 200;
             fastHead.StatusDescription = "OK";
@@ -1246,9 +1342,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
         {
             long maxCacheReadEnd = clientRequestedEnd.HasValue
                 ? Math.Min(clientRequestedEnd.Value, clientStart + MaxProgressiveUpstreamChunkBytes - 1)
-                : clientStart + MaxAdaptiveUpstreamChunkBytes - 1;
+                : clientStart + (isVideo ? MaxProgressiveUpstreamChunkBytes : MaxAdaptiveUpstreamChunkBytes) - 1;
 
-            if (_chunkCache.TryReadRange(
+            if (chunkCache.TryReadRange(
                     videoId,
                     clientStart,
                     maxCacheReadEnd,
@@ -1260,7 +1356,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 if (cachedTotal > 0 && clientStart >= cachedTotal)
                 {
                     HttpListenerResponse r416 = context.Response;
-                    ApplyCorsHeaders(r416, context.Request);
+                    ApplyCorsHeaders(r416, context.Request, wildcardOrigin);
                     r416.StatusCode = 416;
                     r416.StatusDescription = "Range Not Satisfiable";
                     r416.Headers["Content-Range"] = $"bytes */{cachedTotal}";
@@ -1269,8 +1365,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 }
 
                 HttpListenerResponse cacheResp = context.Response;
-                ApplyCorsHeaders(cacheResp, context.Request);
-                cacheResp.ContentType = string.IsNullOrWhiteSpace(cachedMime) ? "audio/mp4" : cachedMime;
+                ApplyCorsHeaders(cacheResp, context.Request, wildcardOrigin);
+                cacheResp.ContentType = string.IsNullOrWhiteSpace(cachedMime) ? defaultMime : cachedMime;
                 cacheResp.Headers["Accept-Ranges"] = "bytes";
                 cacheResp.Headers["X-Kurfa-Cache"] = "HIT";
                 cacheResp.StatusCode = 206;
@@ -1297,11 +1393,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
         {
             bool forceRefresh = attempt > 0;
 
-            ResolvedAudio? resolved = await ResolveAudioStreamAsync(
-                videoId,
-                ct,
-                forceRefresh: forceRefresh,
-                excludedClients: excludedClients.Count > 0 ? excludedClients : null).ConfigureAwait(false);
+            ResolvedAudio? resolved = await resolveMediaAsync(
+                forceRefresh,
+                excludedClients.Count > 0 ? excludedClients : null).ConfigureAwait(false);
             if (resolved is null)
             {
                 break;
@@ -1318,14 +1412,14 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 continue;
             }
 
-            if (resolved.StreamUrl.StartsWith("sabr://", StringComparison.Ordinal))
+            if (!isVideo && resolved.StreamUrl.StartsWith("sabr://", StringComparison.Ordinal))
             {
                 if (await TryServeSabrBufferedResponseAsync(context, videoId, resolved, hasClientRange, clientStart, clientRequestedEnd, isHead, ct).ConfigureAwait(false))
                 {
                     return;
                 }
                 excludedClients.Add(resolved.ClientKind);
-                _streamCache.TryRemove(videoId, out _);
+                streamCache.TryRemove(videoId, out _);
                 continue;
             }
 
@@ -1350,21 +1444,21 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     int headStatus = (int)headUpstream.StatusCode;
                     if (headStatus == 403 || headStatus == 410 || headStatus >= 500)
                     {
-                        _healthTracker.MarkFailure(resolved.ClientKind, $"HEAD_HTTP_{headStatus}");
+                        healthTracker.MarkFailure(resolved.ClientKind, $"HEAD_HTTP_{headStatus}");
                         excludedClients.Add(resolved.ClientKind);
-                        _streamCache.TryRemove(videoId, out _);
+                        streamCache.TryRemove(videoId, out _);
                         continue;
                     }
                     if (headStatus < 200 || headStatus >= 300)
                     {
-                        await WritePlainErrorAsync(context.Response, headStatus, "Upstream audio error", ct).ConfigureAwait(false);
+                        await WritePlainErrorAsync(context.Response, headStatus, "Upstream media error", ct, wildcardOrigin).ConfigureAwait(false);
                         return;
                     }
 
                     HttpListenerResponse headResp = context.Response;
-                    ApplyCorsHeaders(headResp, context.Request);
+                    ApplyCorsHeaders(headResp, context.Request, wildcardOrigin);
                     string headMime = headUpstream.Content.Headers.ContentType?.MediaType ?? resolved.MimeType;
-                    headResp.ContentType = string.IsNullOrWhiteSpace(headMime) ? "audio/mp4" : headMime;
+                    headResp.ContentType = string.IsNullOrWhiteSpace(headMime) ? defaultMime : headMime;
                     headResp.Headers["Accept-Ranges"] = "bytes";
                     headResp.StatusCode = 200;
                     headResp.StatusDescription = "OK";
@@ -1385,7 +1479,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                         headResp.ContentLength64 = fallbackHeadLen;
                         resolvedHeadTotal = fallbackHeadLen;
                     }
-                    _chunkCache.SetMetadata(videoId, headResp.ContentType, resolved.Itag, resolvedHeadTotal);
+                    chunkCache.SetMetadata(videoId, headResp.ContentType, resolved.Itag, resolvedHeadTotal);
                     return;
                 }
                 catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -1394,9 +1488,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 }
                 catch
                 {
-                    _healthTracker.MarkFailure(resolved.ClientKind, "HEAD_EXCEPTION");
+                    healthTracker.MarkFailure(resolved.ClientKind, "HEAD_EXCEPTION");
                     excludedClients.Add(resolved.ClientKind);
-                    _streamCache.TryRemove(videoId, out _);
+                    streamCache.TryRemove(videoId, out _);
                     continue;
                 }
             }
@@ -1406,7 +1500,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 if (resolved.ContentLength > 0 && clientStart >= resolved.ContentLength)
                 {
                     HttpListenerResponse r416 = context.Response;
-                    ApplyCorsHeaders(r416, context.Request);
+                    ApplyCorsHeaders(r416, context.Request, wildcardOrigin);
                     r416.StatusCode = 416;
                     r416.StatusDescription = "Range Not Satisfiable";
                     r416.Headers["Content-Range"] = $"bytes */{resolved.ContentLength}";
@@ -1450,9 +1544,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 catch
                 {
                     upstream?.Dispose();
-                    _healthTracker.MarkFailure(resolved.ClientKind, "RANGE_CONNECT_ERROR");
+                    healthTracker.MarkFailure(resolved.ClientKind, "RANGE_CONNECT_ERROR");
                     excludedClients.Add(resolved.ClientKind);
-                    _streamCache.TryRemove(videoId, out _);
+                    streamCache.TryRemove(videoId, out _);
                     continue;
                 }
 
@@ -1461,22 +1555,22 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     int statusCode = (int)upstream.StatusCode;
                     if (statusCode == 403 || statusCode == 410 || statusCode >= 500 || (clientStart > 0 && statusCode == 200))
                     {
-                        _healthTracker.MarkFailure(resolved.ClientKind, $"RANGE_HTTP_{statusCode}");
+                        healthTracker.MarkFailure(resolved.ClientKind, $"RANGE_HTTP_{statusCode}");
                         excludedClients.Add(resolved.ClientKind);
-                        _streamCache.TryRemove(videoId, out _);
+                        streamCache.TryRemove(videoId, out _);
                         continue;
                     }
                     if (statusCode < 200 || statusCode >= 300)
                     {
-                        await WritePlainErrorAsync(context.Response, statusCode, "Upstream audio error", ct).ConfigureAwait(false);
+                        await WritePlainErrorAsync(context.Response, statusCode, "Upstream media error", ct, wildcardOrigin).ConfigureAwait(false);
                         return;
                     }
 
                     HttpListenerResponse resp = context.Response;
-                    ApplyCorsHeaders(resp, context.Request);
+                    ApplyCorsHeaders(resp, context.Request, wildcardOrigin);
 
                     string contentType = upstream.Content.Headers.ContentType?.MediaType ?? resolved.MimeType;
-                    resp.ContentType = string.IsNullOrWhiteSpace(contentType) ? "audio/mp4" : contentType;
+                    resp.ContentType = string.IsNullOrWhiteSpace(contentType) ? defaultMime : contentType;
                     resp.Headers["Accept-Ranges"] = "bytes";
                     resp.Headers["X-Kurfa-Cache"] = "MISS";
                     resp.Headers["X-Kurfa-Client"] = resolved.ClientKind;
@@ -1513,7 +1607,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     }
 
                     long metadataTotal = totalKnownLength ?? resolved.ContentLength;
-                    _chunkCache.SetMetadata(videoId, resp.ContentType, resolved.Itag, metadataTotal);
+                    chunkCache.SetMetadata(videoId, resp.ContentType, resolved.Itag, metadataTotal);
 
                     if (isHead)
                     {
@@ -1543,15 +1637,11 @@ public sealed partial class NativeDesktopEngine : IDisposable
                             {
                                 if (segmentStartOffset > remainingEnd) break;
 
-                                _healthTracker.MarkFailure(activeChunkMedia.ClientKind, "MID_CHUNK_RECOVERY");
+                                healthTracker.MarkFailure(activeChunkMedia.ClientKind, "MID_CHUNK_RECOVERY");
                                 excludedClients.Add(activeChunkMedia.ClientKind);
-                                _streamCache.TryRemove(videoId, out _);
+                                streamCache.TryRemove(videoId, out _);
 
-                                ResolvedAudio? fresh = await ResolveAudioStreamAsync(
-                                    videoId,
-                                    ct,
-                                    forceRefresh: true,
-                                    excludedClients: excludedClients).ConfigureAwait(false);
+                                ResolvedAudio? fresh = await resolveMediaAsync(true, excludedClients).ConfigureAwait(false);
                                 if (fresh is null)
                                 {
                                     break;
@@ -1575,7 +1665,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                                 if (recStatus != 206 && !(segmentStartOffset == 0 && recStatus == 200))
                                 {
                                     currentResp.Dispose();
-                                    _healthTracker.MarkFailure(activeChunkMedia.ClientKind, $"MID_CHUNK_HTTP_{recStatus}");
+                                    healthTracker.MarkFailure(activeChunkMedia.ClientKind, $"MID_CHUNK_HTTP_{recStatus}");
                                     continue;
                                 }
                             }
@@ -1609,7 +1699,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                             {
                                 if (teeBuffer.Length > 0)
                                 {
-                                    _chunkCache.StoreChunk(
+                                    chunkCache.StoreChunk(
                                         videoId,
                                         resp.ContentType ?? activeChunkMedia.MimeType,
                                         activeChunkMedia.Itag,
@@ -1669,7 +1759,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 }
 
                 // Serve full-GET chunk directly from LRU cache when already buffered
-                if (_chunkCache.TryReadRange(
+                if (chunkCache.TryReadRange(
                         videoId,
                         offset,
                         chunkEnd,
@@ -1685,8 +1775,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     if (!headersSent)
                     {
                         HttpListenerResponse resp = context.Response;
-                        ApplyCorsHeaders(resp, context.Request);
-                        resp.ContentType = string.IsNullOrWhiteSpace(cachedChunkMime) ? "audio/mp4" : cachedChunkMime;
+                        ApplyCorsHeaders(resp, context.Request, wildcardOrigin);
+                        resp.ContentType = string.IsNullOrWhiteSpace(cachedChunkMime) ? defaultMime : cachedChunkMime;
                         resp.Headers["Accept-Ranges"] = "bytes";
                         resp.Headers["X-Kurfa-Cache"] = "HIT";
                         resp.StatusCode = 200;
@@ -1715,12 +1805,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
                 {
                     if (chunkAttempt > 0)
                     {
-                        _streamCache.TryRemove(videoId, out _);
-                        ResolvedAudio? refreshed = await ResolveAudioStreamAsync(
-                            videoId,
-                            ct,
-                            forceRefresh: true,
-                            excludedClients: excludedClients).ConfigureAwait(false);
+                        streamCache.TryRemove(videoId, out _);
+                        ResolvedAudio? refreshed = await resolveMediaAsync(true, excludedClients).ConfigureAwait(false);
                         if (refreshed is null)
                         {
                             break;
@@ -1750,9 +1836,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
                         {
                             chunkUpstream.Dispose();
                             chunkUpstream = null;
-                            _healthTracker.MarkFailure(activeStreamMedia.ClientKind, $"FULL_CHUNK_HTTP_{statusCode}");
+                            healthTracker.MarkFailure(activeStreamMedia.ClientKind, $"FULL_CHUNK_HTTP_{statusCode}");
                             excludedClients.Add(activeStreamMedia.ClientKind);
-                            _streamCache.TryRemove(videoId, out _);
+                            streamCache.TryRemove(videoId, out _);
                             continue;
                         }
                         if (statusCode < 200 || statusCode >= 300)
@@ -1760,7 +1846,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                             if (!headersSent)
                             {
                                 chunkUpstream.Dispose();
-                                await WritePlainErrorAsync(context.Response, statusCode, "Upstream audio error", ct).ConfigureAwait(false);
+                                await WritePlainErrorAsync(context.Response, statusCode, "Upstream media error", ct, wildcardOrigin).ConfigureAwait(false);
                                 return;
                             }
                             chunkUpstream.Dispose();
@@ -1780,9 +1866,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     {
                         chunkUpstream?.Dispose();
                         chunkUpstream = null;
-                        _healthTracker.MarkFailure(activeStreamMedia.ClientKind, "FULL_CHUNK_EXCEPTION");
+                        healthTracker.MarkFailure(activeStreamMedia.ClientKind, "FULL_CHUNK_EXCEPTION");
                         excludedClients.Add(activeStreamMedia.ClientKind);
-                        _streamCache.TryRemove(videoId, out _);
+                        streamCache.TryRemove(videoId, out _);
                     }
                 }
 
@@ -1806,9 +1892,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     if (!headersSent)
                     {
                         HttpListenerResponse resp = context.Response;
-                        ApplyCorsHeaders(resp, context.Request);
+                        ApplyCorsHeaders(resp, context.Request, wildcardOrigin);
                         string contentType = chunkUpstream.Content.Headers.ContentType?.MediaType ?? activeStreamMedia.MimeType;
-                        resp.ContentType = string.IsNullOrWhiteSpace(contentType) ? "audio/mp4" : contentType;
+                        resp.ContentType = string.IsNullOrWhiteSpace(contentType) ? defaultMime : contentType;
                         resp.Headers["Accept-Ranges"] = "bytes";
                         resp.StatusCode = 200;
                         resp.StatusDescription = "OK";
@@ -1817,7 +1903,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                             resp.ContentLength64 = totalLength;
                         }
                         expectedMime = resp.ContentType;
-                        _chunkCache.SetMetadata(videoId, resp.ContentType, activeStreamMedia.Itag, totalLength);
+                        chunkCache.SetMetadata(videoId, resp.ContentType, activeStreamMedia.Itag, totalLength);
                         headersSent = true;
                     }
 
@@ -1849,7 +1935,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                             ArrayPool<byte>.Shared.Return(buffer);
                             if (chunkTee.Length > 0)
                             {
-                                _chunkCache.StoreChunk(
+                                chunkCache.StoreChunk(
                                     videoId,
                                     expectedMime ?? activeStreamMedia.MimeType,
                                     activeStreamMedia.Itag,
@@ -1870,9 +1956,9 @@ public sealed partial class NativeDesktopEngine : IDisposable
                     }
                     catch
                     {
-                        _healthTracker.MarkFailure(activeStreamMedia.ClientKind, "FULL_READ_DROP");
+                        healthTracker.MarkFailure(activeStreamMedia.ClientKind, "FULL_READ_DROP");
                         excludedClients.Add(activeStreamMedia.ClientKind);
-                        _streamCache.TryRemove(videoId, out _);
+                        streamCache.TryRemove(videoId, out _);
 
                         if (writtenInChunk <= 0)
                         {
@@ -1883,11 +1969,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
                         {
                             break;
                         }
-                        ResolvedAudio? recovered = await ResolveAudioStreamAsync(
-                            videoId,
-                            ct,
-                            forceRefresh: true,
-                            excludedClients: excludedClients).ConfigureAwait(false);
+                        ResolvedAudio? recovered = await resolveMediaAsync(true, excludedClients).ConfigureAwait(false);
                         if (recovered is null || !IsMatchingMidStream(recovered, expectedMime, totalLength))
                         {
                             break;
@@ -1918,7 +2000,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
             }
         }
 
-        await WritePlainErrorAsync(context.Response, 502, "Audio stream unavailable", ct).ConfigureAwait(false);
+        await WritePlainErrorAsync(context.Response, 502, isVideo ? "Video stream unavailable" : "Audio stream unavailable", ct, wildcardOrigin).ConfigureAwait(false);
     }
 
     private static bool TryParseByteRangeHeader(string? rangeHeader, out long start, out long? end)
@@ -2059,10 +2141,12 @@ public sealed partial class NativeDesktopEngine : IDisposable
         return resolved;
     }
 
-    private async Task<ResolvedAudio?> ResolveViaClientProfileAsync(
+    private async Task<(Dictionary<string, object?>? Payload, string? VisitorData, string? PoToken)> BuildPlayerRequestPayloadAsync(
         string videoId,
         PlaybackClientProfile profile,
         bool forceRefreshVisitor,
+        bool includePoToken,
+        ClientHealthTracker healthTracker,
         CancellationToken ct)
     {
         string? visitorData = null;
@@ -2075,8 +2159,8 @@ public sealed partial class NativeDesktopEngine : IDisposable
             }
             if (string.IsNullOrWhiteSpace(visitorData))
             {
-                _healthTracker.MarkFailure(profile.Id, "NO_VISITOR_DATA");
-                return null;
+                healthTracker.MarkFailure(profile.Id, "NO_VISITOR_DATA");
+                return (null, null, null);
             }
         }
         else if (profile.IncludeVisitorDataIfAvailable)
@@ -2087,7 +2171,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
         }
 
         string? poToken = null;
-        if (string.Equals(profile.Id, "WEB_REMIX", StringComparison.Ordinal))
+        if (includePoToken && string.Equals(profile.Id, "WEB_REMIX", StringComparison.Ordinal))
         {
             poToken = await ResolvePoTokenAsync(videoId, visitorData, forceRefreshVisitor, ct).ConfigureAwait(false);
         }
@@ -2124,6 +2208,22 @@ public sealed partial class NativeDesktopEngine : IDisposable
             {
                 ["poToken"] = poToken
             };
+        }
+
+        return (payloadObj, visitorData, poToken);
+    }
+
+    private async Task<ResolvedAudio?> ResolveViaClientProfileAsync(
+        string videoId,
+        PlaybackClientProfile profile,
+        bool forceRefreshVisitor,
+        CancellationToken ct)
+    {
+        var (payloadObj, visitorData, poToken) = await BuildPlayerRequestPayloadAsync(
+            videoId, profile, forceRefreshVisitor, includePoToken: true, _healthTracker, ct).ConfigureAwait(false);
+        if (payloadObj is null)
+        {
+            return null;
         }
 
         return await ResolveViaPlayerClientAsync(videoId, profile, payloadObj, visitorData, poToken, ct).ConfigureAwait(false);
@@ -3219,165 +3319,166 @@ public sealed partial class NativeDesktopEngine : IDisposable
         }
     }
 
-    private async Task<ResolvedAudio?> ResolveMuxedVideoAsync(
+    public async Task<ResolvedAudio?> ResolveVideoStreamForProxyAsync(
+        string? videoId,
+        CancellationToken ct = default,
+        bool forceRefresh = false,
+        IReadOnlySet<string>? excludedClients = null)
+    {
+        if (!IsValidVideoId(videoId))
+        {
+            return null;
+        }
+        string cleanId = videoId!;
+
+        if (!forceRefresh &&
+            (excludedClients is null || excludedClients.Count == 0) &&
+            _videoStreamCache.TryGetValue(cleanId, out ResolvedAudio? cached))
+        {
+            if (cached.ExpiresAtUtc > DateTimeOffset.UtcNow && _videoHealthTracker.IsHealthy(cached.ClientKind))
+            {
+                return cached;
+            }
+            _videoStreamCache.TryRemove(cleanId, out _);
+        }
+
+        string excludedKey = excludedClients is { Count: > 0 }
+            ? string.Join(',', excludedClients.OrderBy(static x => x, StringComparer.Ordinal))
+            : string.Empty;
+        string inflightKey = $"{cleanId}:{(forceRefresh ? '1' : '0')}:{excludedKey}";
+        Task<ResolvedAudio?> task = _inflightVideoResolutions.GetOrAdd(
+            inflightKey,
+            _ => ResolveMuxedVideoCoreAsync(cleanId, forceRefresh, excludedClients, _cts.Token)
+        );
+        try
+        {
+            return await task.WaitAsync(ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            _inflightVideoResolutions.TryRemove(new KeyValuePair<string, Task<ResolvedAudio?>>(inflightKey, task));
+        }
+    }
+
+    private Task<ResolvedAudio?> ResolveMuxedVideoAsync(
         string videoId,
         string? skipClient,
         CancellationToken ct)
     {
-        string? visitorData = await ResolveVisitorDataAsync(false, ct).ConfigureAwait(false);
+        IReadOnlySet<string>? excluded = !string.IsNullOrEmpty(skipClient)
+            ? new HashSet<string>(StringComparer.Ordinal) { skipClient }
+            : null;
+        return ResolveMuxedVideoCoreAsync(videoId, forceRefresh: false, excludedClients: excluded, ct);
+    }
 
-        if (!string.Equals(skipClient, "ANDROID", StringComparison.Ordinal))
+    private async Task<ResolvedAudio?> ResolveMuxedVideoCoreAsync(
+        string videoId,
+        bool forceRefresh,
+        IReadOnlySet<string>? excludedClients,
+        CancellationToken ct)
+    {
+        List<PlaybackClientProfile> candidates = _videoHealthTracker.GetOrderedCandidates(VideoPlaybackClients, excludedClients);
+        foreach (PlaybackClientProfile profile in candidates)
         {
-            var androidPayload = new
+            var (payloadObj, visitorData, _) = await BuildPlayerRequestPayloadAsync(
+                videoId, profile, forceRefreshVisitor: forceRefresh, includePoToken: false, _videoHealthTracker, ct).ConfigureAwait(false);
+            if (payloadObj is null)
             {
-                context = new
-                {
-                    client = new
-                    {
-                        clientName = "ANDROID",
-                        clientVersion = "20.10.38",
-                        androidSdkVersion = 34,
-                        osName = "Android",
-                        osVersion = "14",
-                        visitorData,
-                        hl = "tr",
-                        gl = "TR"
-                    }
-                },
-                videoId,
-                contentCheckOk = true,
-                racyCheckOk = true
-            };
+                continue;
+            }
 
-            ResolvedAudio? androidRes = await TryVerifyStreamRangeAsync(
-                await ResolveMuxedVideoFromClientAsync(
-                    videoId, androidPayload, AndroidUserAgent, "3", "20.10.38", visitorData, "ANDROID", ct).ConfigureAwait(false),
-                ct).ConfigureAwait(false);
-            if (androidRes is not null) return androidRes;
-        }
-
-        if (!string.Equals(skipClient, "IOS", StringComparison.Ordinal))
-        {
-            var iosPayload = new
+            ResolvedAudio? candidate = await ResolveMuxedVideoFromClientAsync(
+                videoId, profile, payloadObj, visitorData, ct).ConfigureAwait(false);
+            ResolvedAudio? verified = await TryVerifyStreamRangeAsync(candidate, ct).ConfigureAwait(false);
+            if (verified is not null)
             {
-                context = new
-                {
-                    client = new
-                    {
-                        clientName = "IOS",
-                        clientVersion = "20.10.4",
-                        deviceMake = "Apple",
-                        deviceModel = "iPhone16,2",
-                        osName = "iPhone",
-                        osVersion = "18.3.2.22D82",
-                        hl = "tr",
-                        gl = "TR"
-                    }
-                },
-                videoId
-            };
-
-            ResolvedAudio? iosRes = await TryVerifyStreamRangeAsync(
-                await ResolveMuxedVideoFromClientAsync(
-                    videoId, iosPayload, IosUserAgent, "5", "20.10.4", null, "IOS", ct).ConfigureAwait(false),
-                ct).ConfigureAwait(false);
-            if (iosRes is not null) return iosRes;
-        }
-
-        if (!string.Equals(skipClient, "ANDROID_VR", StringComparison.Ordinal))
-        {
-            var vrPayload = new
+                _videoHealthTracker.MarkSuccess(profile.Id);
+                PruneCacheIfNeeded(_videoStreamCache);
+                _videoStreamCache[videoId] = verified;
+                _videoChunkCache.SetMetadata(videoId, verified.MimeType, verified.Itag, verified.ContentLength);
+                return verified;
+            }
+            if (candidate is not null)
             {
-                context = new
-                {
-                    client = new
-                    {
-                        clientName = "ANDROID_VR",
-                        clientVersion = "1.57.29",
-                        androidSdkVersion = 34,
-                        hl = "tr",
-                        gl = "TR"
-                    }
-                },
-                videoId
-            };
-
-            ResolvedAudio? vrRes = await TryVerifyStreamRangeAsync(
-                await ResolveMuxedVideoFromClientAsync(
-                    videoId, vrPayload, AndroidVrUserAgent, "28", "1.57.29", null, "ANDROID_VR", ct).ConfigureAwait(false),
-                ct).ConfigureAwait(false);
-            if (vrRes is not null) return vrRes;
-        }
-
-        if (!string.Equals(skipClient, "VISIONOS_0_1", StringComparison.Ordinal) &&
-            !string.Equals(skipClient, "VISIONOS", StringComparison.Ordinal))
-        {
-            var visionPayload = new
-            {
-                context = new
-                {
-                    client = new
-                    {
-                        clientName = "VISIONOS",
-                        clientVersion = "0.1",
-                        deviceMake = "Apple",
-                        deviceModel = "RealityDevice14,1",
-                        osName = "VISION_OS",
-                        osVersion = "1.3",
-                        platform = "MOBILE",
-                        visitorData,
-                        hl = "tr",
-                        gl = "TR"
-                    }
-                },
-                videoId,
-                contentCheckOk = true,
-                racyCheckOk = true
-            };
-
-            ResolvedAudio? visionRes = await TryVerifyStreamRangeAsync(
-                await ResolveMuxedVideoFromClientAsync(
-                    videoId, visionPayload, VisionOs01UserAgent, "101", "0.1", visitorData, "VISIONOS_0_1", ct).ConfigureAwait(false),
-                ct).ConfigureAwait(false);
-            if (visionRes is not null) return visionRes;
+                _videoHealthTracker.MarkFailure(profile.Id, "VIDEO_RANGE_VERIFY_FAILED");
+            }
         }
 
         return null;
     }
 
+    private static void PruneCacheIfNeeded(ConcurrentDictionary<string, ResolvedAudio> cache)
+    {
+        if (cache.Count < MaxStreamCacheEntries)
+        {
+            return;
+        }
+        DateTimeOffset now = DateTimeOffset.UtcNow;
+        foreach (var kvp in cache)
+        {
+            if (kvp.Value.ExpiresAtUtc <= now)
+            {
+                cache.TryRemove(kvp.Key, out _);
+            }
+        }
+        if (cache.Count >= MaxStreamCacheEntries)
+        {
+            cache.Clear();
+        }
+    }
+
     private async Task<ResolvedAudio?> ResolveMuxedVideoFromClientAsync(
         string videoId,
+        PlaybackClientProfile profile,
         object payloadObj,
-        string userAgent,
-        string? clientNameId,
-        string? clientVersion,
         string? visitorData,
-        string clientKind,
         CancellationToken ct)
     {
         try
         {
-            string jsonBody = JsonSerializer.Serialize(payloadObj);
-            using var req = new HttpRequestMessage(
-                HttpMethod.Post,
-                "https://www.youtube.com/youtubei/v1/player?prettyPrint=false")
+            string endpointUrl = profile.UseMusicPlayerEndpoint
+                ? "https://music.youtube.com/youtubei/v1/player?prettyPrint=false"
+                : "https://www.youtube.com/youtubei/v1/player?prettyPrint=false";
+            string jsonBody = JsonSerializer.Serialize(payloadObj, PlayerPayloadJsonOptions);
+            using var req = new HttpRequestMessage(HttpMethod.Post, endpointUrl)
             {
                 Content = new StringContent(jsonBody, Encoding.UTF8, "application/json")
             };
-            req.Headers.TryAddWithoutValidation("User-Agent", userAgent);
+            req.Headers.TryAddWithoutValidation("User-Agent", profile.UserAgent);
             req.Headers.TryAddWithoutValidation("X-Goog-FieldMask", PlayerFieldMask);
-            if (!string.IsNullOrEmpty(clientNameId)) req.Headers.TryAddWithoutValidation("X-YouTube-Client-Name", clientNameId);
-            if (!string.IsNullOrEmpty(clientVersion)) req.Headers.TryAddWithoutValidation("X-YouTube-Client-Version", clientVersion);
+            if (!string.IsNullOrEmpty(profile.ClientId)) req.Headers.TryAddWithoutValidation("X-YouTube-Client-Name", profile.ClientId);
+            if (!string.IsNullOrEmpty(profile.ClientVersion)) req.Headers.TryAddWithoutValidation("X-YouTube-Client-Version", profile.ClientVersion);
             if (!string.IsNullOrEmpty(visitorData)) req.Headers.TryAddWithoutValidation("X-Goog-Visitor-Id", visitorData);
+            if (profile.UseMusicPlayerEndpoint)
+            {
+                req.Headers.TryAddWithoutValidation("Origin", "https://music.youtube.com");
+                req.Headers.TryAddWithoutValidation("Referer", "https://music.youtube.com/");
+            }
 
             using var searchCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             searchCts.CancelAfter(ApiRequestTimeout);
             using HttpResponseMessage res = await _apiHttpClient.SendAsync(req, searchCts.Token).ConfigureAwait(false);
-            if (!res.IsSuccessStatusCode) return null;
+            if (!res.IsSuccessStatusCode)
+            {
+                _videoHealthTracker.MarkFailure(profile.Id, $"VIDEO_HTTP_{(int)res.StatusCode}");
+                return null;
+            }
 
             await using Stream bodyStream = await res.Content.ReadAsStreamAsync(ct).ConfigureAwait(false);
             using JsonDocument doc = await JsonDocument.ParseAsync(bodyStream, cancellationToken: ct).ConfigureAwait(false);
             JsonElement root = doc.RootElement;
+
+            if (root.TryGetProperty("playabilityStatus", out JsonElement playability) &&
+                playability.ValueKind == JsonValueKind.Object)
+            {
+                string status = GetString(playability, "status");
+                if (!string.IsNullOrEmpty(status) &&
+                    !string.Equals(status, "OK", StringComparison.OrdinalIgnoreCase))
+                {
+                    _videoHealthTracker.MarkFailure(profile.Id, $"VIDEO_PLAYABILITY_{status}");
+                    return null;
+                }
+            }
 
             if (!root.TryGetProperty("streamingData", out JsonElement streamingData) || streamingData.ValueKind != JsonValueKind.Object)
                 return null;
@@ -3438,7 +3539,7 @@ public sealed partial class NativeDesktopEngine : IDisposable
 
             return new ResolvedAudio(
                 videoId, bestUrl, bestMime, bestItag, bestContentLength,
-                title, artist, durationSec, userAgent, clientKind, DateTimeOffset.UtcNow.Add(StreamCacheTtl));
+                title, artist, durationSec, profile.UserAgent, profile.Id, DateTimeOffset.UtcNow.Add(StreamCacheTtl));
         }
         catch (OperationCanceledException) { throw; }
         catch { return null; }

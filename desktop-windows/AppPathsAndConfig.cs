@@ -70,6 +70,9 @@ public sealed class AppPaths
     public static string DefaultInstallDir =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KurfanovaMuzik");
 
+    public static string DefaultTestInstallDir =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "KurfaTest");
+
     public static string ResolveDownloadDir(DesktopAppConfig? cfg)
     {
         if (!string.IsNullOrWhiteSpace(cfg?.DownloadDir))

@@ -27,7 +27,7 @@ jobs:
       - name: Publish Multi-File Build & Build Inno Setup Installer
         shell: pwsh
         run: |
-          $patch = [Math]::Max(0, [int]$env:GITHUB_RUN_NUMBER - 21)
+          $patch = [Math]::Max(0, [int]$env:GITHUB_RUN_NUMBER - 20)
           $appVersion = "1.2.$patch"
           Write-Host "Building Kurfanova Windows Desktop Installer v$appVersion"
 
@@ -67,7 +67,7 @@ jobs:
       - name: Publish Portable Single-File Windows Executable
         shell: pwsh
         run: |
-          $patch = [Math]::Max(0, [int]$env:GITHUB_RUN_NUMBER - 21)
+          $patch = [Math]::Max(0, [int]$env:GITHUB_RUN_NUMBER - 20)
           $appVersion = "1.2.$patch"
           Write-Host "Building Kurfanova Windows Portable EXE v$appVersion"
 
@@ -90,7 +90,7 @@ jobs:
       - name: Verify Artifacts, Generate SHA-256 Sums & Update Manifest
         shell: pwsh
         run: |
-          $patch = [Math]::Max(0, [int]$env:GITHUB_RUN_NUMBER - 21)
+          $patch = [Math]::Max(0, [int]$env:GITHUB_RUN_NUMBER - 20)
           $appVersion = "1.2.$patch"
           $setupExe = Get-Item "dist-win/Kurfamuzik-Setup.exe"
           $portableExe = Get-Item "dist-win/Kurfanova-Muzik-Windows.exe"
@@ -111,7 +111,7 @@ jobs:
             installerUrl = "https://github.com/KurfaCore/kurfanova-app/releases/latest/download/Kurfamuzik-Setup.exe"
             installerSha256 = $setupSha
             installerSize = $setupExe.Length
-            notes = "Kurfamüzik Masaüstü v${appVersion}: Inno Setup kurulum paketi, sertleştirilmiş masaüstü istemcisi ve SHA-256 doğrulama."
+            notes = "Kurfamüzik Masaüstü v${appVersion}: Yerel video proxy desteği, kapak renkli cam MiniPlayer, Windows arka plan oynatma ve bildirim logosu iyileştirmeleri, FX ve şarkı sözü güncellemeleri."
           } | ConvertTo-Json
           [System.IO.File]::WriteAllText("dist-win/win-update.json", $manifest, [System.Text.UTF8Encoding]::new($false))
 

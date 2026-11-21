@@ -12,6 +12,7 @@ public sealed class MainForm : Form
 {
     private const string TargetUrl = "https://kurfanova.github.io/";
     private const string FallbackTargetUrl = "https://kurfanova.kurfa.workers.dev/";
+    private const string TestTargetUrl = "https://kurfatest.kurfa.workers.dev/";
     private const string DesktopBridgeMode = "desktop-v1";
 
     private static readonly string[] AdFilterPatterns =
@@ -59,6 +60,7 @@ public sealed class MainForm : Form
     [
         "kurfanova.github.io",
         "kurfanova.kurfa.workers.dev",
+        "kurfatest.kurfa.workers.dev",
         "accounts.google.com",
         "kurfa-ai.firebaseapp.com",
         "youtube.com",
@@ -70,6 +72,9 @@ public sealed class MainForm : Form
 
     private readonly AppPaths _paths;
     private readonly DesktopAppConfig _config;
+    private readonly bool _isTestMode;
+    private readonly Uri _initialTargetUri;
+    private readonly string? _customTargetHost;
     private readonly NativeDesktopEngine _engine = new();
     private readonly DiscordRpcService _discordRpc = new();
     private readonly AutoUpdater _updater;
@@ -97,19 +102,38 @@ public sealed class MainForm : Form
     private bool _triedFallbackOrigin;
     private bool _isAudioPlaying;
 
-    public MainForm() : this(null, null)
+    public MainForm() : this(null, null, false, null)
     {
     }
 
-    public MainForm(AppPaths? paths, DesktopAppConfig? config)
+    public MainForm(AppPaths? paths, DesktopAppConfig? config) : this(paths, config, false, null)
     {
-        _paths = paths ?? new AppPaths(AppPaths.ResolveActiveInstallDir());
+    }
+
+    public MainForm(AppPaths? paths, DesktopAppConfig? config, bool isTestMode, string? customTargetUrl = null)
+    {
+        _isTestMode = isTestMode;
+        _paths = paths ?? new AppPaths(isTestMode ? AppPaths.DefaultTestInstallDir : AppPaths.ResolveActiveInstallDir());
         _config = config ?? AppPaths.LoadOrDefaultConfig(_paths, AppPaths.GetNormalizedCurrentVersion());
         _updater = new AutoUpdater(_paths);
 
+        if (!string.IsNullOrWhiteSpace(customTargetUrl) &&
+            Uri.TryCreate(customTargetUrl, UriKind.Absolute, out Uri? customUri) &&
+            (customUri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase) ||
+             customUri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)))
+        {
+            _initialTargetUri = customUri;
+            _customTargetHost = customUri.Host.ToLowerInvariant();
+        }
+        else
+        {
+            _initialTargetUri = new Uri(_isTestMode ? TestTargetUrl : TargetUrl);
+            _customTargetHost = null;
+        }
+
         Color darkBg = Color.FromArgb(11, 11, 20); // #0B0B14
 
-        Text = NormalizeLanguage(_config.Language) == "en" ? "Kurfamüzik — Desktop" : "Kurfamüzik — Masaüstü";
+        Text = GetMainWindowTitle(_config.Language);
         BackColor = darkBg;
         ForeColor = Color.White;
         Size = new Size(1280, 820);
@@ -137,10 +161,19 @@ public sealed class MainForm : Form
     private static string NormalizeLanguage(string? lang) =>
         string.Equals(lang, "en", StringComparison.OrdinalIgnoreCase) ? "en" : "tr";
 
+    private string GetMainWindowTitle(string? lang)
+    {
+        if (_isTestMode)
+        {
+            return "KurfaTest — Önizleme";
+        }
+        return NormalizeLanguage(lang) == "en" ? "Kurfamüzik — Desktop" : "Kurfamüzik — Masaüstü";
+    }
+
     private void ApplyLanguage(string? lang)
     {
         string normalized = NormalizeLanguage(lang);
-        Text = normalized == "en" ? "Kurfamüzik — Desktop" : "Kurfamüzik — Masaüstü";
+        Text = GetMainWindowTitle(normalized);
         _trayMenu?.SetLanguage(normalized);
         _miniPlayer?.SetLanguage(normalized);
     }
@@ -151,11 +184,9 @@ public sealed class MainForm : Form
         {
             CoreWebView2? core = _webView.CoreWebView2;
             if (core is null) return;
-            // Never throttle/suspend WebView2 while playing or while mini-player is open;
-            // keeping Normal memory target in tray/minimized avoids Chromium media pipeline stalls.
             bool isBackground = WindowState == FormWindowState.Minimized || !Visible;
-            bool keepActiveForPlayback = _isAudioPlaying || (_miniPlayer is { Visible: true });
-            core.MemoryUsageTargetLevel = (isBackground && !keepActiveForPlayback)
+            bool keepActiveForAudio = _isAudioPlaying || (_miniPlayer is { Visible: true });
+            core.MemoryUsageTargetLevel = (isBackground && !keepActiveForAudio)
                 ? CoreWebView2MemoryUsageTargetLevel.Low
                 : CoreWebView2MemoryUsageTargetLevel.Normal;
         }
@@ -268,12 +299,48 @@ public sealed class MainForm : Form
         catch { }
     }
 
+    private void RegisterToastAppIdentity(string appId)
+    {
+        try
+        {
+            Directory.CreateDirectory(_paths.DataDir);
+            string toastPngPath = Path.Combine(_paths.DataDir, "toast-logo.png");
+            if (!File.Exists(toastPngPath))
+            {
+                using Stream? iconStream = Assembly.GetExecutingAssembly().GetManifestResourceStream("KurfanovaMuzik.app.ico");
+                if (iconStream is not null)
+                {
+                    using var ico = new Icon(iconStream, 256, 256);
+                    using var bmp = ico.ToBitmap();
+                    bmp.Save(toastPngPath, System.Drawing.Imaging.ImageFormat.Png);
+                }
+            }
+
+            using Microsoft.Win32.RegistryKey? key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey($@"Software\Classes\AppUserModelId\{appId}");
+            if (key is not null)
+            {
+                key.SetValue("DisplayName", _isTestMode ? "KurfaTest" : "Kurfamüzik", Microsoft.Win32.RegistryValueKind.String);
+                if (File.Exists(toastPngPath))
+                {
+                    key.SetValue("IconUri", toastPngPath, Microsoft.Win32.RegistryValueKind.String);
+                }
+                key.SetValue("IconBackgroundColor", "0", Microsoft.Win32.RegistryValueKind.String);
+            }
+        }
+        catch { }
+    }
+
     private async void OnFormLoad(object? sender, EventArgs e)
     {
         try
         {
-            _ = SetCurrentProcessExplicitAppUserModelID("KurfaCore.Kurfamuzik");
-            SyncInstalledIconAndShortcuts();
+            string appId = _isTestMode ? "KurfaCore.KurfaTest" : "KurfaCore.Kurfamuzik";
+            _ = SetCurrentProcessExplicitAppUserModelID(appId);
+            RegisterToastAppIdentity(appId);
+            if (!_isTestMode)
+            {
+                SyncInstalledIconAndShortcuts();
+            }
             ApplyTitleBarDarkMode(true);
             _engine.Start();
             InitializeTrayIcon();
@@ -297,7 +364,7 @@ public sealed class MainForm : Form
             Directory.CreateDirectory(_paths.WebView2DataDir);
 
             var envOptions = new CoreWebView2EnvironmentOptions(
-                "--autoplay-policy=no-user-gesture-required --disk-cache-size=33554432 --media-cache-size=33554432 --disable-features=CalculateNativeWinOcclusion --disable-background-timer-throttling --disable-renderer-backgrounding --disable-backgrounding-occluded-windows"
+                "--autoplay-policy=no-user-gesture-required --disk-cache-size=33554432 --media-cache-size=33554432 --disable-background-timer-throttling --disable-renderer-backgrounding"
             );
             CoreWebView2Environment env = await CoreWebView2Environment.CreateAsync(null, _paths.WebView2DataDir, envOptions);
             _webViewEnv = env;
@@ -323,7 +390,8 @@ public sealed class MainForm : Form
             {
                 if (!args.IsSuccess && args.WebErrorStatus != CoreWebView2WebErrorStatus.OperationCanceled)
                 {
-                    if (!_triedFallbackOrigin && (_webView.Source?.Host.Contains("github.io", StringComparison.OrdinalIgnoreCase) ?? true))
+                    if (!_isTestMode && _customTargetHost is null &&
+                        !_triedFallbackOrigin && (_webView.Source?.Host.Contains("github.io", StringComparison.OrdinalIgnoreCase) ?? true))
                     {
                         _triedFallbackOrigin = true;
                         core.Navigate(FallbackTargetUrl);
@@ -345,21 +413,24 @@ public sealed class MainForm : Form
                 catch { }
             };
 
-            await core.AddScriptToExecuteOnDocumentCreatedAsync(BuildBridgeInjectionScript());
+            await core.AddScriptToExecuteOnDocumentCreatedAsync(BuildBridgeInjectionScript(_customTargetHost));
 
-            core.Navigate(TargetUrl);
+            core.Navigate(_initialTargetUri.AbsoluteUri);
 
-            _updater.UpdateProgressChanged += OnUpdateProgressChanged;
-            _updater.UpdateReady += OnUpdateReady;
-            _ = Task.Run(async () =>
+            if (!_isTestMode)
             {
-                try
+                _updater.UpdateProgressChanged += OnUpdateProgressChanged;
+                _updater.UpdateReady += OnUpdateReady;
+                _ = Task.Run(async () =>
                 {
-                    await Task.Delay(3500, _shutdownCts.Token).ConfigureAwait(false);
-                    await _updater.CheckManifestAsync(_shutdownCts.Token, force: false, emitProgressEvents: true).ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) { }
-            });
+                    try
+                    {
+                        await Task.Delay(3500, _shutdownCts.Token).ConfigureAwait(false);
+                        await _updater.CheckManifestAsync(_shutdownCts.Token, force: false, emitProgressEvents: true).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) { }
+                });
+            }
         }
         catch (WebView2RuntimeNotFoundException)
         {
@@ -388,12 +459,16 @@ public sealed class MainForm : Form
         }
     }
 
-    private static string BuildBridgeInjectionScript()
+    private static string BuildBridgeInjectionScript(string? customTargetHost = null)
     {
+        string escapedCustomHost = string.IsNullOrWhiteSpace(customTargetHost)
+            ? string.Empty
+            : customTargetHost.Replace("\\", "\\\\").Replace("'", "\\'");
         return """
             (() => {
               try {
                 const host = String(window.location && window.location.hostname || '').toLowerCase();
+                const customHost = '__KURFA_CUSTOM_HOST__';
 
                 // 1. YouTube Embed Zero-Ad Shield (protects Video Klip Modu / any fallback embed inside WebView2)
                 if (host === 'www.youtube.com' || host === 'youtube.com' || host === 'www.youtube-nocookie.com' || host === 'youtube-nocookie.com') {
@@ -461,7 +536,11 @@ public sealed class MainForm : Form
                 }
 
                 // 2. Kurfanova Host Native Desktop Bridge
-                if (host !== 'kurfanova.github.io' && host !== 'kurfanova.kurfa.workers.dev' && host !== 'localhost') return;
+                if (host !== 'kurfanova.github.io' &&
+                    host !== 'kurfanova.kurfa.workers.dev' &&
+                    host !== 'kurfatest.kurfa.workers.dev' &&
+                    host !== 'localhost' &&
+                    (!customHost || host !== customHost)) return;
 
                 const activateBridge = () => {
                   try {
@@ -817,7 +896,7 @@ public sealed class MainForm : Form
                 };
               } catch (_) {}
             })();
-            """;
+            """.Replace("__KURFA_CUSTOM_HOST__", escapedCustomHost);
     }
 
     private void OnWebResourceRequested(object? sender, CoreWebView2WebResourceRequestedEventArgs e)
@@ -847,8 +926,7 @@ public sealed class MainForm : Form
                     return;
                 }
             }
-            else if (MatchesHostOrSubdomain(host, "kurfanova.github.io") ||
-                     MatchesHostOrSubdomain(host, "kurfanova.kurfa.workers.dev") ||
+            else if (IsConfiguredAppHost(host) ||
                      MatchesHostOrSubdomain(host, "accounts.google.com") ||
                      host == "127.0.0.1")
             {
@@ -1686,8 +1764,7 @@ public sealed class MainForm : Form
             return;
         }
 
-        if ((MatchesHostOrSubdomain(host, "kurfanova.github.io") ||
-             MatchesHostOrSubdomain(host, "kurfanova.kurfa.workers.dev")) &&
+        if (IsConfiguredAppHost(host) &&
             _webView.CoreWebView2 is not null)
         {
             e.Handled = true;
@@ -1720,14 +1797,23 @@ public sealed class MainForm : Form
         }
 
         string host = uri.Host.ToLowerInvariant();
-        if (e.IsUserInitiated && !MatchesAnyHost(host, InAppHosts))
+        if (e.IsUserInitiated && !MatchesAnyHost(host, InAppHosts) && !IsConfiguredAppHost(host))
         {
             e.Cancel = true;
             OpenExternalBrowser(uri);
         }
     }
 
-    private static bool IsAllowedBridgeOrigin(string? source, out string targetOrigin)
+    private bool IsConfiguredAppHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host)) return false;
+        return MatchesHostOrSubdomain(host, "kurfanova.github.io") ||
+               MatchesHostOrSubdomain(host, "kurfanova.kurfa.workers.dev") ||
+               MatchesHostOrSubdomain(host, "kurfatest.kurfa.workers.dev") ||
+               (!string.IsNullOrEmpty(_customTargetHost) && MatchesHostOrSubdomain(host, _customTargetHost));
+    }
+
+    private bool IsAllowedBridgeOrigin(string? source, out string targetOrigin)
     {
         targetOrigin = string.Empty;
         if (string.IsNullOrWhiteSpace(source) || !Uri.TryCreate(source, UriKind.Absolute, out Uri? uri))
@@ -1737,14 +1823,20 @@ public sealed class MainForm : Form
 
         bool isKurfanova = uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase) &&
                            (uri.Host.Equals("kurfanova.github.io", StringComparison.OrdinalIgnoreCase) ||
-                            uri.Host.Equals("kurfanova.kurfa.workers.dev", StringComparison.OrdinalIgnoreCase)) &&
+                            uri.Host.Equals("kurfanova.kurfa.workers.dev", StringComparison.OrdinalIgnoreCase) ||
+                            uri.Host.Equals("kurfatest.kurfa.workers.dev", StringComparison.OrdinalIgnoreCase)) &&
                            uri.IsDefaultPort;
+
+        bool isCustomTarget = !string.IsNullOrEmpty(_customTargetHost) &&
+                              (uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase) ||
+                               uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)) &&
+                              uri.Host.Equals(_customTargetHost, StringComparison.OrdinalIgnoreCase);
 
         bool isLocalhost = (uri.Scheme.Equals("https", StringComparison.OrdinalIgnoreCase) ||
                             uri.Scheme.Equals("http", StringComparison.OrdinalIgnoreCase)) &&
                            uri.Host.Equals("localhost", StringComparison.OrdinalIgnoreCase);
 
-        if (!isKurfanova && !isLocalhost)
+        if (!isKurfanova && !isCustomTarget && !isLocalhost)
         {
             return false;
         }
@@ -1814,6 +1906,7 @@ public sealed class MainForm : Form
 
     private void OnUpdateProgressChanged(AutoUpdater.UpdateProgressInfo info)
     {
+        if (_isTestMode) return;
         _latestUpdateProgress = info;
         if (IsDisposed || !IsHandleCreated || !_webContentLoaded) return;
 
@@ -1822,6 +1915,7 @@ public sealed class MainForm : Form
 
     private void ReplayLatestUpdateProgress()
     {
+        if (_isTestMode) return;
         AutoUpdater.UpdateProgressInfo? info = _latestUpdateProgress;
         if (info is null || IsDisposed || !IsHandleCreated) return;
 
@@ -1861,6 +1955,7 @@ public sealed class MainForm : Form
 
     private void OnUpdateReady(Version version, string? notes)
     {
+        if (_isTestMode) return;
         if (IsDisposed || !IsHandleCreated) return;
         if (Interlocked.CompareExchange(ref _updatePromptShown, 1, 0) != 0) return;
 
@@ -1912,7 +2007,7 @@ public sealed class MainForm : Form
             _trayCroppedIcon = LoadTrayIconForCurrentDpi();
             _trayIcon = new NotifyIcon
             {
-                Text = $"Kurfamüzik v{verTag}",
+                Text = _isTestMode ? $"KurfaTest v{verTag}" : $"Kurfamüzik v{verTag}",
                 Icon = _trayCroppedIcon ?? LoadEmbeddedIcon(32) ?? _embeddedIcon ?? SystemIcons.Application,
                 Visible = true
             };
@@ -1928,7 +2023,7 @@ public sealed class MainForm : Form
                 },
                 async () =>
                 {
-                    _trayIcon?.ShowBalloonTip(1500, "Kurfamüzik", "Yeni sürüm denetleniyor...", ToolTipIcon.Info);
+                    _trayIcon?.ShowBalloonTip(1500, "Kurfamüzik", "Yeni sürüm denetleniyor...", ToolTipIcon.None);
                     AutoUpdater.UpdateCheckResult check = await _updater.CheckManifestAsync(_shutdownCts.Token, force: true, emitProgressEvents: true).ConfigureAwait(false);
                     if (IsDisposed) return;
 
@@ -1968,7 +2063,7 @@ public sealed class MainForm : Form
                         }
                         else if (check.Status == "up-to-date")
                         {
-                            _trayIcon?.ShowBalloonTip(2200, "Kurfamüzik", $"Uygulamanız güncel (v{check.CurrentVersion.ToString(3)}).", ToolTipIcon.Info);
+                            _trayIcon?.ShowBalloonTip(2200, "Kurfamüzik", $"Uygulamanız güncel (v{check.CurrentVersion.ToString(3)}).", ToolTipIcon.None);
                         }
                         else if (check.Status == "error")
                         {
@@ -2050,7 +2145,7 @@ public sealed class MainForm : Form
                     isEn
                         ? "Still running in background. Double-click the tray icon to reopen."
                         : "Arka planda çalışmaya devam ediyor. Geri açmak için tepsi simgesine çift tıklayın.",
-                    ToolTipIcon.Info);
+                    ToolTipIcon.None);
             }
         }
         catch { /* ignore tray hide races */ }

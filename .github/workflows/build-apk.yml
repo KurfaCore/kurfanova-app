@@ -98,7 +98,7 @@ jobs:
           name: "Kurfamüzik — Windows Masaüstü & Android Sürümü"
           make_latest: true
           body: |
-            Kurfamüzik resmi **Windows Masaüstü (x64)** ve **Android APK (`v1.2.${{ github.run_number }}`)** kurulum paketleri.
+            Kurfamüzik resmi **Windows Masaüstü (`v1.2.9+`, x64)** ve **Android APK (`v1.2.${{ github.run_number }}`)** kurulum paketleri.
 
             ### İndirme Dosyaları
             - **Windows Kurulum (Önerilen):** `Kurfamuzik-Setup.exe` (Windows 10 / 11 x64 Inno Setup, yönetici izni gerektirmez)
@@ -106,11 +106,10 @@ jobs:
             - **Android:** `Kurfanova-Muzik.apk` (Android 7.0+)
 
             ### Öne Çıkan Yenilikler
-            - Şeffaf arka plansız logo ve Windows 10/11 uyumlu 32-bit cam katmanlı `MiniPlayer` / tepsi menüsü
-            - Yerel ses dosyaları için gerçek süre okuma ve temiz parça/sanatçı başlığı ayrıştırma
-            - Türkçe / İngilizce (`TR` / `EN`) tam dil desteği ve özel indirme klasörü seçimi
-            - Kalıcı yerel kullanıcı verisi (`user-data.json`) ve birincil sunucuya erişilemediğinde otomatik Worker yedek geçişi
-            - `win-update.json` ve `apk-update.json` üzerinden SHA-256 doğrulamalı otomatik güncelleme
+            - **Windows Masaüstü:** Kapak rengine duyarlı buzlu cam MiniPlayer, bildirim/toast logosu iyileştirmesi, Windows 10 arka planda duraklatma önleme ve `--test` izole önizleme modu
+            - **Masaüstü & Android Yerel Akış:** Yeni yerel video proxy (`/__kurfa_native_video__/`) ve çoklu istemci (`VISIONOS`, `ANDROID`, `IOS_PRODUCER`) medya akış desteği
+            - **Web & Oynatıcı:** LRCLIB + SimpMusic + BetterLyrics Lyrics v3 ve titreşimsiz senkron sözler, şarkıya duyarlı Ses Motoru & 16 bantlı canlı spektrum, Türkiye listeleri ile kişiselleşen Keşfet, sanatçı profilleri ve yenilenen albüm detay ekranı
+            - **Altyapı:** `win-update.json` ve `apk-update.json` üzerinden SHA-256 doğrulamalı otomatik güncelleme ve kalıcı yerel kullanıcı verisi (`user-data.json`)
 
             ### Doğrulama & SHA-256
             - Windows SHA-256: [`SHA256SUMS-windows.txt`](https://github.com/KurfaCore/kurfanova-app/releases/latest/download/SHA256SUMS-windows.txt)

@@ -376,6 +376,11 @@ public class MainActivity extends Activity {
         }
 
         @JavascriptInterface
+        public String getLocalNativeVideoUrl(String videoId) {
+            return KurfaNativeEngine.getLocalNativeVideoUrl(videoId);
+        }
+
+        @JavascriptInterface
         public void checkForUpdates() {
             ApkAutoUpdater.checkInteractive(MainActivity.this, nativeExecutor, webView);
         }
@@ -1482,6 +1487,14 @@ public class MainActivity extends Activity {
                             request.getRequestHeaders()
                     );
                 }
+                String nativeClipVid = KurfaNativeEngine.extractVideoIdFromNativeVideoUri(request.getUrl());
+                if (nativeClipVid != null) {
+                    return KurfaNativeEngine.handleNativeVideoIntercept(
+                            nativeClipVid,
+                            request.getMethod(),
+                            request.getRequestHeaders()
+                    );
+                }
                 if (isAdRequest(request.getUrl())) {
                     return createEmptyResponse();
                 }
@@ -1497,6 +1510,10 @@ public class MainActivity extends Activity {
                 String nativeVid = KurfaNativeEngine.extractVideoIdFromNativeAudioUri(parsed);
                 if (nativeVid != null) {
                     return KurfaNativeEngine.handleNativeAudioIntercept(nativeVid, "GET", null);
+                }
+                String nativeClipVid = KurfaNativeEngine.extractVideoIdFromNativeVideoUri(parsed);
+                if (nativeClipVid != null) {
+                    return KurfaNativeEngine.handleNativeVideoIntercept(nativeClipVid, "GET", null);
                 }
                 if (isAdRequest(parsed)) {
                     return createEmptyResponse();

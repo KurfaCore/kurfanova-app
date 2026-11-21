@@ -44,19 +44,21 @@ public sealed class MiniPlayerForm : Form
     private double _durSec;
     private string? _lastThumbUrl;
     private Bitmap? _coverBitmap;
+    private Color _ambientTint = Color.FromArgb(148, 163, 210);
+    private Color _accentTint = Color.FromArgb(236, 240, 248);
     private float _scale = 1f;
     private bool _positionedOnce;
 
     // Logical coordinates inside the layered window (card origin is (LogicalShadow, LogicalShadow))
     private readonly Rectangle _cardRect = new(LogicalShadow, LogicalShadow, LogicalCardW, LogicalCardH);
     private readonly Rectangle _coverRect = new(LogicalShadow + 14, LogicalShadow + 13, 70, 70);
-    private readonly Rectangle _restoreRect = new(LogicalShadow + 292, LogicalShadow + 10, 22, 22);
-    private readonly Rectangle _closeRect = new(LogicalShadow + 318, LogicalShadow + 10, 22, 22);
-    private readonly Rectangle _prevRect = new(LogicalShadow + 94, LogicalShadow + 53, 28, 28);
-    private readonly Rectangle _playRect = new(LogicalShadow + 125, LogicalShadow + 51, 32, 32);
-    private readonly Rectangle _nextRect = new(LogicalShadow + 160, LogicalShadow + 53, 28, 28);
-    private readonly Rectangle _muteRect = new(LogicalShadow + 191, LogicalShadow + 53, 28, 28);
-    private readonly Rectangle _trackHitRect = new(LogicalShadow + 14, LogicalShadow + 91, LogicalCardW - 28, 16);
+    private readonly Rectangle _restoreRect = new(LogicalShadow + 292, LogicalShadow + 11, 22, 22);
+    private readonly Rectangle _closeRect = new(LogicalShadow + 318, LogicalShadow + 11, 22, 22);
+    private readonly Rectangle _prevRect = new(LogicalShadow + 96, LogicalShadow + 53, 28, 28);
+    private readonly Rectangle _playRect = new(LogicalShadow + 128, LogicalShadow + 51, 32, 32);
+    private readonly Rectangle _nextRect = new(LogicalShadow + 164, LogicalShadow + 53, 28, 28);
+    private readonly Rectangle _muteRect = new(LogicalShadow + 196, LogicalShadow + 53, 28, 28);
+    private readonly Rectangle _trackHitRect = new(LogicalShadow + 14, LogicalShadow + LogicalCardH - 18, LogicalCardW - 28, 18);
 
     private Point _dragStart;
     private bool _draggingWindow;
@@ -426,13 +428,15 @@ public sealed class MiniPlayerForm : Form
             g.FillPath(sb, sp);
         }
 
-        // 2. Dark frosted glass card (#121726 -> #171E32 gradient) + specular rim
+        // 2. Subtle cover-tinted frosted obsidian glass + soft ambient wash + specular rim
+        Color baseTop = BlendColor(Color.FromArgb(18, 21, 32), _ambientTint, 0.14f);
+        Color baseBot = BlendColor(Color.FromArgb(24, 28, 42), _ambientTint, 0.09f);
         using (GraphicsPath cardPath = CreateRoundedPath(_cardRect, CornerRadius))
         {
             using (var bgGrad = new LinearGradientBrush(
                 _cardRect,
-                Color.FromArgb(245, 18, 23, 38),
-                Color.FromArgb(245, 23, 30, 50),
+                Color.FromArgb(242, baseTop),
+                Color.FromArgb(246, baseBot),
                 LinearGradientMode.ForwardDiagonal))
             {
                 g.FillPath(bgGrad, cardPath);
@@ -441,14 +445,27 @@ public sealed class MiniPlayerForm : Form
             GraphicsState saved = g.Save();
             g.SetClip(cardPath);
 
+            // Subtle ambient cover glow behind left artwork side (soft & refined, never neon)
+            var ambientRect = new RectangleF(_cardRect.X - 30f, _cardRect.Y - 24f, 188f, 152f);
+            using (var ambientPath = new GraphicsPath())
+            {
+                ambientPath.AddEllipse(ambientRect);
+                using var ambientBrush = new PathGradientBrush(ambientPath)
+                {
+                    CenterColor = Color.FromArgb(38, _ambientTint),
+                    SurroundColors = [Color.FromArgb(0, _ambientTint)]
+                };
+                g.FillPath(ambientBrush, ambientPath);
+            }
+
             // Top specular highlight
             using (var topSheen = new LinearGradientBrush(
-                new Rectangle(_cardRect.X, _cardRect.Y, _cardRect.Width, 38),
-                Color.FromArgb(16, 255, 255, 255),
+                new Rectangle(_cardRect.X, _cardRect.Y, _cardRect.Width, 34),
+                Color.FromArgb(18, 255, 255, 255),
                 Color.FromArgb(0, 255, 255, 255),
                 LinearGradientMode.Vertical))
             {
-                g.FillRectangle(topSheen, _cardRect.X, _cardRect.Y, _cardRect.Width, 38);
+                g.FillRectangle(topSheen, _cardRect.X, _cardRect.Y, _cardRect.Width, 34);
             }
 
             g.ResetClip();
@@ -456,11 +473,11 @@ public sealed class MiniPlayerForm : Form
 
             var borderRect = new RectangleF(_cardRect.X + 0.5f, _cardRect.Y + 0.5f, _cardRect.Width - 1f, _cardRect.Height - 1f);
             using GraphicsPath borderPath = CreateRoundedPathF(borderRect, CornerRadius);
-            using var rimPen = new Pen(Color.FromArgb(34, 255, 255, 255), 1f);
+            using var rimPen = new Pen(Color.FromArgb(36, 255, 255, 255), 1f);
             g.DrawPath(rimPen, borderPath);
         }
 
-        // 3. Left 70x70 rounded album art (corner 12) with subtle neutral border
+        // 3. Left 70x70 rounded album art (corner 12) with subtle neutral rim
         using (GraphicsPath coverPath = CreateRoundedPath(_coverRect, 12))
         {
             GraphicsState saved = g.Save();
@@ -476,7 +493,7 @@ public sealed class MiniPlayerForm : Form
             }
             g.Restore(saved);
 
-            using var cBorder = new Pen(Color.FromArgb(22, 255, 255, 255), 1f);
+            using var cBorder = new Pen(Color.FromArgb(28, 255, 255, 255), 1f);
             g.DrawPath(cBorder, coverPath);
         }
 
@@ -485,15 +502,15 @@ public sealed class MiniPlayerForm : Form
         int metaW = 190; // ends at +286, safely left of _restoreRect (+292)
         using (var titleFont = new Font("Segoe UI", 9.75f, FontStyle.Bold))
         using (var artistFont = new Font("Segoe UI", 8.25f, FontStyle.Regular))
-        using (var timeFont = new Font("Consolas", 7.75f, FontStyle.Regular))
+        using (var timeFont = new Font("Segoe UI", 7.5f, FontStyle.Regular))
         using (var whiteBrush = new SolidBrush(Color.FromArgb(248, 250, 252)))
-        using (var mutedBrush = new SolidBrush(Color.FromArgb(164, 174, 194)))
+        using (var mutedBrush = new SolidBrush(Color.FromArgb(182, 192, 210)))
         {
             using var fmt = new StringFormat { Trimming = StringTrimming.EllipsisCharacter, FormatFlags = StringFormatFlags.NoWrap };
             g.DrawString(_title, titleFont, whiteBrush, new RectangleF(metaX, LogicalShadow + 11, metaW, 20), fmt);
             g.DrawString(_artist, artistFont, mutedBrush, new RectangleF(metaX, LogicalShadow + 30, metaW, 17), fmt);
 
-            // Duration timer cur / dur
+            // Duration timer cur / dur aligned on the transport baseline
             string tStr = _durSec > 0 ? $"{FormatSec(_curSec)} / {FormatSec(_durSec)}" : "--:-- / --:--";
             using var timeFmt = new StringFormat { Alignment = StringAlignment.Far, LineAlignment = StringAlignment.Center };
             g.DrawString(tStr, timeFont, mutedBrush, new RectangleF(LogicalShadow + 228, LogicalShadow + 59, 110, 16), timeFmt);
@@ -503,13 +520,13 @@ public sealed class MiniPlayerForm : Form
         DrawRestoreButton(g, _restoreRect, _hoverBtn == 7);
         DrawCloseButton(g, _closeRect, _hoverBtn == 4);
 
-        // 6. Transport buttons: Prev, Glowing Crimson Play/Pause, Next, Mute
+        // 6. Transport buttons: Prev, Apple-style Frosted Play/Pause, Next, Mute
         DrawSkipButton(g, _prevRect, isNext: false, hovered: _hoverBtn == 1);
-        DrawPlayButton(g, _playRect, _isPlaying, hovered: _hoverBtn == 2);
+        DrawPlayButton(g, _playRect, _isPlaying, hovered: _hoverBtn == 2, _ambientTint);
         DrawSkipButton(g, _nextRect, isNext: true, hovered: _hoverBtn == 3);
-        DrawMuteButton(g, _muteRect, _isMuted, hovered: _hoverBtn == 5);
+        DrawMuteButton(g, _muteRect, _isMuted, hovered: _hoverBtn == 5, _accentTint);
 
-        // 7. Bottom interactive seekbar
+        // 7. Clean edge-docked thin rounded progress line at card bottom
         DrawSeekBar(g);
 
         return bmp;
@@ -585,44 +602,44 @@ public sealed class MiniPlayerForm : Form
         g.DrawLine(pen, r.Right - 7, r.Y + 7, r.X + 7, r.Bottom - 7);
     }
 
-    private static void DrawPlayButton(Graphics g, Rectangle r, bool isPlaying, bool hovered)
+    private static void DrawPlayButton(Graphics g, Rectangle r, bool isPlaying, bool hovered, Color ambientTint)
     {
-        // Ambient crimson glow behind play circle
-        var glowRect = new RectangleF(r.X - 4f, r.Y - 4f, r.Width + 8f, r.Height + 8f);
-        using (var glowPath = new GraphicsPath())
+        if (hovered)
         {
+            var glowRect = new RectangleF(r.X - 3f, r.Y - 3f, r.Width + 6f, r.Height + 6f);
+            using var glowPath = new GraphicsPath();
             glowPath.AddEllipse(glowRect);
             using var pgb = new PathGradientBrush(glowPath)
             {
-                CenterColor = Color.FromArgb(hovered ? 105 : 70, 255, 46, 99),
-                SurroundColors = [Color.FromArgb(0, 255, 46, 99)]
+                CenterColor = Color.FromArgb(46, ambientTint),
+                SurroundColors = [Color.FromArgb(0, ambientTint)]
             };
             g.FillPath(pgb, glowPath);
         }
 
-        Color cTop = hovered ? Color.FromArgb(255, 78, 124) : Color.FromArgb(255, 52, 104);
-        Color cBot = hovered ? Color.FromArgb(236, 32, 86) : Color.FromArgb(225, 29, 72);
+        Color cTop = hovered ? Color.FromArgb(255, 255, 255) : Color.FromArgb(244, 247, 252);
+        Color cBot = hovered ? Color.FromArgb(236, 241, 249) : Color.FromArgb(224, 230, 242);
         using (var pb = new LinearGradientBrush(r, cTop, cBot, LinearGradientMode.Vertical))
         {
             g.FillEllipse(pb, r);
         }
 
-        using var rim = new Pen(Color.FromArgb(55, 255, 255, 255), 1f);
+        using var rim = new Pen(Color.FromArgb(90, 255, 255, 255), 1f);
         g.DrawEllipse(rim, r.X + 0.5f, r.Y + 0.5f, r.Width - 1f, r.Height - 1f);
 
-        using var iconBrush = new SolidBrush(Color.White);
+        using var iconBrush = new SolidBrush(Color.FromArgb(18, 22, 34));
         if (isPlaying)
         {
-            g.FillRectangle(iconBrush, r.X + 11f, r.Y + 10f, 3.5f, 12f);
-            g.FillRectangle(iconBrush, r.X + 17.5f, r.Y + 10f, 3.5f, 12f);
+            g.FillRectangle(iconBrush, r.X + 11f, r.Y + 10f, 3.4f, 12f);
+            g.FillRectangle(iconBrush, r.X + 17.6f, r.Y + 10f, 3.4f, 12f);
         }
         else
         {
             PointF[] tri =
             [
-                new(r.X + 12.5f, r.Y + 9.5f),
-                new(r.X + 22.5f, r.Y + 16f),
-                new(r.X + 12.5f, r.Y + 22.5f)
+                new(r.X + 12.6f, r.Y + 9.6f),
+                new(r.X + 22.2f, r.Y + 16f),
+                new(r.X + 12.6f, r.Y + 22.4f)
             ];
             g.FillPolygon(iconBrush, tri);
         }
@@ -631,38 +648,40 @@ public sealed class MiniPlayerForm : Form
     private void DrawSeekBar(Graphics g)
     {
         bool activeSeek = _hoverBtn == 6 || _scrubbingSeek;
-        int barH = activeSeek ? 5 : 3;
-        int barY = LogicalShadow + 98 - (barH - 3) / 2;
-        var trackRect = new Rectangle(LogicalShadow + 14, barY, LogicalCardW - 28, barH);
+        float barH = activeSeek ? 4.5f : 3f;
+        float barY = LogicalShadow + LogicalCardH - 9f - (barH - 3f) * 0.5f;
+        var trackRect = new RectangleF(LogicalShadow + 14f, barY, LogicalCardW - 28f, barH);
 
-        using (var trackPath = CreateRoundedPath(trackRect, barH / 2))
-        using (var trackBrush = new SolidBrush(Color.FromArgb(52, 255, 255, 255)))
+        using (var trackPath = CreateRoundedPathF(trackRect, barH * 0.5f))
+        using (var trackBrush = new SolidBrush(Color.FromArgb(42, 255, 255, 255)))
         {
             g.FillPath(trackBrush, trackPath);
         }
 
         double pct = _durSec > 0 ? Math.Clamp(_curSec / _durSec, 0.0, 1.0) : 0.0;
-        int fillW = (int)Math.Round(trackRect.Width * pct);
-        if (fillW >= 3)
+        float fillW = (float)(trackRect.Width * pct);
+        if (fillW >= 3f)
         {
-            var fillRect = new Rectangle(trackRect.X, trackRect.Y, fillW, trackRect.Height);
-            using var fillPath = CreateRoundedPath(fillRect, barH / 2);
+            var fillRect = new RectangleF(trackRect.X, trackRect.Y, fillW, trackRect.Height);
+            using var fillPath = CreateRoundedPathF(fillRect, barH * 0.5f);
+            Color fillStart = BlendColor(_ambientTint, Color.White, 0.35f);
+            Color fillEnd = BlendColor(_accentTint, Color.White, 0.50f);
             using var fillBrush = new LinearGradientBrush(
                 fillRect,
-                Color.FromArgb(225, 29, 72),
-                Color.FromArgb(255, 72, 118),
+                Color.FromArgb(235, fillStart),
+                Color.FromArgb(245, fillEnd),
                 LinearGradientMode.Horizontal);
             g.FillPath(fillBrush, fillPath);
         }
 
         if (activeSeek && _durSec > 0)
         {
-            float knobX = Math.Clamp(trackRect.X + fillW, trackRect.X + 4, trackRect.Right - 4);
-            float knobY = trackRect.Y + barH / 2f;
-            using var halo = new SolidBrush(Color.FromArgb(75, 255, 46, 99));
-            g.FillEllipse(halo, knobX - 7f, knobY - 7f, 14f, 14f);
+            float knobX = Math.Clamp(trackRect.X + fillW, trackRect.X + 4f, trackRect.Right - 4f);
+            float knobY = trackRect.Y + barH * 0.5f;
+            using var halo = new SolidBrush(Color.FromArgb(56, _accentTint));
+            g.FillEllipse(halo, knobX - 6.5f, knobY - 6.5f, 13f, 13f);
             using var kb = new SolidBrush(Color.White);
-            g.FillEllipse(kb, knobX - 4.5f, knobY - 4.5f, 9f, 9f);
+            g.FillEllipse(kb, knobX - 4f, knobY - 4f, 8f, 8f);
         }
     }
 
@@ -690,14 +709,16 @@ public sealed class MiniPlayerForm : Form
         }
     }
 
-    private static void DrawMuteButton(Graphics g, Rectangle r, bool isMuted, bool hovered)
+    private static void DrawMuteButton(Graphics g, Rectangle r, bool isMuted, bool hovered, Color accentTint)
     {
         if (hovered)
         {
             using var hb = new SolidBrush(Color.FromArgb(30, 255, 255, 255));
             g.FillEllipse(hb, r);
         }
-        Color col = isMuted ? Color.FromArgb(255, 100, 130) : (hovered ? Color.White : Color.FromArgb(200, 210, 225));
+        Color col = isMuted
+            ? BlendColor(Color.FromArgb(244, 114, 140), accentTint, 0.25f)
+            : (hovered ? Color.White : Color.FromArgb(200, 210, 225));
         int cx = r.X + r.Width / 2;
         int cy = r.Y + r.Height / 2;
         using var b = new SolidBrush(col);
@@ -723,6 +744,56 @@ public sealed class MiniPlayerForm : Form
             using var wavePen = new Pen(col, 1.5f) { StartCap = LineCap.Round, EndCap = LineCap.Round };
             g.DrawArc(wavePen, cx, cy - 4, 6, 8, -50, 100);
         }
+    }
+
+    private static (Color Ambient, Color Accent) ExtractCoverPalette(Bitmap bmp)
+    {
+        double rSum = 0, gSum = 0, bSum = 0, wSum = 0;
+        int stepX = Math.Max(1, bmp.Width / 12);
+        int stepY = Math.Max(1, bmp.Height / 12);
+        for (int y = stepY / 2; y < bmp.Height; y += stepY)
+        {
+            for (int x = stepX / 2; x < bmp.Width; x += stepX)
+            {
+                Color p = bmp.GetPixel(x, y);
+                if (p.A < 128) continue;
+                int max = Math.Max(p.R, Math.Max(p.G, p.B));
+                int min = Math.Min(p.R, Math.Min(p.G, p.B));
+                if (max < 22 || min > 236) continue;
+                double sat = max > 0 ? (max - min) / (double)max : 0;
+                double lum = (0.299 * p.R + 0.587 * p.G + 0.114 * p.B) / 255.0;
+                double midBias = 1.0 - Math.Abs(lum - 0.52);
+                double w = 0.25 + sat * 1.45 + Math.Max(0.0, midBias) * 0.4;
+                rSum += p.R * w;
+                gSum += p.G * w;
+                bSum += p.B * w;
+                wSum += w;
+            }
+        }
+
+        if (wSum <= 0.01)
+        {
+            return (Color.FromArgb(148, 163, 210), Color.FromArgb(236, 240, 248));
+        }
+
+        int r = Math.Clamp((int)Math.Round(rSum / wSum), 0, 255);
+        int g = Math.Clamp((int)Math.Round(gSum / wSum), 0, 255);
+        int b = Math.Clamp((int)Math.Round(bSum / wSum), 0, 255);
+
+        // Soften toward refined frosted slate so cover tint is subtle, never garish neon
+        Color raw = Color.FromArgb(r, g, b);
+        Color ambient = BlendColor(raw, Color.FromArgb(140, 152, 188), 0.38f);
+        Color accent = BlendColor(raw, Color.FromArgb(235, 240, 250), 0.45f);
+        return (ambient, accent);
+    }
+
+    private static Color BlendColor(Color a, Color b, float t)
+    {
+        float k = Math.Clamp(t, 0f, 1f);
+        int r = (int)Math.Round(a.R + (b.R - a.R) * k);
+        int g = (int)Math.Round(a.G + (b.G - a.G) * k);
+        int bl = (int)Math.Round(a.B + (b.B - a.B) * k);
+        return Color.FromArgb(Math.Clamp(r, 0, 255), Math.Clamp(g, 0, 255), Math.Clamp(bl, 0, 255));
     }
 
     private static Rectangle GetCenterSquareCrop(int w, int h)
@@ -789,11 +860,14 @@ public sealed class MiniPlayerForm : Form
             var copy = new Bitmap(loaded);
             if (!IsDisposed && IsHandleCreated)
             {
+                (Color ambient, Color accent) = ExtractCoverPalette(copy);
                 BeginInvoke(() =>
                 {
                     if (IsDisposed) { copy.Dispose(); return; }
                     _coverBitmap?.Dispose();
                     _coverBitmap = copy;
+                    _ambientTint = ambient;
+                    _accentTint = accent;
                     RenderLayered();
                 });
             }
