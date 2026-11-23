@@ -115,6 +115,7 @@ public class KurfaPlaybackService extends Service {
 
     public static volatile boolean isPlaying = false;
     private static volatile boolean nativeExoMode = false;
+    private static volatile long nativeControlSeq = 0L;
     private static volatile String activeVideoId = "";
     private static volatile String currentTitle = "Kurfanova Müzik";
     private static volatile String currentArtist = "Reklamsız Müzik Çalar";
@@ -333,6 +334,7 @@ public class KurfaPlaybackService extends Service {
         final String videoId = KurfaNativeEngine.extractVideoId(rawVideoId);
         if (ctx == null || videoId == null) return;
 
+        nativeControlSeq++;
         nativeExoMode = true;
         activeVideoId = videoId;
         currentTitle = (title != null && !title.trim().isEmpty()) ? title.trim() : "Kurfanova Müzik";
@@ -386,6 +388,7 @@ public class KurfaPlaybackService extends Service {
     }
 
     public static void resumeNative(Context ctx) {
+        nativeControlSeq++;
         MAIN_HANDLER.post(() -> {
             KurfaPlaybackService svc = activeService.get();
             if (svc != null) {
@@ -395,13 +398,14 @@ public class KurfaPlaybackService extends Service {
     }
 
     public static void stopNative(Context ctx) {
+        final long stopSeq = ++nativeControlSeq;
         nativeExoMode = false;
         isPlaying = false;
         KurfaWebView.keepAliveInBackground = false;
         MAIN_HANDLER.post(() -> {
             KurfaPlaybackService svc = activeService.get();
             if (svc != null) {
-                svc.stopExoInternal(true);
+                svc.stopExoInternal(true, stopSeq, true);
             }
         });
     }
@@ -554,6 +558,7 @@ public class KurfaPlaybackService extends Service {
 
     public static void updateState(Context ctx, boolean playing) {
         if (nativeExoMode) return;
+        nativeControlSeq++;
         isPlaying = playing;
         KurfaWebView.keepAliveInBackground = playing;
         if (ctx == null) return;
@@ -1065,6 +1070,10 @@ public class KurfaPlaybackService extends Service {
     }
 
     private void stopExoInternal(boolean clearTrack) {
+        stopExoInternal(clearTrack, -1L, false);
+    }
+
+    private void stopExoInternal(boolean clearTrack, long expectedSeq, boolean silentState) {
         cancelScreenOffFocusRecovery();
         cancelNextTrackPrefetch();
         userRequestedPlayback = false;
@@ -1080,11 +1089,18 @@ public class KurfaPlaybackService extends Service {
         if (clearTrack) {
             activeVideoId = "";
         }
+        // If HTML5/Local playback already took ownership (via updateState(ctx, true)) after stopNative was queued,
+        // do not clobber locks, notification state, or emit stale playing=false to WebView.
+        if (expectedSeq >= 0L && expectedSeq != nativeControlSeq) {
+            return;
+        }
         isPlaying = false;
         KurfaWebView.keepAliveInBackground = false;
         releaseLocks();
         updateSessionAndNotification(false);
-        emitNativeExoEvent("state", null);
+        if (!silentState) {
+            emitNativeExoEvent("state", null);
+        }
     }
 
     private void seekExoInternal(double sec) {
@@ -1186,6 +1202,20 @@ public class KurfaPlaybackService extends Service {
         MAIN_HANDLER.post(() -> {
             KurfaPlaybackService svc = activeService.get();
             if (svc == null || !nativeExoMode || svc.exoPlayer == null) return;
+            if (activeVideoId != null && !activeVideoId.isEmpty()) {
+                NativeQueueTrack curTrack = null;
+                int curIdx = -1;
+                synchronized (QUEUE_LOCK) {
+                    curIdx = findQueueIndexByVideoIdLocked(activeVideoId);
+                    if (curIdx >= 0 && curIdx < NATIVE_QUEUE.size()) {
+                        curTrack = NATIVE_QUEUE.get(curIdx);
+                    }
+                }
+                if (curTrack == null) {
+                    curTrack = new NativeQueueTrack(activeVideoId, currentTitle, currentArtist, currentThumbUrl);
+                }
+                svc.emitNativeTrackChangedEvent(curIdx, curTrack);
+            }
             svc.emitNativeExoEvent("state", null);
             svc.emitNativeExoEvent("time", null);
             if (svc.userRequestedPlayback && !svc.stallWatchdogScheduled) {
@@ -1213,6 +1243,15 @@ public class KurfaPlaybackService extends Service {
             ev.put("currentTime", posMs / 1000.0);
             ev.put("duration", durMs > 0L ? (durMs / 1000.0) : 0.0);
             ev.put("videoId", activeVideoId != null ? activeVideoId : "");
+            if ("state".equals(type) && nativeExoMode && activeVideoId != null && !activeVideoId.isEmpty()) {
+                ev.put("title", currentTitle != null ? currentTitle : "");
+                ev.put("artist", currentArtist != null ? currentArtist : "");
+                ev.put("cover", currentThumbUrl != null ? currentThumbUrl : "");
+                synchronized (QUEUE_LOCK) {
+                    int idx = findQueueIndexByVideoIdLocked(activeVideoId);
+                    if (idx >= 0) ev.put("index", idx);
+                }
+            }
             if (errorMsg != null) {
                 ev.put("error", errorMsg);
             }

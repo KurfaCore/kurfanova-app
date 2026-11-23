@@ -569,7 +569,17 @@ public class MainActivity extends Activity {
         return tail.isEmpty() ? null : tail;
     }
 
-    private WebResourceResponse handleLocalDeviceAudioIntercept(String mediaIdStr, Map<String, String> headers) {
+    private WebResourceResponse handleLocalDeviceAudioIntercept(String mediaIdStr, String method, Map<String, String> headers) {
+        if ("OPTIONS".equalsIgnoreCase(method)) {
+            Map<String, String> corsHeaders = new HashMap<>();
+            corsHeaders.put("Access-Control-Allow-Origin", "*");
+            corsHeaders.put("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS");
+            corsHeaders.put("Access-Control-Allow-Headers", "Range, Content-Type");
+            corsHeaders.put("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
+            corsHeaders.put("Access-Control-Max-Age", "3600");
+            return new WebResourceResponse("text/plain", "UTF-8", 204, "No Content", corsHeaders, new ByteArrayInputStream(new byte[0]));
+        }
+        AssetFileDescriptor afd = null;
         try {
             long mediaId = Long.parseLong(mediaIdStr);
             Uri contentUri = ContentUris.withAppendedId(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, mediaId);
@@ -577,11 +587,17 @@ public class MainActivity extends Activity {
             String mime = resolver.getType(contentUri);
             if (TextUtils.isEmpty(mime)) mime = "audio/mpeg";
 
-            AssetFileDescriptor afd = resolver.openAssetFileDescriptor(contentUri, "r");
+            afd = resolver.openAssetFileDescriptor(contentUri, "r");
             if (afd == null) {
-                return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", null, null);
+                return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", null, new ByteArrayInputStream(new byte[0]));
             }
             long totalLen = afd.getLength();
+            if (totalLen <= 0L) {
+                try {
+                    long statLen = afd.getParcelFileDescriptor().getStatSize();
+                    if (statLen > 0L) totalLen = statLen;
+                } catch (Throwable ignored) {}
+            }
             long start = 0L;
             long end = totalLen > 0 ? totalLen - 1L : -1L;
             boolean isRange = false;
@@ -602,19 +618,21 @@ public class MainActivity extends Activity {
                 }
             }
 
-            java.io.InputStream is = afd.createInputStream();
-            if (start > 0) {
-                long skipped = 0;
-                while (skipped < start) {
-                    long s = is.skip(start - skipped);
-                    if (s <= 0) break;
-                    skipped += s;
-                }
+            if (totalLen > 0 && start >= totalLen) {
+                try { afd.close(); } catch (Throwable ignored) {}
+                Map<String, String> errHeaders = new HashMap<>();
+                errHeaders.put("Content-Range", "bytes */" + totalLen);
+                errHeaders.put("Access-Control-Allow-Origin", "*");
+                return new WebResourceResponse("text/plain", "UTF-8", 416, "Range Not Satisfiable", errHeaders, new ByteArrayInputStream(new byte[0]));
+            }
+            if (totalLen > 0 && end < start) {
+                end = totalLen - 1L;
             }
 
             Map<String, String> respHeaders = new HashMap<>();
             respHeaders.put("Accept-Ranges", "bytes");
             respHeaders.put("Access-Control-Allow-Origin", "*");
+            respHeaders.put("Access-Control-Expose-Headers", "Content-Range, Content-Length, Accept-Ranges");
             if (totalLen > 0) {
                 long contentLen = Math.max(0L, end - start + 1L);
                 respHeaders.put("Content-Length", String.valueOf(contentLen));
@@ -624,9 +642,32 @@ public class MainActivity extends Activity {
             }
             int status = (isRange && totalLen > 0) ? 206 : 200;
             String reason = status == 206 ? "Partial Content" : "OK";
+
+            if ("HEAD".equalsIgnoreCase(method)) {
+                try { afd.close(); } catch (Throwable ignored) {}
+                return new WebResourceResponse(mime, null, status, reason, respHeaders, new ByteArrayInputStream(new byte[0]));
+            }
+
+            java.io.InputStream is = afd.createInputStream();
+            if (start > 0) {
+                long skipped = 0;
+                while (skipped < start) {
+                    long s = is.skip(start - skipped);
+                    if (s <= 0) {
+                        if (is.read() == -1) break;
+                        skipped += 1;
+                    } else {
+                        skipped += s;
+                    }
+                }
+            }
+
             return new WebResourceResponse(mime, null, status, reason, respHeaders, is);
         } catch (Throwable t) {
-            return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", null, null);
+            if (afd != null) {
+                try { afd.close(); } catch (Throwable ignored) {}
+            }
+            return new WebResourceResponse("text/plain", "UTF-8", 404, "Not Found", null, new ByteArrayInputStream(new byte[0]));
         }
     }
 
@@ -1477,7 +1518,7 @@ public class MainActivity extends Activity {
             if (request != null && request.getUrl() != null) {
                 String localMediaId = extractLocalAudioMediaId(request.getUrl());
                 if (localMediaId != null) {
-                    return handleLocalDeviceAudioIntercept(localMediaId, request.getRequestHeaders());
+                    return handleLocalDeviceAudioIntercept(localMediaId, request.getMethod(), request.getRequestHeaders());
                 }
                 String nativeVid = KurfaNativeEngine.extractVideoIdFromNativeAudioUri(request.getUrl());
                 if (nativeVid != null) {
@@ -1507,6 +1548,10 @@ public class MainActivity extends Activity {
         public WebResourceResponse shouldInterceptRequest(WebView view, String url) {
             if (isHttpUrl(url)) {
                 Uri parsed = Uri.parse(url);
+                String localMediaId = extractLocalAudioMediaId(parsed);
+                if (localMediaId != null) {
+                    return handleLocalDeviceAudioIntercept(localMediaId, "GET", null);
+                }
                 String nativeVid = KurfaNativeEngine.extractVideoIdFromNativeAudioUri(parsed);
                 if (nativeVid != null) {
                     return KurfaNativeEngine.handleNativeAudioIntercept(nativeVid, "GET", null);
