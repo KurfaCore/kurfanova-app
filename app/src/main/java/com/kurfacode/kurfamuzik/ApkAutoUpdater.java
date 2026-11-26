@@ -30,6 +30,7 @@ import java.io.OutputStream;
 import java.security.MessageDigest;
 import java.util.Locale;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import okhttp3.OkHttpClient;
@@ -47,19 +48,24 @@ public final class ApkAutoUpdater {
             "https://github.com/KurfaCore/kurfanova-app/releases/latest/download/apk-update.json";
 
     private static final OkHttpClient UPDATE_CLIENT = new OkHttpClient.Builder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(10, TimeUnit.SECONDS)
+            .callTimeout(15, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .build();
 
     private static final AtomicBoolean INTERACTIVE_LOCK = new AtomicBoolean(false);
+    private static final AtomicBoolean STARTUP_CHECK_DONE = new AtomicBoolean(false);
     private static volatile File stagedApkFile = null;
     private static volatile String stagedVersionName = null;
     private static volatile boolean pendingInstallAfterPermission = false;
 
     private ApkAutoUpdater() {}
 
-    /** Silent startup check: updates Settings label + subtle toast without popping a startup modal. */
+    /** Silent startup check: runs strictly once per app launch without leaking RAM or threads. */
     public static void checkInBackground(Activity activity, ExecutorService executor, WebView webView) {
+        if (!STARTUP_CHECK_DONE.compareAndSet(false, true)) return;
         runUpdateCheck(activity, executor, webView, false);
     }
 

@@ -109,10 +109,10 @@ final class KurfaNativeEngine {
             "ANDROID", "WEB_REMIX", "IOS", "TVHTML5_SIMPLY", "VISIONOS", "NEWPIPE", "ANDROID_VR", "SABR"
     };
     private static final String[] VIDEO_PRIMARY_CLIENT_ORDER = new String[]{
-            "VISIONOS", "ANDROID", "IOS_PRODUCER", "TVHTML5_SIMPLY", "ANDROID_VR", "IOS", "NEWPIPE"
+            "ANDROID_VR", "ANDROID", "IOS_PRODUCER", "TVHTML5_SIMPLY", "VISIONOS", "IOS", "NEWPIPE"
     };
     private static final String[] VIDEO_ALTERNATE_CLIENT_ORDER = new String[]{
-            "ANDROID", "IOS_PRODUCER", "TVHTML5_SIMPLY", "ANDROID_VR", "VISIONOS", "IOS", "NEWPIPE"
+            "ANDROID", "TVHTML5_SIMPLY", "ANDROID_VR", "IOS_PRODUCER", "NEWPIPE", "VISIONOS", "IOS"
     };
 
     private static final String WEB_REMIX_VERSION = "1.20260707.12.00";
@@ -1666,7 +1666,9 @@ final class KurfaNativeEngine {
                             "HEAD".equals(method));
                     return;
                 }
-                ProxyResponse resp = openNativeMediaProxyResponse(videoId, method, reqHeaders, true, isVideo);
+                String queryPart = qIdx >= 0 ? rawTarget.substring(qIdx + 1) : "";
+                boolean retryAlt = isVideo && queryPart.contains("retry=1");
+                ProxyResponse resp = openNativeMediaProxyResponse(videoId, method, reqHeaders, true, isVideo, retryAlt);
                 responseBody = resp.bodyStream;
 
                 StringBuilder sb = new StringBuilder();
@@ -1782,6 +1784,17 @@ final class KurfaNativeEngine {
             boolean streamFullOpenRange,
             boolean isVideo
     ) {
+        return openNativeMediaProxyResponse(videoId, method, requestHeaders, streamFullOpenRange, isVideo, false);
+    }
+
+    private static ProxyResponse openNativeMediaProxyResponse(
+            String videoId,
+            String method,
+            Map<String, String> requestHeaders,
+            boolean streamFullOpenRange,
+            boolean isVideo,
+            boolean retryAlternate
+    ) {
         String allowOrigin = isVideo ? "*" : resolveAllowedOrigin(requestHeaders);
         String defaultMime = isVideo ? "video/mp4" : "audio/mp4";
         if ("OPTIONS".equalsIgnoreCase(method)) {
@@ -1828,8 +1841,8 @@ final class KurfaNativeEngine {
         }
 
         for (int attempt = 0; attempt < 4; attempt++) {
-            boolean forceRefresh = attempt > 0;
-            boolean forceAlternate = attempt >= 1;
+            boolean forceRefresh = attempt > 0 || (attempt == 0 && retryAlternate);
+            boolean forceAlternate = attempt >= 1 || retryAlternate;
             ResolvedAudio media;
             if (isVideo) {
                 media = pinnedConstraints

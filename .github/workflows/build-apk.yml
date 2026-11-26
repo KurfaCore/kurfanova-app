@@ -53,7 +53,7 @@ jobs:
           KURFA_KEY_PASS: ${{ secrets.ANDROID_KEY_PASS }}
         run: |
           VER_CODE=$((GITHUB_RUN_NUMBER + 3))
-          VER_NAME="1.2.${GITHUB_RUN_NUMBER}"
+          VER_NAME="1.3.0"
           echo "Building APK versionCode=${VER_CODE} versionName=${VER_NAME}"
           gradle assembleDebug -PappVersionCode="${VER_CODE}" -PappVersionName="${VER_NAME}" --no-daemon --stacktrace
 
@@ -66,7 +66,7 @@ jobs:
           mkdir -p dist
           cp app/build/outputs/apk/debug/app-debug.apk dist/Kurfanova-Muzik.apk
           VER_CODE=$((GITHUB_RUN_NUMBER + 3))
-          VER_NAME="1.2.${GITHUB_RUN_NUMBER}"
+          VER_NAME="1.3.0"
           SHA256=$(sha256sum dist/Kurfanova-Muzik.apk | awk '{print $1}')
           SIZE=$(stat -c%s dist/Kurfanova-Muzik.apk)
           printf '%s  Kurfanova-Muzik.apk\n' "${SHA256}" > dist/SHA256SUMS-android.txt
@@ -98,7 +98,7 @@ jobs:
           name: "Kurfamüzik — Windows Masaüstü & Android Sürümü"
           make_latest: true
           body: |
-            Kurfamüzik resmi **Windows Masaüstü (`v1.2.9+`, x64)** ve **Android APK (`v1.2.${{ github.run_number }}`)** kurulum paketleri.
+            Kurfamüzik resmi **Windows Masaüstü (`v1.2.9+`, x64)** ve **Android APK (`v1.3.0`)** kurulum paketleri.
 
             ### İndirme Dosyaları
             - **Windows Kurulum (Önerilen):** `Kurfamuzik-Setup.exe` (Windows 10 / 11 x64 Inno Setup, yönetici izni gerektirmez)

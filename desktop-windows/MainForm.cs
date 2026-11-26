@@ -976,6 +976,7 @@ public sealed class MainForm : Form
         bool miniPlaying = false;
         bool hasMiniPlaying = false;
         bool miniMuted = false;
+        double? miniVolume = null;
         double miniCur = 0;
         double miniDur = 0;
         bool themeDarkMode = true;
@@ -1051,6 +1052,10 @@ public sealed class MainForm : Form
                     (mmEl.ValueKind == JsonValueKind.True || mmEl.ValueKind == JsonValueKind.False))
                 {
                     miniMuted = mmEl.GetBoolean();
+                }
+                if (payload.TryGetProperty("volume", out JsonElement mvEl) && mvEl.ValueKind == JsonValueKind.Number)
+                {
+                    miniVolume = Math.Clamp(mvEl.GetDouble(), 0.0, 1.0);
                 }
                 if (payload.TryGetProperty("cur", out JsonElement mcEl) && mcEl.ValueKind == JsonValueKind.Number)
                 {
@@ -1480,7 +1485,7 @@ public sealed class MainForm : Form
                         {
                             _isAudioPlaying = miniPlaying;
                         }
-                        bool nowVisible = ToggleOrUpdateMiniPlayer(true, downloadTitle, miniArtist, miniThumb, miniPlaying, miniMuted, miniCur, miniDur);
+                        bool nowVisible = ToggleOrUpdateMiniPlayer(true, downloadTitle, miniArtist, miniThumb, miniPlaying, miniMuted, miniCur, miniDur, miniVolume);
                         responseObj = new { success = true, visible = nowVisible };
                         break;
                     }
@@ -1508,7 +1513,7 @@ public sealed class MainForm : Form
                         }
                         if (_miniPlayer is { IsDisposed: false, Visible: true })
                         {
-                            ToggleOrUpdateMiniPlayer(false, downloadTitle, miniArtist, miniThumb, miniPlaying, miniMuted, miniCur, miniDur);
+                            ToggleOrUpdateMiniPlayer(false, downloadTitle, miniArtist, miniThumb, miniPlaying, miniMuted, miniCur, miniDur, miniVolume);
                         }
                         responseObj = new { success = true };
                         break;
@@ -1613,7 +1618,8 @@ public sealed class MainForm : Form
         bool isPlaying,
         bool isMuted,
         double curSec,
-        double durSec)
+        double durSec,
+        double? volume = null)
     {
         if (IsDisposed || !IsHandleCreated) return false;
         bool visible = false;
@@ -1633,7 +1639,8 @@ public sealed class MainForm : Form
                         Show();
                         WindowState = FormWindowState.Normal;
                         Activate();
-                    });
+                    },
+                    onSetVolume: vol => ExecuteMiniPlayerJs($"if(typeof window.setPlayerVolume==='function')window.setPlayerVolume({vol.ToString(System.Globalization.CultureInfo.InvariantCulture)});"));
                 string lang;
                 lock (_config)
                 {
@@ -1643,20 +1650,20 @@ public sealed class MainForm : Form
                 _miniPlayer.VisibleChanged += (_, _) => UpdateWebViewMemoryMode();
             }
 
-            _miniPlayer.UpdateState(title, artist, thumbUrl, isPlaying, isMuted, curSec, durSec);
+            _miniPlayer.UpdateState(title, artist, thumbUrl, isPlaying, isMuted, curSec, durSec, volume);
             if (toggleVisibility)
             {
-                if (_miniPlayer.Visible)
+                if (_miniPlayer.Visible && !_miniPlayer.IsClosingAnimation)
                 {
-                    _miniPlayer.Hide();
+                    _miniPlayer.CloseAnimated();
                 }
                 else
                 {
-                    _miniPlayer.Show();
+                    _miniPlayer.ShowAnimated();
                 }
             }
             UpdateWebViewMemoryMode();
-            visible = _miniPlayer.Visible;
+            visible = _miniPlayer.Visible && !_miniPlayer.IsClosingAnimation;
         }
 
         if (InvokeRequired)

@@ -656,8 +656,14 @@ public class KurfaPlaybackService extends Service {
             public void onPlay() {
                 if (nativeExoMode && exoPlayer != null) {
                     resumeExoInternal();
-                } else if (!isPlaying) {
-                    dispatchToJs("kurfaNativeTogglePlay");
+                } else {
+                    isPlaying = true;
+                    KurfaWebView.keepAliveInBackground = true;
+                    pausedByAudioFocus = false;
+                    requestAudioFocus();
+                    acquireLocks();
+                    updateSessionAndNotification(true);
+                    dispatchPlayPauseJs(true);
                 }
             }
 
@@ -665,8 +671,12 @@ public class KurfaPlaybackService extends Service {
             public void onPause() {
                 if (nativeExoMode && exoPlayer != null) {
                     pauseExoInternal();
-                } else if (isPlaying) {
-                    dispatchToJs("kurfaNativeTogglePlay");
+                } else {
+                    isPlaying = false;
+                    KurfaWebView.keepAliveInBackground = false;
+                    releaseLocks();
+                    updateSessionAndNotification(false);
+                    dispatchPlayPauseJs(false);
                 }
             }
 
@@ -1118,7 +1128,7 @@ public class KurfaPlaybackService extends Service {
         if (exoPlayer == null) return;
         int state = exoPlayer.getPlaybackState();
         boolean active = exoPlayer.isPlaying() || (exoPlayer.getPlayWhenReady() && state == Player.STATE_BUFFERING);
-        isPlaying = exoPlayer.isPlaying();
+        isPlaying = active;
         KurfaWebView.keepAliveInBackground = active;
         if (active) {
             acquireLocks();
@@ -1291,7 +1301,26 @@ public class KurfaPlaybackService extends Service {
                 }
                 return START_STICKY;
             }
-            dispatchToJs("kurfaNativeTogglePlay");
+            boolean targetPlay = !isPlaying;
+            isPlaying = targetPlay;
+            KurfaWebView.keepAliveInBackground = targetPlay;
+            if (targetPlay) {
+                pausedByAudioFocus = false;
+                requestAudioFocus();
+                acquireLocks();
+            } else {
+                releaseLocks();
+                if (!pausedByAudioFocus) {
+                    abandonAudioFocus();
+                }
+            }
+            updateSessionAndNotification(targetPlay);
+            if (!targetPlay) {
+                stopForegroundCompat(false);
+            }
+            dispatchPlayPauseJs(targetPlay);
+            loadArtworkAsyncIfNeeded();
+            return START_STICKY;
         } else if (ACTION_NEXT.equals(action)) {
             dispatchToJs("kurfaNativeNextTrack");
         } else if (ACTION_PREV.equals(action)) {

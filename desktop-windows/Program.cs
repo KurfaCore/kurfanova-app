@@ -23,6 +23,16 @@ internal static class Program
         try { _ = SetCurrentProcessExplicitAppUserModelID(isTestMode ? "KurfaCore.KurfaTest" : "KurfaCore.Kurfamuzik"); } catch { }
 
         // 0. Preview screenshot helpers for visual verification
+        int previewMiniModesIdx = Array.FindIndex(args, a => string.Equals(a, "--preview-miniplayer-modes", StringComparison.OrdinalIgnoreCase));
+        if (previewMiniModesIdx >= 0 && previewMiniModesIdx + 1 < args.Length)
+        {
+            ApplicationConfiguration.Initialize();
+            using var previewMiniModes = new MiniPlayerForm(
+                () => { }, () => { }, () => { }, () => { }, _ => { }, () => { }, _ => { });
+            previewMiniModes.SavePreviewModes(args[previewMiniModesIdx + 1]);
+            return;
+        }
+
         int previewMiniIdx = Array.FindIndex(args, a => string.Equals(a, "--preview-miniplayer", StringComparison.OrdinalIgnoreCase));
         if (previewMiniIdx >= 0 && previewMiniIdx + 1 < args.Length)
         {
