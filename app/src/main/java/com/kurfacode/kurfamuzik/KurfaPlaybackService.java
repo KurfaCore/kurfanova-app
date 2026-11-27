@@ -240,25 +240,8 @@ public class KurfaPlaybackService extends Service {
     };
 
     private final AudioManager.OnAudioFocusChangeListener audioFocusListener = focusChange -> {
-        if (nativeExoMode) return;
-        if (focusChange == AudioManager.AUDIOFOCUS_LOSS) {
-            hasAudioFocus = false;
-            pausedByAudioFocus = false;
-            if (isPlaying) {
-                dispatchPlayPauseJs(false);
-            }
-        } else if (focusChange == AudioManager.AUDIOFOCUS_LOSS_TRANSIENT) {
-            if (isPlaying) {
-                pausedByAudioFocus = true;
-                dispatchPlayPauseJs(false);
-            }
-        } else if (focusChange == AudioManager.AUDIOFOCUS_GAIN) {
-            hasAudioFocus = true;
-            if (pausedByAudioFocus && !isPlaying) {
-                pausedByAudioFocus = false;
-                dispatchPlayPauseJs(true);
-            }
-        }
+        // In nativeExoMode ExoPlayer owns AudioFocus; in WebView mode Chromium owns AudioFocus.
+        // Never fight our own WebView <audio> for AUDIOFOCUS_GAIN.
     };
 
     private static SimpleCache getOrCreateExoCache(Context context) {
@@ -1384,33 +1367,10 @@ public class KurfaPlaybackService extends Service {
     }
 
     private void requestAudioFocus() {
-        if (audioManager == null || hasAudioFocus) return;
-        try {
-            int res;
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                if (audioFocusRequest == null) {
-                    AudioAttributes attrs = new AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                            .build();
-                    audioFocusRequest = new AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
-                            .setAudioAttributes(attrs)
-                            .setAcceptsDelayedFocusGain(true)
-                            .setOnAudioFocusChangeListener(audioFocusListener, MAIN_HANDLER)
-                            .build();
-                }
-                res = audioManager.requestAudioFocus(audioFocusRequest);
-            } else {
-                @SuppressWarnings("deprecation")
-                int legacyRes = audioManager.requestAudioFocus(
-                        audioFocusListener,
-                        AudioManager.STREAM_MUSIC,
-                        AudioManager.AUDIOFOCUS_GAIN
-                );
-                res = legacyRes;
-            }
-            hasAudioFocus = (res == AudioManager.AUDIOFOCUS_REQUEST_GRANTED);
-        } catch (Throwable ignored) {}
+        // WebView Chromium manages AudioFocus for HTML5/local <audio>; Media3 ExoPlayer manages
+        // AudioFocus natively via setAudioAttributes(..., true). Requesting a second AUDIOFOCUS_GAIN
+        // listener here caused self-revocation (1-second auto-pause) on local device music tracks.
+        hasAudioFocus = false;
     }
 
     private void abandonAudioFocus() {
