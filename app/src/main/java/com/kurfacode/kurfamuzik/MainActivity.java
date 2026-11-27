@@ -74,6 +74,8 @@ public class MainActivity extends Activity {
     private static final String FALLBACK_URL = "https://kurfanova.kurfa.workers.dev/";
     private static final int REQUEST_FILE_CHOOSER = 1001;
     private static final int REQUEST_WRITE_STORAGE = 1002;
+    private static final int REQUEST_READ_AUDIO = 1003;
+    private static final int REQUEST_POST_NOTIFICATIONS = 1004;
     private static final int MAX_DATA_DOWNLOAD_BYTES = 25 * 1024 * 1024;
 
     private static final Set<String> AD_HOSTS = new HashSet<>(Arrays.asList(
@@ -165,7 +167,6 @@ public class MainActivity extends Activity {
     private ValueCallback<Uri[]> fileUploadCallback;
     private PendingDownload pendingDownload;
     private volatile String pendingAudioScanRequestId = null;
-    private static final int REQUEST_READ_AUDIO = 1003;
     private static final String LOCAL_AUDIO_PATH_PREFIX = "/__kurfa_local_audio/";
     private volatile String activeWebOrigin = "https://kurfanova.github.io";
     private boolean triedFallbackUrl = false;
@@ -308,7 +309,12 @@ public class MainActivity extends Activity {
 
         @JavascriptInterface
         public void updateNowPlayingMetadata(String title, String artist, String thumbUrl) {
-            KurfaPlaybackService.updateMetadata(MainActivity.this, title, artist, thumbUrl);
+            KurfaPlaybackService.updateMetadata(MainActivity.this, title, artist, thumbUrl, -1L);
+        }
+
+        @JavascriptInterface
+        public void updateNowPlayingMetadataWithDuration(String title, String artist, String thumbUrl, long durationSec) {
+            KurfaPlaybackService.updateMetadata(MainActivity.this, title, artist, thumbUrl, durationSec);
         }
 
         @JavascriptInterface
@@ -771,7 +777,7 @@ public class MainActivity extends Activity {
                     android.content.SharedPreferences prefs = getSharedPreferences("kurfa_prefs", MODE_PRIVATE);
                     if (!prefs.getBoolean("notif_asked", false)) {
                         prefs.edit().putBoolean("notif_asked", true).apply();
-                        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 1003);
+                        requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, REQUEST_POST_NOTIFICATIONS);
                     }
                 }
             } catch (Throwable ignored) {}

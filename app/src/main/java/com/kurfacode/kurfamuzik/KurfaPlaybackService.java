@@ -121,7 +121,9 @@ public class KurfaPlaybackService extends Service {
     private static volatile String currentArtist = "Reklamsız Müzik Çalar";
     private static volatile String currentThumbUrl = "";
     private static volatile long currentDurationMs = -1L;
-    private static volatile long currentPositionMs = PlaybackState.PLAYBACK_POSITION_UNKNOWN;
+    private static volatile long currentPositionMs = 0L;
+    private static volatile long lastPublishedMetadataDurationMs = -2L;
+    private static volatile long lastNativeControlDispatchAtMs = 0L;
     private static volatile float desiredVolume = 1.0f;
     private static volatile Bitmap currentArtwork = null;
 
@@ -158,6 +160,7 @@ public class KurfaPlaybackService extends Service {
     private int cacheSessionNonce = 0;
     private Runnable pendingFocusRecovery;
     private boolean timeTickScheduled = false;
+    private long lastSessionStatePushAtMs = 0L;
 
     private final Runnable nativePrefetchRunnable = () -> {
         if (!nativeExoMode || !userRequestedPlayback) return;
@@ -230,7 +233,14 @@ public class KurfaPlaybackService extends Service {
             long durMs = exoPlayer.getDuration();
             currentPositionMs = posMs;
             currentDurationMs = durMs > 0L ? durMs : -1L;
-            updateSessionPlaybackStateOnly();
+            if (currentDurationMs > 0L && currentDurationMs != lastPublishedMetadataDurationMs) {
+                publishMediaMetadataLocked();
+            }
+            long nowElapsed = SystemClock.elapsedRealtime();
+            if (!shouldTick || (nowElapsed - lastSessionStatePushAtMs) >= 2000L) {
+                lastSessionStatePushAtMs = nowElapsed;
+                updateSessionPlaybackStateOnly();
+            }
             emitNativeExoEvent("time", null);
             if (shouldTick) {
                 timeTickScheduled = true;
@@ -541,6 +551,9 @@ public class KurfaPlaybackService extends Service {
 
     public static void updateState(Context ctx, boolean playing) {
         if (nativeExoMode) return;
+        if (isPlaying == playing && (SystemClock.elapsedRealtime() - lastNativeControlDispatchAtMs) < 1200L) {
+            return;
+        }
         nativeControlSeq++;
         isPlaying = playing;
         KurfaWebView.keepAliveInBackground = playing;
@@ -559,9 +572,32 @@ public class KurfaPlaybackService extends Service {
     }
 
     public static void updateMetadata(Context ctx, String title, String artist, String thumbUrl) {
-        currentTitle = (title != null && !title.trim().isEmpty()) ? title.trim() : "Kurfanova Müzik";
-        currentArtist = (artist != null && !artist.trim().isEmpty()) ? artist.trim() : "Kurfanova";
-        currentThumbUrl = thumbUrl != null ? thumbUrl.trim() : "";
+        updateMetadata(ctx, title, artist, thumbUrl, -1L);
+    }
+
+    public static void updateMetadata(Context ctx, String title, String artist, String thumbUrl, long durationSec) {
+        String safeTitle = (title != null && !title.trim().isEmpty()) ? title.trim() : "Kurfanova Müzik";
+        String safeArtist = (artist != null && !artist.trim().isEmpty()) ? artist.trim() : "Kurfanova";
+        String safeThumb = thumbUrl != null ? thumbUrl.trim() : "";
+        boolean trackChanged = !safeTitle.equals(currentTitle)
+                || !safeArtist.equals(currentArtist)
+                || !safeThumb.equals(currentThumbUrl);
+
+        currentTitle = safeTitle;
+        currentArtist = safeArtist;
+        if (!safeThumb.equals(currentThumbUrl)) {
+            currentThumbUrl = safeThumb;
+            currentArtwork = null;
+            lastLoadedArtUrl = "";
+        }
+        if (trackChanged && !nativeExoMode) {
+            currentPositionMs = 0L;
+            currentDurationMs = durationSec > 0L ? durationSec * 1000L : -1L;
+            lastPublishedMetadataDurationMs = -2L;
+        } else if (durationSec > 0L && currentDurationMs <= 0L) {
+            currentDurationMs = durationSec * 1000L;
+            lastPublishedMetadataDurationMs = -2L;
+        }
         KurfaPlaybackService svc = activeService.get();
         if (svc != null) {
             MAIN_HANDLER.post(() -> {
@@ -579,12 +615,22 @@ public class KurfaPlaybackService extends Service {
 
     public static void updateProgress(Context ctx, long positionSec, long durationSec) {
         if (nativeExoMode) return;
-        currentPositionMs = positionSec >= 0 ? positionSec * 1000L : PlaybackState.PLAYBACK_POSITION_UNKNOWN;
-        currentDurationMs = durationSec > 0 ? durationSec * 1000L : -1L;
+        long durMs = durationSec > 0L ? durationSec * 1000L : -1L;
+        long posMs = positionSec >= 0L ? positionSec * 1000L : 0L;
+        if (durMs > 0L && posMs > durMs) {
+            posMs = durMs;
+        }
+        currentPositionMs = posMs;
+        if (durMs > 0L) {
+            currentDurationMs = durMs;
+        }
         KurfaPlaybackService svc = activeService.get();
         if (svc != null) {
             MAIN_HANDLER.post(() -> {
                 if (activeService.get() == svc) {
+                    if (currentDurationMs > 0L && currentDurationMs != lastPublishedMetadataDurationMs) {
+                        svc.publishMediaMetadataLocked();
+                    }
                     svc.updateSessionPlaybackStateOnly();
                 }
             });
@@ -640,6 +686,7 @@ public class KurfaPlaybackService extends Service {
                 if (nativeExoMode && exoPlayer != null) {
                     resumeExoInternal();
                 } else {
+                    lastNativeControlDispatchAtMs = SystemClock.elapsedRealtime();
                     isPlaying = true;
                     KurfaWebView.keepAliveInBackground = true;
                     pausedByAudioFocus = false;
@@ -655,10 +702,12 @@ public class KurfaPlaybackService extends Service {
                 if (nativeExoMode && exoPlayer != null) {
                     pauseExoInternal();
                 } else {
+                    lastNativeControlDispatchAtMs = SystemClock.elapsedRealtime();
                     isPlaying = false;
                     KurfaWebView.keepAliveInBackground = false;
                     releaseLocks();
                     updateSessionAndNotification(false);
+                    stopForegroundCompat(false);
                     dispatchPlayPauseJs(false);
                 }
             }
@@ -1233,6 +1282,7 @@ public class KurfaPlaybackService extends Service {
             ev.put("playing", playingNow);
             ev.put("buffering", bufferingNow);
             ev.put("playWhenReady", exoPlayer != null && exoPlayer.getPlayWhenReady() && userRequestedPlayback);
+            ev.put("userPaused", !userRequestedPlayback);
             ev.put("currentTime", posMs / 1000.0);
             ev.put("duration", durMs > 0L ? (durMs / 1000.0) : 0.0);
             ev.put("videoId", activeVideoId != null ? activeVideoId : "");
@@ -1285,6 +1335,7 @@ public class KurfaPlaybackService extends Service {
                 return START_STICKY;
             }
             boolean targetPlay = !isPlaying;
+            lastNativeControlDispatchAtMs = SystemClock.elapsedRealtime();
             isPlaying = targetPlay;
             KurfaWebView.keepAliveInBackground = targetPlay;
             if (targetPlay) {
@@ -1334,7 +1385,7 @@ public class KurfaPlaybackService extends Service {
             }
         }
 
-        boolean asForeground = ACTION_SYNC.equals(action) || isPlaying;
+        boolean asForeground = isPlaying;
         updateSessionAndNotification(asForeground);
         if (!isPlaying && (ACTION_SYNC.equals(action) || action == null)) {
             stopForegroundCompat(false);
@@ -1343,9 +1394,30 @@ public class KurfaPlaybackService extends Service {
         return START_STICKY;
     }
 
+    private void publishMediaMetadataLocked() {
+        if (mediaSession == null) return;
+        try {
+            MediaMetadata.Builder meta = new MediaMetadata.Builder()
+                    .putString(MediaMetadata.METADATA_KEY_TITLE, currentTitle)
+                    .putString(MediaMetadata.METADATA_KEY_ARTIST, currentArtist);
+            if (currentDurationMs > 0L) {
+                meta.putLong(MediaMetadata.METADATA_KEY_DURATION, currentDurationMs);
+            }
+            if (currentArtwork != null) {
+                meta.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, currentArtwork);
+            }
+            lastPublishedMetadataDurationMs = currentDurationMs;
+            mediaSession.setMetadata(meta.build());
+        } catch (Throwable ignored) {}
+    }
+
     private void updateSessionPlaybackStateOnly() {
         if (mediaSession == null) return;
         try {
+            long safePos = currentPositionMs >= 0L ? currentPositionMs : 0L;
+            if (currentDurationMs > 0L && safePos > currentDurationMs) {
+                safePos = currentDurationMs;
+            }
             PlaybackState state = new PlaybackState.Builder()
                     .setActions(
                             PlaybackState.ACTION_PLAY |
@@ -1358,8 +1430,9 @@ public class KurfaPlaybackService extends Service {
                     )
                     .setState(
                             isPlaying ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
-                            currentPositionMs,
-                            isPlaying ? desiredSpeed : 0.0f
+                            safePos,
+                            isPlaying ? desiredSpeed : 0.0f,
+                            SystemClock.elapsedRealtime()
                     )
                     .build();
             mediaSession.setPlaybackState(state);
@@ -1402,34 +1475,8 @@ public class KurfaPlaybackService extends Service {
 
     private void updateSessionAndNotification(boolean asForeground) {
         if (mediaSession != null) {
-            PlaybackState state = new PlaybackState.Builder()
-                    .setActions(
-                            PlaybackState.ACTION_PLAY |
-                            PlaybackState.ACTION_PAUSE |
-                            PlaybackState.ACTION_PLAY_PAUSE |
-                            PlaybackState.ACTION_SKIP_TO_NEXT |
-                            PlaybackState.ACTION_SKIP_TO_PREVIOUS |
-                            PlaybackState.ACTION_SEEK_TO |
-                            PlaybackState.ACTION_STOP
-                    )
-                    .setState(
-                            isPlaying ? PlaybackState.STATE_PLAYING : PlaybackState.STATE_PAUSED,
-                            currentPositionMs,
-                            isPlaying ? desiredSpeed : 0.0f
-                    )
-                    .build();
-            mediaSession.setPlaybackState(state);
-
-            MediaMetadata.Builder meta = new MediaMetadata.Builder()
-                    .putString(MediaMetadata.METADATA_KEY_TITLE, currentTitle)
-                    .putString(MediaMetadata.METADATA_KEY_ARTIST, currentArtist);
-            if (currentDurationMs > 0) {
-                meta.putLong(MediaMetadata.METADATA_KEY_DURATION, currentDurationMs);
-            }
-            if (currentArtwork != null) {
-                meta.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, currentArtwork);
-            }
-            mediaSession.setMetadata(meta.build());
+            updateSessionPlaybackStateOnly();
+            publishMediaMetadataLocked();
         }
 
         Notification notif = buildNotification();
