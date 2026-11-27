@@ -144,7 +144,7 @@ public class KurfaPlaybackService extends Service {
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private final ExecutorService artExecutor = Executors.newSingleThreadExecutor();
-    private volatile String lastLoadedArtUrl = "";
+    private static volatile String lastLoadedArtUrl = "";
 
     private ExoPlayer exoPlayer;
     private LoudnessEnhancer loudnessEnhancer;
