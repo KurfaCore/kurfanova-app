@@ -63,10 +63,10 @@ public final class ApkAutoUpdater {
 
     private ApkAutoUpdater() {}
 
-    /** Silent startup check: runs strictly once per app launch without leaking RAM or threads. */
+    /** Silent startup check: runs strictly once per app launch after WebView boots without leaking RAM or threads. */
     public static void checkInBackground(Activity activity, ExecutorService executor, WebView webView) {
         if (!STARTUP_CHECK_DONE.compareAndSet(false, true)) return;
-        runUpdateCheck(activity, executor, webView, false);
+        new Handler(Looper.getMainLooper()).postDelayed(() -> runUpdateCheck(activity, executor, webView, false), 3500L);
     }
 
     /** Manual check from Ayarlar -> Güncelleme Denetle: downloads APK, exports to İndirilenler, prompts cleanly. */
