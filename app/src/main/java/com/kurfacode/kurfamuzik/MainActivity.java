@@ -481,7 +481,8 @@ public class MainActivity extends Activity {
                         MediaStore.Audio.Media.ALBUM,
                         MediaStore.Audio.Media.DURATION,
                         MediaStore.Audio.Media.MIME_TYPE,
-                        MediaStore.Audio.Media.SIZE
+                        MediaStore.Audio.Media.SIZE,
+                        MediaStore.Audio.Media.DATE_ADDED
                 };
                 String selection = MediaStore.Audio.Media.DURATION + " >= 5000 AND " + MediaStore.Audio.Media.SIZE + " > 16384";
                 try (Cursor cursor = resolver.query(uri, projection, selection, null, MediaStore.Audio.Media.DATE_ADDED + " DESC")) {
@@ -492,6 +493,8 @@ public class MainActivity extends Activity {
                         int albumCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.ALBUM);
                         int durCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION);
                         int mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.MIME_TYPE);
+                        int sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE);
+                        int dateAddedCol = cursor.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED);
                         while (cursor.moveToNext() && tracks.length() < 400) {
                             long mediaId = cursor.getLong(idCol);
                             String rawTitle = cursor.getString(titleCol);
@@ -499,6 +502,8 @@ public class MainActivity extends Activity {
                             String album = cursor.getString(albumCol);
                             long durMs = cursor.getLong(durCol);
                             String mime = cursor.getString(mimeCol);
+                            long sizeBytes = cursor.getLong(sizeCol);
+                            long dateAddedMs = Math.max(0L, cursor.getLong(dateAddedCol)) * 1000L;
                             String title = cleanLocalAudioField(rawTitle);
                             boolean artistUnknown = TextUtils.isEmpty(rawArtist) || "<unknown>".equalsIgnoreCase(rawArtist.trim());
                             String artist = artistUnknown ? "" : cleanLocalAudioField(rawArtist);
@@ -525,6 +530,8 @@ public class MainActivity extends Activity {
                             item.put("album", album != null ? album : "");
                             item.put("duration", durStr);
                             item.put("durationSec", sec);
+                            item.put("sizeBytes", sizeBytes);
+                            item.put("dateAdded", dateAddedMs);
                             item.put("mimeType", !TextUtils.isEmpty(mime) ? mime : "audio/mpeg");
                             item.put("streamUrl", activeWebOrigin + LOCAL_AUDIO_PATH_PREFIX + mediaId);
                             item.put("thumbnail", "./kurfamuzik_logo.png");
